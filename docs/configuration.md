@@ -49,11 +49,11 @@ trusted_spam_headers = []
 
 The existing policy verdicts are kept for compatibility. Routing maps them separately:
 
-| Policy verdict | Routing outcome | Config table |
-| --- | --- | --- |
-| `SpamVerdict.DELETE` | spam | `[spam.actions.spam]` |
-| `SpamVerdict.KEEP` | not-spam | `[spam.actions.not_spam]` |
-| `SpamVerdict.REVIEW` | review | `[spam.actions.review]` |
+| Policy verdict       | Routing outcome | Config table              |
+| -------------------- | --------------- | ------------------------- |
+| `SpamVerdict.DELETE` | spam            | `[spam.actions.spam]`     |
+| `SpamVerdict.KEEP`   | not-spam        | `[spam.actions.not_spam]` |
+| `SpamVerdict.REVIEW` | review          | `[spam.actions.review]`   |
 
 An action table accepts `keep`, `move`, or `delete`:
 

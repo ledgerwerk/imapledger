@@ -91,6 +91,7 @@ class FakeClient:
         self._maybe_fail("uid_expunge")
         self.expunged.append(tuple(messages))
 
+
 def factory_for(client):
     return lambda *args, **kwargs: client
 
@@ -127,6 +128,7 @@ def make_mailbox(
         client_factory=client_factory or factory_for(client),
         event_callback=event_callback,
     )
+
 
 def test_writable_mode_requires_uidplus() -> None:
     client = FakeClient(capabilities=(b"IMAP4rev1",))
@@ -438,7 +440,6 @@ def test_uid_mode_and_password_reference_lifetime():
     with pytest.raises(ImapOperationError, match="imap_login"):
         failed_mailbox.__enter__()
     assert failed_mailbox._password == ""
-
 
 
 def test_writable_keep_only_does_not_require_mutation_capabilities() -> None:

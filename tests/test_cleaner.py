@@ -151,9 +151,7 @@ def test_review_can_be_moved_using_review_action():
 def test_result_callback_fires_during_classification_before_mutations_and_forwards_selection():
     events = []
     mailbox = FakeMailbox(writable=True, events=events)
-    mailbox.items.append(
-        MailboxItem(uid=4, message=MailMessage(4, "spam", "c@example.org", (), "", "more spam"))
-    )
+    mailbox.items.append(MailboxItem(uid=4, message=MailMessage(4, "spam", "c@example.org", (), "", "more spam")))
     selection = MessageSelection(limit=4, offset=1, sort=MessageSort.OLDEST)
     callbacks = []
     actions = SpamActions(spam=MessageAction(ActionKind.MOVE, "INBOX.Trash"))

@@ -166,6 +166,7 @@ class _Client(Protocol):
     def remove_flags(self, messages: Any, flags: Any, silent: bool = False) -> Any: ...
     def uid_expunge(self, messages: Any) -> Any: ...
 
+
 ClientFactory = Callable[..., _Client]
 
 
@@ -271,6 +272,7 @@ class ScopedMailbox:
         self._client: _Client | None = None
         self._snapshot: MailboxSnapshot | None = None
         self._capabilities: frozenset[bytes] | None = None
+
     @property
     def folder(self) -> str:
         return self._folder
@@ -278,7 +280,6 @@ class ScopedMailbox:
     @property
     def writable(self) -> bool:
         return self._writable
-
 
     @property
     def capabilities(self) -> frozenset[bytes]:
@@ -701,6 +702,7 @@ class ScopedMailbox:
         if missing:
             raise UnsafeMailboxOperation(f"approved UIDs no longer exist in scoped mailbox: {sorted(missing)}")
         return client, requested
+
     def _delete_batch(self, client: _Client, uids: Sequence[int]) -> None:
         try:
             client.add_flags(uids, [DELETED_FLAG], silent=True)

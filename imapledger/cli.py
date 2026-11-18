@@ -90,6 +90,7 @@ def init_config(
     console.print(f"Wrote {path}")
     console.print("No IMAP password was stored.")
 
+
 @app.command()
 def doctor(
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
@@ -112,8 +113,7 @@ def doctor(
     actions = settings.spam.actions
     destinations = _move_destinations(actions)
     requires_delete = any(
-        action.action is ActionKind.DELETE
-        for action in (actions.spam, actions.not_spam, actions.review)
+        action.action is ActionKind.DELETE for action in (actions.spam, actions.not_spam, actions.review)
     )
     failed = False
     try:
@@ -226,8 +226,7 @@ def clean(
     actions = settings.spam.actions
     destinations = _move_destinations(actions)
     allow_delete = any(
-        action.action is ActionKind.DELETE
-        for action in (actions.spam, actions.not_spam, actions.review)
+        action.action is ActionKind.DELETE for action in (actions.spam, actions.not_spam, actions.review)
     )
     reports: list[CleanReport] = []
     failure: Exception | None = None
@@ -308,7 +307,6 @@ def clean(
         raise typer.Exit(1) from failure
 
 
-
 def _selection_summary(
     *,
     folder: str,
@@ -321,7 +319,6 @@ def _selection_summary(
         f"folder={folder} messages={total_messages} selected={selected_count} "
         f"sort={selection.sort.value} offset={selection.offset} limit={limit}"
     )
-
 
 
 def _move_destinations(actions: SpamActions) -> tuple[str, ...]:
@@ -424,6 +421,7 @@ def _action_summary(report: CleanReport) -> str:
     actions.append(f"kept {report.kept_in_place}")
     return "Actions: " + "; ".join(actions) + "."
 
+
 def _print_summary(report: CleanReport) -> None:
     console.print(
         f"Scanned {report.scanned}; spam {report.spam}; not-spam {report.not_spam}; review {report.review}; "
@@ -470,6 +468,7 @@ def _print_aggregate_summary(reports: list[CleanReport]) -> None:
         f"deleted {sum(report.deleted for report in reports)}; "
         f"kept {sum(report.kept_in_place for report in reports)}."
     )
+
 
 def _print_failure(exc: Exception, *, debug: bool) -> None:
     if isinstance(exc, ImapOperationError):

@@ -230,9 +230,7 @@ class SpamCleaner:
         outcomes = (SpamOutcome.SPAM, SpamOutcome.NOT_SPAM, SpamOutcome.REVIEW)
         for index, outcome in enumerate(outcomes):
             group = [
-                row
-                for row in report.results
-                if row.outcome is outcome and row.action.action is not ActionKind.KEEP
+                row for row in report.results if row.outcome is outcome and row.action.action is not ActionKind.KEEP
             ]
             if not group:
                 continue

@@ -283,6 +283,7 @@ def test_apply_progress_uses_approval_wording_not_deletion_claim(monkeypatch):
     assert "folder=Spam UID 40  DELETED" in rendered
     assert "Actions: deleted 1; kept 3." in rendered
 
+
 class DoctorFakeClient:
     def __init__(self, *, size=1, uids=(10,), fail_on=None):
         self.size = size
@@ -440,8 +441,8 @@ def test_report_shows_verdict_signals_reasons_and_safe_skip_error_detail(monkeyp
                 reasons=("unsolicited-bulk",),
                 status="delete",
                 inclination="DELETE-APPROVED",
-                    action=MessageAction(ActionKind.DELETE),
-                    outcome=SpamOutcome.SPAM,
+                action=MessageAction(ActionKind.DELETE),
+                outcome=SpamOutcome.SPAM,
             ),
             MessageResult(
                 uid=2,
@@ -474,7 +475,7 @@ def test_report_shows_verdict_signals_reasons_and_safe_skip_error_detail(monkeyp
                 reasons=("insufficient-evidence",),
                 status="review",
                 inclination="REVIEW / KEEP",
-                    outcome=SpamOutcome.REVIEW,
+                outcome=SpamOutcome.REVIEW,
             ),
         ],
     )
@@ -641,7 +642,6 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
     assert "hint: run imapledger doctor --verbose" in result.output
 
 
-
 def test_config_show_prints_effective_config_without_prompt_or_connection(monkeypatch, tmp_path):
     settings = Settings(
         imap=ImapSettings(host="imap.example.org", username="user@example.org"),
@@ -663,7 +663,7 @@ def test_config_show_prints_effective_config_without_prompt_or_connection(monkey
     assert result.exit_code == 0
     assert f"config: {config_path}" in rendered
     assert 'folders = ["INBOX.Junk", "INBOX.Spam"]' in rendered
-    assert '[spam.actions.spam]' in rendered
+    assert "[spam.actions.spam]" in rendered
     assert 'destination = "INBOX.Trash"' in rendered
     assert "password" not in rendered.lower()
 
@@ -677,15 +677,24 @@ def test_init_writes_repeated_folders_and_configured_actions(monkeypatch, tmp_pa
         cli.app,
         [
             "init",
-            "--host", "imap.example.org",
-            "--username", "me@example.org",
-            "--folder", "INBOX.Junk",
-            "--folder", "INBOX.Spam",
-            "--spam-action", "move",
-            "--spam-destination", "INBOX.Trash",
-            "--not-spam-action", "move",
-            "--not-spam-destination", "INBOX.NotSpam",
-            "--config", str(config_path),
+            "--host",
+            "imap.example.org",
+            "--username",
+            "me@example.org",
+            "--folder",
+            "INBOX.Junk",
+            "--folder",
+            "INBOX.Spam",
+            "--spam-action",
+            "move",
+            "--spam-destination",
+            "INBOX.Trash",
+            "--not-spam-action",
+            "move",
+            "--not-spam-destination",
+            "INBOX.NotSpam",
+            "--config",
+            str(config_path),
         ],
     )
 
@@ -695,7 +704,6 @@ def test_init_writes_repeated_folders_and_configured_actions(monkeypatch, tmp_pa
     assert settings.spam.actions.spam == MessageAction(ActionKind.MOVE, "INBOX.Trash")
     assert settings.spam.actions.not_spam == MessageAction(ActionKind.MOVE, "INBOX.NotSpam")
     assert "password" not in config_path.read_text(encoding="utf-8").lower()
-
 
 
 def _install_multi_clean(monkeypatch, settings, output, *, report_factory=None, destination_exists=True):
@@ -766,24 +774,28 @@ def _install_multi_clean(monkeypatch, settings, output, *, report_factory=None, 
         def run(self, *, apply, selection, on_result):
             state["clean_calls"].append((self.mailbox.folder, self.classifier, selection))
             state["events"].append(("classify", self.mailbox.folder))
-            report = report_factory(self.mailbox, apply) if report_factory else CleanReport(
-                folder=self.mailbox.folder,
-                apply=apply,
-                results=[
-                    MessageResult(
-                        uid=10,
-                        subject="spam",
-                        sender="spam@example.org",
-                        verdict=SpamVerdict.DELETE,
-                        signals=SemanticSpamSignals(0.1, 0.99, 0.1, 0.1, 0.9),
-                        reasons=("phishing",),
-                        status="delete",
-                        inclination="DELETE-APPROVED",
-                        action=self.actions.spam,
-                        outcome=SpamOutcome.SPAM,
-                        action_applied=apply,
-                    )
-                ],
+            report = (
+                report_factory(self.mailbox, apply)
+                if report_factory
+                else CleanReport(
+                    folder=self.mailbox.folder,
+                    apply=apply,
+                    results=[
+                        MessageResult(
+                            uid=10,
+                            subject="spam",
+                            sender="spam@example.org",
+                            verdict=SpamVerdict.DELETE,
+                            signals=SemanticSpamSignals(0.1, 0.99, 0.1, 0.1, 0.9),
+                            reasons=("phishing",),
+                            status="delete",
+                            inclination="DELETE-APPROVED",
+                            action=self.actions.spam,
+                            outcome=SpamOutcome.SPAM,
+                            action_applied=apply,
+                        )
+                    ],
+                )
             )
             if on_result is not None:
                 for position, row in enumerate(report.results, start=1):
@@ -964,7 +976,6 @@ def test_doctor_checks_all_source_folders_capabilities_and_destinations(monkeypa
     assert rendered.count("destination INBOX.Trash: OK") == 2
     assert rendered.count("destination INBOX.NotSpam: OK") == 2
     assert "result: IMAP read/action preflight is healthy" in rendered
-
 
 
 def test_doctor_reports_missing_preconditions_for_each_folder_and_continues(monkeypatch):

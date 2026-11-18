@@ -58,7 +58,7 @@ def test_config_roundtrip_preserves_multi_folder_actions_without_password(tmp_pa
     assert "password" not in text.lower()
     assert "threshold =" not in text
     assert 'folders = ["INBOX.Junk", "INBOX.Spam"]' in text
-    assert '[spam.actions.spam]' in text
+    assert "[spam.actions.spam]" in text
     assert 'action = "move"' in text
     assert load_settings(path) == settings
 
@@ -98,6 +98,7 @@ def test_render_settings_includes_defaults_and_roundtrips_without_credentials(tm
     assert "password" not in rendered.lower()
     assert load_settings(path) == settings
 
+
 def test_atomic_write_error_becomes_config_error(monkeypatch, tmp_path: Path) -> None:
     def fail_atomic_write(path: Path, contents: str) -> None:
         raise AtomicWriteError("storage write failed")
@@ -125,14 +126,13 @@ def test_legacy_scalar_folder_warns_and_preserves_delete_defaults(tmp_path: Path
     assert settings.spam.actions.review.action is ActionKind.KEEP
 
 
-
-
 def test_new_folder_schema_without_actions_defaults_to_keep(tmp_path: Path) -> None:
     settings = _load_spam(tmp_path, 'folders = ["Spam"]\n')
 
     assert settings.spam.actions.spam.action is ActionKind.KEEP
     assert settings.spam.actions.not_spam.action is ActionKind.KEEP
     assert settings.spam.actions.review.action is ActionKind.KEEP
+
 
 def test_folder_and_folders_cannot_both_be_configured(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="cannot both"):
@@ -147,7 +147,7 @@ def test_folder_and_folders_cannot_both_be_configured(tmp_path: Path) -> None:
         ('["   "]', "must not be empty"),
         ('["Spam", "Spam"]', "duplicates"),
         ('[" Spam"]', "whitespace"),
-        ('[1]', "entries must be strings"),
+        ("[1]", "entries must be strings"),
     ],
 )
 def test_invalid_folder_lists_are_rejected(tmp_path: Path, folders: str, message: str) -> None:
@@ -182,8 +182,7 @@ def test_invalid_actions_are_rejected(tmp_path: Path, action_table: str, message
 def test_legacy_scalar_threshold_is_warned_about_and_ignored(tmp_path: Path) -> None:
     path = tmp_path / "legacy.toml"
     path.write_text(
-        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
-        '[spam]\nfolder = "Spam"\nthreshold = 0.99\n',
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n[spam]\nfolder = "Spam"\nthreshold = 0.99\n',
         encoding="utf-8",
     )
 
