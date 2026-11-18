@@ -770,6 +770,36 @@ class ScopedMailbox:
                     message=parse_message(uid, raw, max_body_chars=self._max_body_chars),
                 )
 
+    def move_uid(self, uid: int, destination: str) -> MoveResult:
+        if destination not in self._allowed_destinations:
+            raise UnsafeMailboxOperation("refusing to move to a destination outside the configured allow-list")
+        if destination == self._folder:
+            raise UnsafeMailboxOperation("refusing to move messages to their source folder")
+        client, uid = self._validate_streaming_mutation_uid(
+            uid,
+            required_capability=b"MOVE",
+            operation_prefix="move",
+        )
+        self._emit(f"streaming move destination={destination!r} uid={uid}")
+        try:
+            client.move((uid,), destination)
+        except Exception as exc:
+            failure = _operation_error(
+                operation="imap_uid_move",
+                message="UID MOVE failed",
+                exc=exc,
+                folder=self._folder,
+                selector=f"destination={destination}",
+                uids=(uid,),
+            )
+            raise PartialMoveError(
+                moved=(),
+                pending=(uid,),
+                destination=destination,
+                failure=failure,
+            ) from exc
+        return MoveResult(moved=(uid,), destination=destination)
+
     def move_uids(self, uids: Sequence[int], destination: str) -> MoveResult:
         if destination not in self._allowed_destinations:
             raise UnsafeMailboxOperation("refusing to move to a destination outside the configured allow-list")
@@ -810,6 +840,23 @@ class ScopedMailbox:
                 ) from exc
             completed.extend(uid_batch)
         return MoveResult(moved=tuple(completed), destination=destination)
+
+    def delete_uid(self, uid: int) -> DeleteResult:
+        if not self._allow_delete:
+            raise UnsafeMailboxOperation("deletion is not allowed by the configured spam action")
+        client, uid = self._validate_streaming_mutation_uid(
+            uid,
+            required_capability=b"UIDPLUS",
+            operation_prefix="delete",
+        )
+        self._emit(f"streaming delete uid={uid}")
+        try:
+            self._delete_batch(client, (uid,))
+        except ImapOperationError as failure:
+            failure.batch = 1
+            failure.batch_count = 1
+            raise PartialDeleteError(deleted=(), pending=(uid,), failure=failure) from failure
+        return DeleteResult(deleted=(uid,))
 
     def delete_uids(self, uids: Sequence[int]) -> DeleteResult:
         if not self._allow_delete:
@@ -902,6 +949,38 @@ class ScopedMailbox:
         if missing:
             raise UnsafeMailboxOperation(f"approved UIDs no longer exist in scoped mailbox: {sorted(missing)}")
         return client, requested
+
+    def _validate_streaming_mutation_uid(
+        self,
+        uid: int,
+        *,
+        required_capability: bytes,
+        operation_prefix: str,
+    ) -> tuple[_Client, int]:
+        if not self._writable:
+            raise UnsafeMailboxOperation("mailbox is read-only")
+        client = self._require_client()
+        uid = int(uid)
+        if uid not in self.snapshot().uids:
+            raise UnsafeMailboxOperation(f"refusing UID outside initial mailbox snapshot: {uid}")
+        capability_name = required_capability.decode("ascii")
+        if required_capability not in self.capabilities:
+            raise UnsafeMailboxOperation(f"{capability_name} disappeared; refusing {operation_prefix}")
+
+        try:
+            current_uids = client.search(["UID", uid])
+        except Exception as exc:
+            raise _operation_error(
+                operation=f"imap_pre{operation_prefix}_search",
+                message="exact UID SEARCH failed before mutation",
+                exc=exc,
+                folder=self._folder,
+                selector=f"UID {uid}",
+                uids=(uid,),
+            ) from exc
+        if uid not in {int(current_uid) for current_uid in current_uids}:
+            raise UnsafeMailboxOperation(f"approved UID no longer exists in scoped mailbox: {uid}")
+        return client, uid
 
     def _delete_batch(self, client: _Client, uids: Sequence[int]) -> None:
         try:

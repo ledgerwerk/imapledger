@@ -42,11 +42,17 @@ class FakeMailbox(AbstractContextManager):
         self.iter_selections.append(selection)
         yield from self.items
 
+    def move_uid(self, uid, destination):
+        return self.move_uids((uid,), destination)
+
     def move_uids(self, uids, destination):
         self.moved.append((tuple(uids), destination))
         if self.events is not None:
-            self.events.append("move")
+            self.events.append(f"move:{uids[0]}:{destination}")
         return MoveResult(moved=tuple(uids), destination=destination)
+
+    def delete_uid(self, uid):
+        return self.delete_uids((uid,))
 
     def delete_uids(self, uids):
         self.deleted.extend(uids)
@@ -74,7 +80,12 @@ def _assessment(message: MailMessage) -> SpamAssessment:
 
 
 class FakeClassifier:
+    def __init__(self, events=None):
+        self.events = events
+
     def assess(self, message):
+        if self.events is not None:
+            self.events.append(f"classify:{message.uid}")
         return _assessment(message)
 
 
@@ -114,7 +125,7 @@ def test_dry_run_never_mutates_and_records_configured_actions():
     assert report.results[0].request_id == "request-1"
 
 
-def test_apply_groups_spam_and_not_spam_by_configured_destination():
+def test_apply_routes_spam_and_not_spam_during_iteration():
     mailbox = FakeMailbox(writable=True)
     actions = SpamActions(
         spam=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
@@ -144,33 +155,54 @@ def test_review_can_be_moved_using_review_action():
     report = SpamCleaner(mailbox, ReviewClassifier(), actions=actions).run(apply=True)
 
     assert report.review == 2
-    assert mailbox.moved == [((1, 2), "INBOX.Review")]
+    assert mailbox.moved == [((1,), "INBOX.Review"), ((2,), "INBOX.Review")]
     assert all(row.outcome is SpamOutcome.REVIEW for row in report.results[:2])
 
 
-def test_result_callback_fires_during_classification_before_mutations_and_forwards_selection():
+def test_result_callback_fires_after_each_action_and_forwards_selection():
     events = []
     mailbox = FakeMailbox(writable=True, events=events)
     mailbox.items.append(MailboxItem(uid=4, message=MailMessage(4, "spam", "c@example.org", (), "", "more spam")))
     selection = MessageSelection(limit=4, offset=1, sort=MessageSort.OLDEST)
     callbacks = []
-    actions = SpamActions(spam=MessageAction(ActionKind.MOVE, "INBOX.Trash"))
+    actions = SpamActions(
+        spam=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
+        not_spam=MessageAction(ActionKind.MOVE, "INBOX.NotSpam"),
+    )
 
-    report = SpamCleaner(mailbox, FakeClassifier(), actions=actions).run(
+    report = SpamCleaner(mailbox, FakeClassifier(events), actions=actions).run(
         apply=True,
         selection=selection,
-        on_result=lambda row, position, total: (callbacks.append((row, position, total)), events.append("row")),
+        on_result=lambda row, position, total: (
+            callbacks.append((row, position, total)),
+            events.append(f"row:{row.uid}"),
+        ),
     )
 
     assert [row for row, _, _ in callbacks] == report.results
-    assert [position for _, position, _ in callbacks] == [1, 2, 3, 4]
-    assert [total for _, _, total in callbacks] == [4, 4, 4, 4]
+    assert [(position, total) for _, position, total in callbacks] == [(1, 4), (2, 4), (3, 4), (4, 4)]
+    assert [row.action_applied for row, _, _ in callbacks] == [True, True, False, True]
     assert mailbox.count_selections == [selection]
     assert mailbox.iter_selections == [selection]
     assert mailbox.count_selections[0] is selection
     assert mailbox.iter_selections[0] is selection
-    assert events == ["row", "row", "row", "row", "move"]
-    assert mailbox.moved == [((1, 4), "INBOX.Trash")]
+    assert events == [
+        "classify:1",
+        "move:1:INBOX.Trash",
+        "row:1",
+        "classify:2",
+        "move:2:INBOX.NotSpam",
+        "row:2",
+        "row:3",
+        "classify:4",
+        "move:4:INBOX.Trash",
+        "row:4",
+    ]
+    assert mailbox.moved == [
+        ((1,), "INBOX.Trash"),
+        ((2,), "INBOX.NotSpam"),
+        ((4,), "INBOX.Trash"),
+    ]
 
 
 def test_apply_deletes_only_configured_spam_action_uids():
@@ -206,56 +238,94 @@ def test_classifier_error_fails_closed_and_skip_error_never_mutate():
 
 
 class PartialFakeMailbox(FakeMailbox):
-    def __init__(self, *, writable: bool):
-        super().__init__(writable=writable)
-        self.items.append(MailboxItem(uid=4, message=MailMessage(4, "phish", "c@example.org", (), "", "spam")))
+    def __init__(self, *, writable: bool, events=None):
+        super().__init__(writable=writable, events=events)
+        self.items.extend(
+            [
+                MailboxItem(uid=4, message=MailMessage(4, "phish", "c@example.org", (), "", "spam")),
+                MailboxItem(uid=5, message=MailMessage(5, "later", "d@example.org", (), "", "spam")),
+            ]
+        )
 
     def move_uids(self, uids, destination):
-        self.moved.append((tuple(uids), destination))
-        failure = ImapOperationError(
-            operation="imap_uid_move",
-            message="UID MOVE failed",
-            folder="Spam",
-            uids=(4,),
-            batch=1,
-            batch_count=1,
-            cause_type="RuntimeError",
-        )
-        raise PartialMoveError(moved=(1,), pending=(4,), destination=destination, failure=failure) from failure
+        uids = tuple(uids)
+        self.moved.append((uids, destination))
+        if self.events is not None:
+            self.events.append(f"move:{uids[0]}:{destination}")
+        if uids == (4,):
+            failure = ImapOperationError(
+                operation="imap_uid_move",
+                message="UID MOVE failed",
+                folder="Spam",
+                uids=uids,
+                batch=1,
+                batch_count=1,
+                cause_type="RuntimeError",
+            )
+            raise PartialMoveError(moved=(), pending=uids, destination=destination, failure=failure) from failure
+        return MoveResult(moved=uids, destination=destination)
 
 
-def test_partial_move_marks_only_confirmed_messages_and_stops_later_groups():
-    mailbox = PartialFakeMailbox(writable=True)
+def test_partial_move_reports_failing_row_and_stops_classification_and_mutation():
+    events = []
+    mailbox = PartialFakeMailbox(writable=True, events=events)
     actions = SpamActions(
         spam=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
         not_spam=MessageAction(ActionKind.MOVE, "INBOX.NotSpam"),
     )
+    callbacks = []
 
-    report = SpamCleaner(mailbox, FakeClassifier(), actions=actions).run(apply=True)
+    report = SpamCleaner(mailbox, FakeClassifier(events), actions=actions).run(
+        apply=True,
+        on_result=lambda row, position, total: (callbacks.append(row), events.append(f"row:{row.uid}")),
+    )
 
     rows = {row.uid: row for row in report.results}
     assert report.partial_move_error is not None
-    assert report.moved == 1
+    assert report.moved == 2
+    assert report.scanned == 4
+    assert [row.uid for row in callbacks] == [1, 2, 3, 4]
     assert rows[1].action_applied is True
+    assert rows[2].action_applied is True
     assert rows[4].action_applied is False
     assert rows[4].detail == "Move was not confirmed; see the operation error."
-    assert rows[2].action_applied is False
-    assert mailbox.moved == [((1, 4), "INBOX.Trash")]
+    assert 5 not in rows
+    assert mailbox.moved == [
+        ((1,), "INBOX.Trash"),
+        ((2,), "INBOX.NotSpam"),
+        ((4,), "INBOX.Trash"),
+    ]
     assert mailbox.deleted == []
+    assert events == [
+        "classify:1",
+        "move:1:INBOX.Trash",
+        "row:1",
+        "classify:2",
+        "move:2:INBOX.NotSpam",
+        "row:2",
+        "row:3",
+        "classify:4",
+        "move:4:INBOX.Trash",
+        "row:4",
+    ]
 
 
 def test_partial_delete_marks_only_confirmed_uids():
     class PartialDeleteMailbox(FakeMailbox):
         def delete_uids(self, uids):
+            uids = tuple(uids)
+            if uids == (1,):
+                self.deleted.extend(uids)
+                return DeleteResult(deleted=uids)
             failure = ImapOperationError(
                 operation="imap_uid_expunge",
                 message="UID EXPUNGE failed",
                 folder="Spam",
-                uids=(4,),
-                batch=2,
-                batch_count=2,
+                uids=uids,
+                batch=1,
+                batch_count=1,
             )
-            raise PartialDeleteError(deleted=(1,), pending=(4,), failure=failure) from failure
+            raise PartialDeleteError(deleted=(), pending=uids, failure=failure) from failure
 
     mailbox = PartialDeleteMailbox(writable=True)
     mailbox.items.append(MailboxItem(uid=4, message=MailMessage(4, "phish", "c@example.org", (), "", "spam")))
@@ -263,6 +333,8 @@ def test_partial_delete_marks_only_confirmed_uids():
 
     rows = {row.uid: row for row in report.results}
     assert report.partial_delete_error is not None
+    assert report.deleted == 1
     assert rows[1].deleted is True
     assert rows[4].deleted is False
     assert rows[4].detail == "Deletion was not confirmed; see the operation error."
+    assert report.scanned == 4

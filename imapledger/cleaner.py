@@ -39,6 +39,9 @@ class Mailbox(Protocol):
 
     def iter_messages(self, selection: MessageSelection) -> Iterator[MailboxItem]: ...
 
+    def move_uid(self, uid: int, destination: str) -> MoveResult: ...
+
+    def delete_uid(self, uid: int) -> DeleteResult: ...
     def move_uids(self, uids: Sequence[int], destination: str) -> MoveResult: ...
 
     def delete_uids(self, uids: Sequence[int]) -> DeleteResult: ...
@@ -148,28 +151,27 @@ class SpamCleaner:
             raise ValueError("apply=True requires a writable scoped mailbox")
         selection = selection or MessageSelection()
         total = self._mailbox.selected_count(selection)
-        rows: list[MessageResult] = []
+        report = CleanReport(folder=self._mailbox.folder, apply=apply, results=[])
 
-        def record(row: MessageResult) -> None:
-            rows.append(row)
+        def notify(row: MessageResult) -> None:
             if on_result is not None:
-                on_result(row, len(rows), total)
+                on_result(row, len(report.results), total)
 
         for item in self._mailbox.iter_messages(selection):
             if item.message is None:
-                record(
-                    MessageResult(
-                        uid=item.uid,
-                        subject="",
-                        sender="",
-                        verdict=None,
-                        signals=None,
-                        reasons=(),
-                        status="skip",
-                        inclination="SKIP",
-                        detail=item.skip_reason or "message not available",
-                    )
+                row = MessageResult(
+                    uid=item.uid,
+                    subject="",
+                    sender="",
+                    verdict=None,
+                    signals=None,
+                    reasons=(),
+                    status="skip",
+                    inclination="SKIP",
+                    detail=item.skip_reason or "message not available",
                 )
+                report.results.append(row)
+                notify(row)
                 continue
 
             message = item.message
@@ -178,19 +180,19 @@ class SpamCleaner:
                 evidence: MessageEvidence = assessment.evidence
                 decision = self._policy.decide(assessment.signals, evidence)
             except Exception as exc:  # Fail closed: classifier and policy errors never authorize a mutation.
-                record(
-                    MessageResult(
-                        uid=message.uid,
-                        subject=message.subject,
-                        sender=message.sender,
-                        verdict=None,
-                        signals=None,
-                        reasons=(),
-                        status="error",
-                        inclination="ERROR / KEEP",
-                        detail=f"{type(exc).__name__}: classification evaluation failed",
-                    )
+                row = MessageResult(
+                    uid=message.uid,
+                    subject=message.subject,
+                    sender=message.sender,
+                    verdict=None,
+                    signals=None,
+                    reasons=(),
+                    status="error",
+                    inclination="ERROR / KEEP",
+                    detail=f"{type(exc).__name__}: classification evaluation failed",
                 )
+                report.results.append(row)
+                notify(row)
                 continue
 
             outcome = VERDICT_OUTCOME[decision.verdict]
@@ -201,87 +203,70 @@ class SpamCleaner:
                 SpamVerdict.KEEP: "KEEP",
                 SpamVerdict.REVIEW: "REVIEW / KEEP",
             }[decision.verdict]
-            record(
-                MessageResult(
-                    uid=message.uid,
-                    subject=message.subject,
-                    sender=message.sender,
-                    verdict=decision.verdict,
-                    signals=assessment.signals,
-                    reasons=decision.reasons,
-                    status=status,
-                    inclination=inclination,
-                    action=action,
-                    outcome=outcome,
-                    model=assessment.model,
-                    request_id=assessment.request_id,
-                )
+            row = MessageResult(
+                uid=message.uid,
+                subject=message.subject,
+                sender=message.sender,
+                verdict=decision.verdict,
+                signals=assessment.signals,
+                reasons=decision.reasons,
+                status=status,
+                inclination=inclination,
+                action=action,
+                outcome=outcome,
+                model=assessment.model,
+                request_id=assessment.request_id,
             )
+            report.results.append(row)
+            should_continue = True
+            if apply and row.action.action is not ActionKind.KEEP:
+                should_continue = self._apply_action(report, row)
+            notify(row)
+            if not should_continue:
+                break
 
-        report = CleanReport(folder=self._mailbox.folder, apply=apply, results=rows)
-        if apply:
-            self._apply_actions(report)
         return report
 
     def _action_for(self, outcome: SpamOutcome) -> MessageAction:
         return getattr(self._actions, outcome.value)
 
-    def _apply_actions(self, report: CleanReport) -> None:
-        outcomes = (SpamOutcome.SPAM, SpamOutcome.NOT_SPAM, SpamOutcome.REVIEW)
-        for index, outcome in enumerate(outcomes):
-            group = [
-                row for row in report.results if row.outcome is outcome and row.action.action is not ActionKind.KEEP
-            ]
-            if not group:
-                continue
-            action = group[0].action
-            uids = tuple(row.uid for row in group)
-            try:
-                if action.action is ActionKind.MOVE:
-                    result = self._mailbox.move_uids(uids, action.destination or "")
-                    completed = set(result.moved)
-                else:
-                    result = self._mailbox.delete_uids(uids)
-                    completed = set(result.deleted)
-            except PartialMoveError as exc:
-                report.partial_move_error = exc
-                self._mark_action_results(group, set(exc.moved), "Move was not confirmed; see the operation error.")
-                self._mark_unattempted_actions(report.results, outcomes[index + 1 :])
-                return
-            except PartialDeleteError as exc:
-                report.partial_delete_error = exc
-                self._mark_action_results(
-                    group,
-                    set(exc.deleted),
-                    "Deletion was not confirmed; see the operation error.",
-                )
-                self._mark_unattempted_actions(report.results, outcomes[index + 1 :])
-                return
-            except Exception as exc:
-                report.action_error = exc
-                for row in group:
-                    row.detail = "Action failed before confirmation; see the operation error."
-                self._mark_unattempted_actions(report.results, outcomes[index + 1 :])
-                return
-            self._mark_action_results(group, completed, None)
+    def _apply_action(self, report: CleanReport, row: MessageResult) -> bool:
+        if row.action.action is ActionKind.KEEP:
+            row.action_applied = False
+            return True
 
-    @staticmethod
-    def _mark_action_results(
-        group: list[MessageResult],
-        completed: set[int],
-        pending_detail: str | None,
-    ) -> None:
-        for row in group:
-            if row.uid in completed:
+        try:
+            if row.action.action is ActionKind.MOVE:
+                result = self._mailbox.move_uid(row.uid, row.action.destination or "")
+                confirmed = row.uid in result.moved
+                action_name = "Move"
+            else:
+                result = self._mailbox.delete_uid(row.uid)
+                confirmed = row.uid in result.deleted
+                action_name = "Deletion"
+        except PartialMoveError as exc:
+            report.partial_move_error = exc
+            if row.uid in exc.moved:
                 row.action_applied = True
-            elif pending_detail is not None:
-                row.detail = pending_detail
+            else:
+                row.detail = "Move was not confirmed; see the operation error."
+            return False
+        except PartialDeleteError as exc:
+            report.partial_delete_error = exc
+            if row.uid in exc.deleted:
+                row.action_applied = True
+            else:
+                row.detail = "Deletion was not confirmed; see the operation error."
+            return False
+        except Exception as exc:
+            report.action_error = exc
+            row.detail = "Action failed before confirmation; see the operation error."
+            return False
 
-    @staticmethod
-    def _mark_unattempted_actions(
-        results: list[MessageResult],
-        outcomes: Sequence[SpamOutcome],
-    ) -> None:
-        for row in results:
-            if row.outcome in outcomes and row.action.action is not ActionKind.KEEP:
-                row.detail = "Action not attempted because an earlier action group failed."
+        if not confirmed:
+            report.action_error = RuntimeError(f"{action_name} was not confirmed.")
+            row.detail = f"{action_name} was not confirmed; see the operation error."
+            return False
+
+        row.action_applied = True
+        return True

@@ -57,6 +57,7 @@ The existing policy verdicts are kept for compatibility. Routing maps them separ
 | `SpamVerdict.KEEP`   | not-spam        | `[spam.actions.not_spam]` |
 | `SpamVerdict.REVIEW` | review          | `[spam.actions.review]`   |
 
+A configured not-spam action runs only for `SpamVerdict.KEEP`; `REVIEW` is a separate outcome and follows `[spam.actions.review]`.
 An action table accepts `keep`, `move`, or `delete`:
 
 - `keep` leaves the message in its current source folder.

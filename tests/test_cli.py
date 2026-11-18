@@ -82,6 +82,8 @@ def test_clean_help_exposes_verbose_and_debug_options():
     assert "--progress" in result.output
     assert "--no-progress" in result.output
 
+    assert "final configured action" in result.output
+
 
 class CleanFakeMailbox:
     folder = "Spam"
@@ -274,7 +276,7 @@ def test_no_progress_suppresses_stream_and_renders_final_report(monkeypatch):
     assert rendered.count("spam-subject") == 1
 
 
-def test_apply_progress_uses_approval_wording_not_deletion_claim(monkeypatch):
+def test_apply_progress_reports_final_action_without_duplicate_listing(monkeypatch):
     output = StringIO()
     report = _stream_report(apply=True)
     _configure_clean(monkeypatch, report, output)
@@ -283,9 +285,10 @@ def test_apply_progress_uses_approval_wording_not_deletion_claim(monkeypatch):
 
     rendered = output.getvalue()
     assert result.exit_code == 0
-    assert "[1/4] UID 40  DELETE-APPROVED" in rendered
-    assert "[1/4] UID 40  DELETED" not in rendered
-    assert "folder=Spam UID 40  DELETED" in rendered
+    assert "[1/4] UID 40  DELETED" in rendered
+    assert "[1/4] UID 40  DELETE-APPROVED" not in rendered
+    assert rendered.count("[1/4] UID 40") == 1
+    assert "folder=Spam UID 40  DELETED" not in rendered
     assert "Actions: deleted 1; kept 3." in rendered
 
 
@@ -921,8 +924,8 @@ def test_clean_apply_preflights_each_destination_before_classifying(monkeypatch)
         folder_events = [event for event in state["events"] if event[1] == folder]
         assert folder_events.index(("destination", folder, "INBOX.Trash")) < folder_events.index(("classify", folder))
         assert folder_events.index(("destination", folder, "INBOX.NotSpam")) < folder_events.index(("classify", folder))
-    assert rendered.count("MOVE-APPROVED -> INBOX.Trash") == 2
-    assert rendered.count("MOVED -> INBOX.Trash") == 2
+    assert rendered.count("[1/1] UID 10  MOVED -> INBOX.Trash") == 2
+    assert "folder=INBOX.Junk UID 10  MOVED -> INBOX.Trash" not in rendered
     assert "Aggregate across 2 folders" in rendered
 
 
@@ -1017,8 +1020,12 @@ def test_clean_partial_move_exits_nonzero_and_keeps_confirmed_reporting(monkeypa
         ("INBOX.Spam", False),
         ("INBOX.Junk", True),
     ]
-    assert "folder=INBOX.Junk UID 10  MOVED -> INBOX.Trash" in rendered
-    assert "folder=INBOX.Junk UID 20  MOVE NOT CONFIRMED -> INBOX.Trash" in rendered
+    assert "[1/2] UID 10  MOVED -> INBOX.Trash" in rendered
+
+    assert "[2/2] UID 20  MOVE NOT CONFIRMED -> INBOX.Trash" in rendered
+    assert rendered.count("[1/2] UID 10") == 1
+    assert "folder=INBOX.Junk UID 10  MOVED -> INBOX.Trash" not in rendered
+    assert "folder=INBOX.Junk UID 20  MOVE NOT CONFIRMED -> INBOX.Trash" not in rendered
     assert "Aggregate across 1 folders" in rendered
     assert "destination='INBOX.Trash'" in result.output
 

@@ -320,7 +320,7 @@ def clean(
     progress: bool = typer.Option(  # noqa: B008
         True,
         "--progress/--no-progress",
-        help="Stream each classification decision as it completes.",
+        help="Stream each classification and final configured action as it completes.",
     ),
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
@@ -432,7 +432,6 @@ def clean(
                         reports.append(report)
                         if progress:
                             _print_summary(report)
-                            _print_action_results(report)
                         else:
                             _print_report(report)
                 except Exception as exc:
@@ -498,7 +497,7 @@ def _print_result(
     total: int,
     apply: bool,
 ) -> None:
-    action = _classification_action_label(row, apply=apply)
+    action = _final_action_label(row, apply=apply)
     reasons = ",".join(row.reasons) or (row.detail or "-")
     verdict = row.verdict.name if row.verdict else "-"
     outcome = row.outcome.value.upper() if row.outcome else "-"
@@ -586,18 +585,6 @@ def _print_summary(report: CleanReport) -> None:
         console.print(
             f"Partial deletion: {len(report.partial_delete_error.deleted)} confirmed; "
             f"{len(report.partial_delete_error.pending)} pending."
-        )
-
-
-def _print_action_results(report: CleanReport) -> None:
-    if not report.apply:
-        return
-    for row in report.results:
-        if row.action.action is ActionKind.KEEP:
-            continue
-        console.print(
-            f"folder={report.folder} UID {row.uid}  {_final_action_label(row, apply=True)}",
-            markup=False,
         )
 
 

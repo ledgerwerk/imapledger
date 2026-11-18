@@ -27,6 +27,7 @@ class FakeClient:
         self.fetches = []
         self.added = []
         self.removed = []
+        self.searches = []
         self.expunged = []
         self.moves = []
         self.existing_folders = {"INBOX.Trash", "Spam"}
@@ -69,8 +70,14 @@ class FakeClient:
 
     def search(self, criteria="ALL", charset=None):
         self.calls.append("search")
+        self.searches.append(criteria)
         self._maybe_fail("search")
-        return self.uids
+        if criteria == "ALL":
+            return list(self.uids)
+        if isinstance(criteria, (list, tuple)) and len(criteria) == 2 and str(criteria[0]).upper() == "UID":
+            requested = int(criteria[1])
+            return [uid for uid in self.uids if uid == requested]
+        raise AssertionError(f"unsupported search criteria: {criteria!r}")
 
     def fetch(self, messages, data, modifiers=None):
         messages = tuple(messages)
@@ -88,6 +95,8 @@ class FakeClient:
         self._maybe_fail("move")
         self.moves.append((tuple(messages), folder))
 
+        self.uids = [uid for uid in self.uids if uid not in messages]
+
     def add_flags(self, messages, flags, silent=False):
         self._maybe_fail("add_flags")
         self.added.append((tuple(messages), tuple(flags), silent))
@@ -99,6 +108,8 @@ class FakeClient:
     def uid_expunge(self, messages):
         self._maybe_fail("uid_expunge")
         self.expunged.append(tuple(messages))
+
+        self.uids = [uid for uid in self.uids if uid not in messages]
 
 
 def factory_for(client):
@@ -242,6 +253,147 @@ def test_delete_uses_uid_expunge_for_exact_snapshot_uids() -> None:
     assert client.selected == [("Spam", False), ("Spam", False)]
     assert client.added == [((10,), ("\\Deleted",), True)]
     assert client.expunged == [(10,)]
+
+
+def test_streaming_move_uses_exact_uids_without_reselecting_source():
+    client = FakeClient(uids=[10, 20])
+    with make_mailbox(
+        client,
+        writable=True,
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+    ) as mailbox:
+        first = mailbox.move_uid(10, "INBOX.Trash")
+        second = mailbox.move_uid(20, "INBOX.Trash")
+
+    assert first == MoveResult(moved=(10,), destination="INBOX.Trash")
+    assert second == MoveResult(moved=(20,), destination="INBOX.Trash")
+    assert client.moves == [((10,), "INBOX.Trash"), ((20,), "INBOX.Trash")]
+    assert client.searches == ["ALL", ["UID", 10], ["UID", 20]]
+    assert client.selected == [("Spam", False)]
+    assert client.uids == []
+
+
+def test_streaming_delete_uses_uidplus_and_exact_uid():
+    client = FakeClient()
+    with make_mailbox(client, writable=True, allow_delete=True) as mailbox:
+        result = mailbox.delete_uid(10)
+
+    assert result == DeleteResult(deleted=(10,))
+    assert client.searches == ["ALL", ["UID", 10]]
+    assert client.selected == [("Spam", False)]
+    assert client.added == [((10,), ("\\Deleted",), True)]
+    assert client.expunged == [(10,)]
+    assert client.uids == []
+
+
+def test_streaming_mutations_preserve_snapshot_and_destination_safety():
+    client = FakeClient()
+    with make_mailbox(
+        client,
+        writable=True,
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+    ) as mailbox:
+        with pytest.raises(UnsafeMailboxOperation, match="outside initial"):
+            mailbox.move_uid(999, "INBOX.Trash")
+        with pytest.raises(UnsafeMailboxOperation, match="outside the configured allow-list"):
+            mailbox.move_uid(10, "INBOX.Other")
+
+    assert client.searches == ["ALL"]
+    assert client.moves == []
+
+    source_client = FakeClient()
+    with make_mailbox(
+        source_client,
+        writable=True,
+        allowed_destinations=("Spam",),
+        allow_delete=False,
+    ) as mailbox:
+        with pytest.raises(UnsafeMailboxOperation, match="source folder"):
+            mailbox.move_uid(10, "Spam")
+
+    assert source_client.searches == ["ALL"]
+    assert source_client.moves == []
+
+
+def test_streaming_move_requires_writable_scope_and_capability():
+    readonly_client = FakeClient()
+    with make_mailbox(
+        readonly_client,
+        writable=False,
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+    ) as mailbox:
+        with pytest.raises(UnsafeMailboxOperation, match="read-only"):
+            mailbox.move_uid(10, "INBOX.Trash")
+
+    client = FakeClient()
+    with make_mailbox(
+        client,
+        writable=True,
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+    ) as mailbox:
+        mailbox._capabilities = frozenset((b"IMAP4rev1",))
+        with pytest.raises(UnsafeMailboxOperation, match="MOVE disappeared"):
+            mailbox.move_uid(10, "INBOX.Trash")
+
+    assert client.moves == []
+    assert client.searches == ["ALL"]
+
+
+def test_streaming_delete_requires_explicit_allow_and_uidplus():
+    disallowed_client = FakeClient()
+    with make_mailbox(disallowed_client, writable=True, allow_delete=False) as mailbox:
+        with pytest.raises(UnsafeMailboxOperation, match="not allowed"):
+            mailbox.delete_uid(10)
+
+    client = FakeClient()
+    with make_mailbox(client, writable=True, allow_delete=True) as mailbox:
+        mailbox._capabilities = frozenset((b"IMAP4rev1", b"MOVE"))
+        with pytest.raises(UnsafeMailboxOperation, match="UIDPLUS disappeared"):
+            mailbox.delete_uid(10)
+
+    assert disallowed_client.searches == ["ALL"]
+    assert client.searches == ["ALL"]
+    assert client.expunged == []
+
+
+def test_streaming_mutation_rejects_uid_that_disappeared_from_selected_source():
+    client = FakeClient()
+    with make_mailbox(
+        client,
+        writable=True,
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+    ) as mailbox:
+        client.uids.clear()
+        with pytest.raises(UnsafeMailboxOperation, match="no longer exists"):
+            mailbox.move_uid(10, "INBOX.Trash")
+
+    assert client.searches == ["ALL", ["UID", 10]]
+    assert client.moves == []
+    assert client.selected == [("Spam", False)]
+
+
+def test_streaming_move_failure_is_reported_as_unconfirmed():
+    client = FakeClient()
+    client.fail_on = "move"
+    with make_mailbox(
+        client,
+        writable=True,
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+    ) as mailbox:
+        with pytest.raises(PartialMoveError) as raised:
+            mailbox.move_uid(10, "INBOX.Trash")
+
+    assert raised.value.moved == ()
+    assert raised.value.pending == (10,)
+    assert raised.value.destination == "INBOX.Trash"
+    assert client.searches == ["ALL", ["UID", 10]]
+    assert client.moves == []
 
 
 def test_delete_rejects_uid_outside_initial_snapshot() -> None:
