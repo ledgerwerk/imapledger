@@ -1,28 +1,20 @@
 # imapledger
 
-A deliberately small, security-scoped IMAP automation tool. The MVP scans exactly one configured junk folder, asks `pyjev` to assess structured spam evidence, then applies an explicit application policy. Only a DELETE verdict can approve permanent removal of exact UIDs.
-
-The semantic model never receives an IMAP client and cannot select folders or issue IMAP commands.
+A security-scoped IMAP automation tool. `imapledger` scans configured source folders, classifies messages using `pyjev` evidence, then maps deterministic policy outcomes to configured mailbox actions. The semantic model never receives an IMAP client and cannot select destinations or issue IMAP commands.
 
 ## Security model
 
-The current cleaner has a narrow authority boundary:
+- Each `ScopedMailbox` session is bound to one source folder.
+- Source folders are processed in configured order, one connection at a time.
+- IMAP uses TLS and UID mode. The password is requested with hidden input and is never stored in the configuration.
+- Dry-run is the default. It selects each source read-only and performs no mutations.
+- `--apply` uses only configured actions. Every MOVE destination is allow-listed, must exist, and requires server MOVE support. imapledger does not create folders or fall back to COPY and EXPUNGE.
+- Moves and deletes use only UIDs from the initial source snapshot. Before mutation, imapledger rechecks UIDVALIDITY and confirms that the selected UIDs still exist.
+- Permanent deletion is available only as an explicit spam action. It requires UIDPLUS and uses exact-UID EXPUNGE.
+- Classification, evidence, and policy errors fail closed. Skipped and errored messages remain in their source folders.
+- Separate source-folder operations are not one cross-folder transaction. If a later source fails, earlier confirmed changes are reported and are not rolled back.
 
-- one IMAP account;
-- one configured folder;
-- TLS/IMAPS only in the MVP;
-- no password storage;
-- the password is requested with hidden `getpass()` input on every `clean` and `doctor` run;
-- IMAP operations use explicit UID mode;
-- the mailbox object drops its password reference immediately after the login attempt. This reduces reference lifetime but is not secure memory zeroization;
-- dry-run is the default and selects the mailbox read-only;
-- destructive mode requires `UIDPLUS`;
-- deletion uses exact UID expunge, never ordinary mailbox-wide `EXPUNGE`;
-- UIDs must belong to the initial mailbox snapshot;
-- `UIDVALIDITY` is rechecked immediately before destructive operations;
-- classifier errors and uncertain messages are kept.
-
-This protects other folders from the application interface. It is not a server-side ACL: a process that has arbitrary code execution plus the IMAP password could still create its own unrestricted IMAP connection. A later version can add stronger credential isolation or a dedicated IMAP account with server-side ACLs.
+A process with arbitrary code execution and the IMAP password could still create an unrestricted connection. Use a dedicated IMAP account and server-side ACLs where stronger isolation is needed.
 
 ## Install for development
 
@@ -38,16 +30,23 @@ python -m pip install -e '.[dev]'
 
 ## Configure
 
+Create a configuration file with repeated source folders and explicit actions:
+
 ```bash
 imapledger init \
   --host imap.example.org \
   --username me@example.org \
-  --folder Spam
+  --folder INBOX.Junk \
+  --folder INBOX.Spam \
+  --spam-action move \
+  --spam-destination INBOX.Trash \
+  --not-spam-action move \
+  --not-spam-destination INBOX.NotSpam
 ```
 
-The default file is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset.
+The default file is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset. `init` never stores a password. `imapledger config show` prints the configuration path and normalized effective TOML without prompting or connecting to IMAP.
 
-Example:
+Example configuration:
 
 ```toml
 [imap]
@@ -56,67 +55,58 @@ port = 993
 username = "me@example.org"
 
 [spam]
-folder = "Spam"
+folders = ["INBOX.Junk", "INBOX.Spam"]
 max_message_bytes = 2000000
 max_body_chars = 20000
 
-[spam.policy]
-legitimate_veto_at = 0.80
-phishing_delete_at = 0.90
-identity_deception_at = 0.90
-unsolicited_bulk_at = 0.92
-delete_safe_at = 0.88
-provider_junk_support_at = 0.80
+[spam.actions.spam]
+action = "move"
+destination = "INBOX.Trash"
 
-[spam.authentication]
-trusted_authserv_ids = []
+[spam.actions.not_spam]
+action = "move"
+destination = "INBOX.NotSpam"
 
-[spam.provider]
-trusted_spam_headers = []
+[spam.actions.review]
+action = "keep"
 ```
 
-Legacy `spam.threshold` values are deprecated, warned about, and ignored. They are not mapped to the new named thresholds. The documented policy defaults apply when `[spam.policy]` is absent.
-There is deliberately no password setting.
+The source folders are scanned in listed order. A `SpamVerdict.DELETE` maps to the spam outcome, `SpamVerdict.KEEP` maps to not-spam, and `SpamVerdict.REVIEW` maps to review. Configuration selects the action for each outcome. REVIEW defaults to keep. Skip and error results always keep. Delete is supported only for spam. Move destinations must already exist and cannot be any configured source folder.
+For the new plural `folders` schema, omitted action tables default to `keep`. Permanent deletion therefore requires an explicit `[spam.actions.spam]` entry. Legacy scalar `spam.folder` configurations retain the old spam-delete default when action tables are absent.
 
-`pyjev` authentication is separate; configure it as documented by `pyjev`.
+Legacy configurations with `spam.folder` remain supported with a deprecation warning. If they have no action tables, the old behavior is preserved: spam is deleted when `--apply` is used, and not-spam and review are kept. New configurations use `folders` and explicit action tables.
 
-## Dry run
+Legacy `spam.threshold` values are deprecated, warned about, and ignored. The documented policy defaults apply when `[spam.policy]` is absent. There is deliberately no password setting. Configure `pyjev` authentication separately as documented by `pyjev`.
+
+## Dry run and apply
 
 ```bash
-# Inspect the newest 10 messages (newest is the default sort)
+imapledger clean
 imapledger clean --limit 10
-
-# Inspect positions 11-20 among the newest messages
 imapledger clean --limit 10 --offset 10 --sort newest
-
-# Inspect the 25 oldest messages
-imapledger clean --limit 25 --sort oldest
-# Render the detailed report instead of streaming rows
-imapledger clean --limit 10 --no-progress
-```
-
-Every invocation prompts for the IMAP password. The default run is read-only and reports `WOULD DELETE` for DELETE verdicts. REVIEW is a distinct non-destructive outcome and is kept. With no `--limit`, the selected window extends from `--offset` to the end of the initial mailbox snapshot.
-
-`--sort newest` orders by descending IMAP UID, and `--sort oldest` orders by ascending IMAP UID. This is mailbox arrival order, not the message `Date:` header. `--offset` skips messages after sorting. The window is chosen from one stable initial UID snapshot, and only its selected UIDs are fetched for size metadata and eligible message bodies.
-
-Progress is enabled by default. It streams one decision with its position and selected total as each message is classified. Use `--no-progress` to suppress per-message rows and render the detailed report at the end. `--verbose` is separate and adds safe IMAP protocol-operation diagnostics; it does not control classification progress.
-
-## Apply DELETE verdicts
-
-```bash
+imapledger clean --no-progress
 imapledger clean --apply
-# Apply deletion only within the newest 10-message window
-imapledger clean --apply --limit 10 --sort newest
-IMAP password:
+imapledger doctor
+imapledger config show
 ```
 
-`--apply` refuses to run if the IMAP server does not advertise `UIDPLUS`. After classification, `imapledger` rechecks the mailbox `UIDVALIDITY`, verifies every approved UID still belongs to the same scoped mailbox, marks only those UIDs `\\Deleted`, and performs `UID EXPUNGE` only for those UIDs.
+Every `clean` and `doctor` invocation prompts once for the IMAP password. Without `--apply`, `clean` is read-only and reports planned actions such as `WOULD MOVE` or `WOULD DELETE`. With `--apply`, classification completes for one source before configured actions are executed for that source. Apply-mode progress first reports `MOVE-APPROVED` or `DELETE-APPROVED`; final output reports `MOVED` or `DELETED` only when confirmed.
 
-With progress enabled, apply-mode DELETE rows say `DELETE-APPROVED` while classification is pending. `DELETED` is reported only after the exact UID expunge succeeds. The summary distinguishes approved UIDs from confirmed deletions; partial deletion shows confirmed and pending UIDs and exits with a failure status.
+`--limit` and `--offset` apply independently to each source folder. With two folders, `--limit 10 --offset 10` selects positions 11 through 20 in each folder. `--sort newest` and `--sort oldest` order each folder by descending or ascending IMAP UID, which represents mailbox arrival order, not the message `Date:` header. UIDs are folder-local and are never globally ordered or merged.
 
-## Partial deletion results
+Moves require the IMAP MOVE capability and an existing destination. Deletes require UIDPLUS. `doctor` checks every configured source, the configured action capabilities, and all move destinations without mutating mail. Mutation batches stop on failure. Earlier confirmed actions remain applied, later action groups and source folders are not attempted, and the command exits non-zero. Inspect pending UIDs before retrying because their result was not confirmed.
 
-Apply mode processes approved UIDs in ascending batches of at most 100. If a batch fails, `imapledger` attempts to clear `\\Deleted` from that failing batch and stops. Earlier `UID EXPUNGE` batches that succeeded remain deleted. The report marks only confirmed UIDs as `DELETED`, shows unresolved approved UIDs as `NOT CONFIRMED`, and exits with a failure status. Inspect the folder before retrying; an ambiguous server response is not treated as success.
+See [the configuration guide](docs/configuration.md) and [the cleaning guide](docs/cleaning.md) for the complete schema, safety checks, reporting, and failure behavior.
+
+## Evidence and policy
+
+`imapledger/decisions.toml` defines one `spam-evidence` bundle with independent unsolicited-bulk, phishing/scam, identity-deception, legitimate/expected, and delete-safe questions. The classifier sends one structured state per message and validates every child probability. Operational UID data and raw authentication payloads are not sent as semantic evidence.
+
+Local evidence extraction normalizes sender and reply identities, list and automation metadata, provider markers, Unicode display-name hints, and bounded URL hostnames. URL paths and query tokens are removed from model state and normal reports. Message-provided values are untrusted content, never instructions.
+
+Authentication results remain untrusted unless an exact receiver `authserv-id` is explicitly configured under `[spam.authentication]`. Do not add guessed IDs. Generic spam headers remain soft evidence unless a trusted provider header is explicitly configured and the operator has verified that the provider inserts it. A passing SPF, DKIM, DMARC, or ARC result is identity evidence, not proof that a message is harmless.
+
+The pure deterministic policy applies named thresholds. Strong legitimate/expected evidence vetoes the spam-safe path, phishing can qualify directly, and identity or unsolicited-bulk findings need corroboration. Provider and subject spam markers alone lead to REVIEW. Changing a configured action does not change policy thresholds.
 
 ## Troubleshooting and diagnostic privacy
 
@@ -126,45 +116,20 @@ Start with the read-only protocol probe:
 imapledger doctor --verbose
 ```
 
-`doctor` checks TLS, login, capabilities, the configured folder in read-only mode, UID search, one size fetch, and an eligible single-message `BODY.PEEK[]` probe. It does not run the classifier or change mail. Probe body bytes are discarded and never printed.
+For a failing clean run, use `imapledger clean --verbose` to see safe IMAP operation progress. Use `--no-progress` to disable per-message rows and `--debug` for local traceback frames and exception class names. Neither option enables raw IMAP wire logging.
 
-For a failing clean run, use `imapledger clean --verbose` to see safe IMAP operation progress, including size-fetch batch metadata. Classification decisions stream by default; use `--no-progress` to disable those rows and `--debug` for local traceback frames and exception class names. Neither option enables raw IMAP wire logging.
+Errors include safe context such as the configured folder, selector, UID range, batch, and recognized server status token. They do not print passwords, authentication payloads, exception messages, raw server responses, or message bytes. Verbose output and reports can still reveal folder names, account identifiers, UIDs, senders, and subjects, so redact those details before sharing.
 
-Errors identify the failed operation and include safe context such as the configured folder, selector, UID range, and batch. When the IMAP client exposes a recognized command rejection, diagnostics retain only its status token (`BAD`, `NO`, or `BYE`), not the raw server response. They do not print passwords, authentication payloads, exception messages, or message bytes. Verbose output, streamed progress rows, and message tables can still reveal folder names, account identifiers, UIDs, senders, and subjects; redact those details before sharing output.
+The offline examples in `eval/spam_cases.jsonl` are synthetic and do not include real message bodies or recipient data.
 
-For `FETCH` failures, note whether the operation is `imap_fetch_size` or `imap_fetch_body`. A size-fetch error includes its bounded batch number and UID range; a body-fetch error identifies one UID. `doctor --verbose` can determine whether the read path and one-message probes work independently of classification. If a destructive run reports pending UIDs, check the mailbox directly before retrying because their outcome was not confirmed.
-
-## Evidence bundle and policy
-
-`imapledger/decisions.toml` defines one `spam-evidence` bundle with independent unsolicited-bulk, phishing/scam, identity-deception, legitimate/expected, and delete-safe questions. The classifier sends one structured state per message and validates every child probability. Operational UID data and raw authentication payloads are not sent as semantic evidence.
-
-Local evidence extraction normalizes sender and reply identities, list/automation metadata, provider markers, Unicode display-name hints, and bounded URL hostnames. URL paths and query tokens are removed from model state and normal reports. Message-provided values are untrusted content, never instructions.
-
-Authentication results remain untrusted unless an exact receiver `authserv-id` is explicitly configured under `[spam.authentication]`. Do not add guessed IDs. Generic spam headers remain soft evidence unless a trusted provider header is explicitly configured and the operator has verified that the provider inserts it. A passing SPF, DKIM, DMARC, or ARC result is identity evidence, not proof that a message is harmless.
-
-The pure deterministic policy applies named thresholds. Strong legitimate/expected evidence vetoes deletion, phishing can qualify directly, and identity or unsolicited-bulk findings need corroboration. Provider and subject spam markers alone lead to REVIEW. Both REVIEW and KEEP are non-destructive; classifier, evidence, and policy errors fail closed.
-
-The streamed row reports verdict, principal signals, and concise reasons. `--limit`, `--offset`, `--sort`, progress output, dry-run defaults, single-folder scope, UIDPLUS requirements, UIDVALIDITY checks, and exact-UID deletion remain unchanged. The small offline examples in `eval/spam_cases.jsonl` are synthetic and do not include real message bodies or recipient data.
-
-## Tests
+## Tests and builds
 
 ```bash
 pytest
 ruff check .
+sphinx-build -W docs docs/_build/html
 python -m build
 python -m twine check dist/*
 ```
 
-All tests are offline and use fake IMAP/classifier implementations.
-
-## Roadmap
-
-The package layout is intended to support additional workflows without turning the model into an unrestricted mail agent:
-
-- **sort**: a source-scoped reader plus a deterministic allow-list of destination folders; the model proposes a route, Python validates and moves it;
-- **daily digest**: read-only mailbox scopes, semantic importance scoring, then a local report/notification layer;
-- **important mail alerts**: read-only polling/IDLE with explicit thresholds and deduplication;
-- **credential hardening**: keyring, external secret helper, or a separate broker process so an agent never receives raw IMAP credentials;
-- **server-side isolation**: dedicated IMAP account/ACLs where the provider supports them.
-
-The invariant should remain: **models judge content; deterministic code owns permissions and side effects.**
+All tests are offline and use fake IMAP and classifier implementations. The invariant remains: **models judge content; deterministic code owns permissions and side effects.**

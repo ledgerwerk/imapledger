@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import warnings
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from ledgercore import AtomicWriteError, atomic_write_text
@@ -22,6 +23,48 @@ class ConfigError(ValueError):
     pass
 
 
+class ActionKind(str, Enum):
+    KEEP = "keep"
+    MOVE = "move"
+    DELETE = "delete"
+
+
+@dataclass(frozen=True, slots=True)
+class MessageAction:
+    action: ActionKind
+    destination: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, ActionKind):
+            try:
+                object.__setattr__(self, "action", ActionKind(self.action))
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"unknown action: {self.action!r}") from exc
+        if self.action is ActionKind.MOVE:
+            if not isinstance(self.destination, str) or not self.destination.strip():
+                raise ConfigError("move action requires a non-empty destination")
+            if self.destination != self.destination.strip():
+                raise ConfigError("action destination must not have leading or trailing whitespace")
+        elif self.destination is not None:
+            raise ConfigError(f"{self.action.value} action must not have a destination")
+
+
+@dataclass(frozen=True, slots=True)
+class SpamActions:
+    spam: MessageAction = field(default_factory=lambda: MessageAction(ActionKind.DELETE))
+    not_spam: MessageAction = field(default_factory=lambda: MessageAction(ActionKind.KEEP))
+    review: MessageAction = field(default_factory=lambda: MessageAction(ActionKind.KEEP))
+
+    def __post_init__(self) -> None:
+        for name in ("spam", "not_spam", "review"):
+            if not isinstance(getattr(self, name), MessageAction):
+                raise ConfigError(f"spam.actions.{name} must be a message action")
+        if self.not_spam.action is ActionKind.DELETE:
+            raise ConfigError("delete is not supported for the not_spam outcome")
+        if self.review.action is ActionKind.DELETE:
+            raise ConfigError("delete is not supported for the review outcome")
+
+
 @dataclass(frozen=True, slots=True)
 class ImapSettings:
     host: str
@@ -39,7 +82,8 @@ class ImapSettings:
 
 @dataclass(frozen=True, slots=True)
 class SpamSettings:
-    folder: str
+    folders: tuple[str, ...]
+    actions: SpamActions = field(default_factory=SpamActions)
     max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES
     max_body_chars: int = DEFAULT_MAX_BODY_CHARS
     policy: SpamPolicy = field(default_factory=SpamPolicy)
@@ -47,12 +91,28 @@ class SpamSettings:
     trusted_provider_headers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.folder.strip():
-            raise ConfigError("spam.folder must not be empty")
+        if not isinstance(self.folders, (tuple, list)):
+            raise ConfigError("spam.folders must be a non-empty array of folder names")
+        folders = tuple(self.folders)
+        object.__setattr__(self, "folders", folders)
+        if not folders:
+            raise ConfigError("spam.folders must not be empty")
+        if any(not isinstance(folder, str) for folder in folders):
+            raise ConfigError("spam.folders entries must be strings")
+        if any(not folder.strip() for folder in folders):
+            raise ConfigError("spam.folders entries must not be empty")
+        if any(folder != folder.strip() for folder in folders):
+            raise ConfigError("spam.folders entries must not have leading or trailing whitespace")
+        if len(set(folders)) != len(folders):
+            raise ConfigError("spam.folders must not contain duplicates")
         if self.max_message_bytes < 1:
             raise ConfigError("spam.max_message_bytes must be positive")
         if self.max_body_chars < 1:
             raise ConfigError("spam.max_body_chars must be positive")
+        for outcome in ("spam", "not_spam", "review"):
+            action = getattr(self.actions, outcome)
+            if action.action is ActionKind.MOVE and action.destination in folders:
+                raise ConfigError(f"spam.actions.{outcome} destination must not be a source folder")
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +148,23 @@ def load_settings(path: Path | None = None) -> Settings:
             stacklevel=2,
         )
 
+    if "folder" in spam and "folders" in spam:
+        raise ConfigError("spam.folder and spam.folders cannot both be configured")
+    if "folders" in spam:
+        folders = _folder_tuple(spam["folders"])
+    elif "folder" in spam:
+        folder = spam["folder"]
+        if not isinstance(folder, str):
+            raise ConfigError("spam.folder must be a string")
+        warnings.warn(
+            "spam.folder is deprecated; use spam.folders",
+            UserWarning,
+            stacklevel=2,
+        )
+        folders = (folder,)
+    else:
+        raise ConfigError("config requires spam.folders")
+
     policy_payload = spam.get("policy", {})
     authentication = spam.get("authentication", {})
     provider = spam.get("provider", {})
@@ -106,7 +183,8 @@ def load_settings(path: Path | None = None) -> Settings:
                 port=int(imap.get("port", 993)),
             ),
             spam=SpamSettings(
-                folder=str(spam["folder"]),
+                folders=folders,
+                actions=_parse_spam_actions(spam.get("actions", {}), legacy_defaults="folder" in spam),
                 max_message_bytes=int(spam.get("max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES)),
                 max_body_chars=int(spam.get("max_body_chars", DEFAULT_MAX_BODY_CHARS)),
                 policy=SpamPolicy(
@@ -133,30 +211,96 @@ def load_settings(path: Path | None = None) -> Settings:
         raise ConfigError(f"invalid config value: {exc}") from exc
 
 
+def _folder_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ConfigError("spam.folders must be an array of non-empty strings")
+    if any(not isinstance(folder, str) for folder in value):
+        raise ConfigError("spam.folders entries must be strings")
+    return tuple(value)
+
+
+def _parse_spam_actions(value: object, *, legacy_defaults: bool = False) -> SpamActions:
+    if not isinstance(value, dict):
+        raise ConfigError("spam.actions must be a table")
+    unknown_outcomes = set(value) - {"spam", "not_spam", "review"}
+    if unknown_outcomes:
+        raise ConfigError(f"unknown spam action outcome: {sorted(unknown_outcomes)[0]}")
+    defaults = SpamActions() if legacy_defaults else SpamActions(spam=MessageAction(ActionKind.KEEP))
+    parsed: dict[str, MessageAction] = {}
+    for outcome in ("spam", "not_spam", "review"):
+        if outcome not in value:
+            parsed[outcome] = getattr(defaults, outcome)
+            continue
+        table = value[outcome]
+        if not isinstance(table, dict):
+            raise ConfigError(f"spam.actions.{outcome} must be a table")
+        unknown_keys = set(table) - {"action", "destination"}
+        if unknown_keys:
+            raise ConfigError(f"unknown key in spam.actions.{outcome}: {sorted(unknown_keys)[0]}")
+        if "action" not in table:
+            raise ConfigError(f"spam.actions.{outcome} requires an action")
+        raw_action = table["action"]
+        if not isinstance(raw_action, str):
+            raise ConfigError(f"spam.actions.{outcome}.action must be a string")
+        try:
+            action = ActionKind(raw_action)
+        except ValueError as exc:
+            raise ConfigError(f"unknown action for spam.actions.{outcome}: {raw_action!r}") from exc
+        if action is ActionKind.MOVE:
+            if "destination" not in table:
+                raise ConfigError(f"move action for spam.actions.{outcome} requires a destination")
+            destination = table["destination"]
+            if not isinstance(destination, str):
+                raise ConfigError(f"spam.actions.{outcome}.destination must be a string")
+        else:
+            if "destination" in table:
+                raise ConfigError(f"{action.value} action for spam.actions.{outcome} must not have a destination")
+            destination = None
+        parsed[outcome] = MessageAction(action=action, destination=destination)
+    return SpamActions(**parsed)
+
+
+def render_settings(settings: Settings) -> str:
+    thresholds = settings.spam.policy.thresholds()
+    lines = [
+        "[imap]",
+        f'host = "{_toml_string(settings.imap.host)}"',
+        f"port = {settings.imap.port}",
+        f'username = "{_toml_string(settings.imap.username)}"',
+        "",
+        "[spam]",
+        f"folders = {_toml_string_array(settings.spam.folders)}",
+        f"max_message_bytes = {settings.spam.max_message_bytes}",
+        f"max_body_chars = {settings.spam.max_body_chars}",
+    ]
+    for outcome in ("spam", "not_spam", "review"):
+        action = getattr(settings.spam.actions, outcome)
+        lines.extend(("", f"[spam.actions.{outcome}]", f'action = "{action.action.value}"'))
+        if action.destination is not None:
+            lines.append(f'destination = "{_toml_string(action.destination)}"')
+    lines.extend(("", "[spam.policy]"))
+    lines.extend(f"{name} = {value}" for name, value in thresholds.items())
+    lines.extend(
+        (
+            "",
+            "[spam.authentication]",
+            f"trusted_authserv_ids = {_toml_string_array(settings.spam.trusted_authserv_ids)}",
+            "",
+            "[spam.provider]",
+            f"trusted_spam_headers = {_toml_string_array(settings.spam.trusted_provider_headers)}",
+            "",
+        )
+    )
+    return "\n".join(lines)
+
+
 def write_settings(settings: Settings, path: Path | None = None, *, overwrite: bool = False) -> Path:
     config_path = path or default_config_path()
     if config_path.exists() and not overwrite:
         raise ConfigError(f"config already exists: {config_path}; use --force to overwrite")
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    thresholds = settings.spam.policy.thresholds()
-    text = (
-        "[imap]\n"
-        f'host = "{_toml_string(settings.imap.host)}"\n'
-        f"port = {settings.imap.port}\n"
-        f'username = "{_toml_string(settings.imap.username)}"\n'
-        "\n[spam]\n"
-        f'folder = "{_toml_string(settings.spam.folder)}"\n'
-        f"max_message_bytes = {settings.spam.max_message_bytes}\n"
-        f"max_body_chars = {settings.spam.max_body_chars}\n"
-        "\n[spam.policy]\n"
-        + "".join(f"{name} = {value}\n" for name, value in thresholds.items())
-        + "\n[spam.authentication]\n"
-        + f"trusted_authserv_ids = {_toml_string_array(settings.spam.trusted_authserv_ids)}\n"
-        + "\n[spam.provider]\n"
-        + f"trusted_spam_headers = {_toml_string_array(settings.spam.trusted_provider_headers)}\n"
-    )
     try:
-        atomic_write_text(config_path, text)
+        atomic_write_text(config_path, render_settings(settings))
     except AtomicWriteError as exc:
         raise ConfigError(f"could not write config {config_path}: {exc}") from exc
     try:

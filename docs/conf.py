@@ -5,14 +5,14 @@ from importlib import metadata
 sys.path.insert(0, os.path.abspath(".."))
 
 project = "imapledger"
-copyright = "2026, Taskledger Contributors"
+copyright = "2026, Imapledger Contributors"
 author = "Imapledger Contributors"
 
 try:
     release = metadata.version("imapledger")
 except metadata.PackageNotFoundError:
     try:
-        from taskledger._version import __version__ as release
+        from imapledger._version import __version__ as release
     except ImportError:
         release = "0.1.0"
 

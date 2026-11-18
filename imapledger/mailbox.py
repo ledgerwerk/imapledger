@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
@@ -12,7 +12,8 @@ DELETED_FLAG = "\\Deleted"
 
 
 DEFAULT_FETCH_BATCH_SIZE = 100
-DEFAULT_DELETE_BATCH_SIZE = 100
+DEFAULT_MUTATION_BATCH_SIZE = 100
+DEFAULT_DELETE_BATCH_SIZE = DEFAULT_MUTATION_BATCH_SIZE
 
 
 class MailboxError(RuntimeError):
@@ -110,6 +111,44 @@ class PartialDeleteError(ImapOperationError):
         return f"{super().__str__()}\nconfirmed_deleted_count={len(self.deleted)} pending_count={len(self.pending)}"
 
 
+@dataclass(frozen=True, slots=True)
+class MoveResult:
+    moved: tuple[int, ...]
+    destination: str
+
+
+class PartialMoveError(ImapOperationError):
+    def __init__(
+        self,
+        *,
+        moved: Sequence[int],
+        pending: Sequence[int],
+        destination: str,
+        failure: ImapOperationError,
+    ) -> None:
+        self.moved = tuple(int(uid) for uid in moved)
+        self.pending = tuple(int(uid) for uid in pending)
+        self.destination = destination
+        self.cause = failure
+        super().__init__(
+            operation=failure.operation,
+            message="move stopped after a failed UID batch",
+            folder=failure.folder,
+            selector=failure.selector,
+            uids=self.pending,
+            batch=failure.batch,
+            batch_count=failure.batch_count,
+            cause_type=failure.cause_type,
+            server_status=failure.server_status,
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"{super().__str__()} destination={self.destination!r}\n"
+            f"confirmed_moved_count={len(self.moved)} pending_count={len(self.pending)}"
+        )
+
+
 class UnsafeMailboxOperation(MailboxError):
     pass
 
@@ -119,12 +158,13 @@ class _Client(Protocol):
     def logout(self) -> Any: ...
     def capabilities(self) -> Any: ...
     def select_folder(self, folder: str, readonly: bool = False) -> dict[bytes, Any]: ...
+    def folder_exists(self, folder: str) -> bool: ...
     def search(self, criteria: Any = "ALL", charset: str | None = None) -> list[int]: ...
     def fetch(self, messages: Any, data: Any, modifiers: Any = None) -> dict[int, dict[bytes, Any]]: ...
+    def move(self, messages: Any, folder: str) -> Any: ...
     def add_flags(self, messages: Any, flags: Any, silent: bool = False) -> Any: ...
     def remove_flags(self, messages: Any, flags: Any, silent: bool = False) -> Any: ...
     def uid_expunge(self, messages: Any) -> Any: ...
-
 
 ClientFactory = Callable[..., _Client]
 
@@ -193,12 +233,22 @@ class ScopedMailbox:
         max_body_chars: int,
         timeout: float = 30.0,
         fetch_batch_size: int = DEFAULT_FETCH_BATCH_SIZE,
-        delete_batch_size: int = DEFAULT_DELETE_BATCH_SIZE,
+        mutation_batch_size: int = DEFAULT_MUTATION_BATCH_SIZE,
+        delete_batch_size: int | None = None,
+        allowed_destinations: Collection[str] = (),
+        allow_delete: bool = False,
         client_factory: ClientFactory | None = None,
         event_callback: Callable[[str], None] | None = None,
     ) -> None:
-        if not folder.strip():
-            raise ValueError("folder must not be empty")
+        if not folder.strip() or folder != folder.strip():
+            raise ValueError("folder must be non-empty and have no surrounding whitespace")
+        destinations = tuple(allowed_destinations)
+        if any(not isinstance(destination, str) or not destination.strip() for destination in destinations):
+            raise ValueError("allowed destinations must be non-empty strings")
+        if any(destination != destination.strip() for destination in destinations):
+            raise ValueError("allowed destinations must not have surrounding whitespace")
+        self._allowed_destinations = frozenset(destinations)
+        self._allow_delete = allow_delete
         self._host = host
         self._port = port
         self._username = username
@@ -209,16 +259,18 @@ class ScopedMailbox:
         self._max_body_chars = max_body_chars
         if fetch_batch_size <= 0:
             raise ValueError("fetch_batch_size must be positive")
-        if delete_batch_size <= 0:
-            raise ValueError("delete_batch_size must be positive")
+        if delete_batch_size is not None:
+            mutation_batch_size = delete_batch_size
+        if mutation_batch_size <= 0:
+            raise ValueError("mutation_batch_size must be positive")
         self._timeout = timeout
         self._fetch_batch_size = fetch_batch_size
-        self._delete_batch_size = delete_batch_size
+        self._mutation_batch_size = mutation_batch_size
         self._client_factory = client_factory or _default_client_factory
         self._event_callback = event_callback
         self._client: _Client | None = None
         self._snapshot: MailboxSnapshot | None = None
-
+        self._capabilities: frozenset[bytes] | None = None
     @property
     def folder(self) -> str:
         return self._folder
@@ -226,6 +278,28 @@ class ScopedMailbox:
     @property
     def writable(self) -> bool:
         return self._writable
+
+
+    @property
+    def capabilities(self) -> frozenset[bytes]:
+        if self._capabilities is None:
+            raise MailboxError("mailbox is not open")
+        return self._capabilities
+
+    def destination_exists(self, destination: str) -> bool:
+        if destination not in self._allowed_destinations:
+            raise UnsafeMailboxOperation("refusing to inspect a destination outside the configured allow-list")
+        client = self._require_client()
+        try:
+            return bool(client.folder_exists(destination))
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_folder_exists",
+                message="could not verify configured move destination",
+                exc=exc,
+                folder=self._folder,
+                selector=destination,
+            ) from exc
 
     def __enter__(self) -> ScopedMailbox:
         self._emit(f"connect host={self._host} port={self._port} tls=true")
@@ -261,10 +335,11 @@ class ScopedMailbox:
                     exc=exc,
                 ) from exc
             self._emit(f"capabilities count={len(capabilities)}")
-            if self._writable and not _contains_capability(capabilities, b"UIDPLUS"):
-                raise UnsafeMailboxOperation(
-                    "destructive mode requires IMAP UIDPLUS so only approved UIDs can be expunged"
-                )
+            normalized_capabilities = frozenset(_normalize_capabilities(capabilities))
+            if self._writable and self._allowed_destinations and b"MOVE" not in normalized_capabilities:
+                raise UnsafeMailboxOperation("configured move action requires IMAP MOVE")
+            if self._writable and self._allow_delete and b"UIDPLUS" not in normalized_capabilities:
+                raise UnsafeMailboxOperation("configured delete action requires IMAP UIDPLUS")
 
             try:
                 selected = client.select_folder(self._folder, readonly=not self._writable)
@@ -297,12 +372,14 @@ class ScopedMailbox:
             raise
         self._client = client
         self._snapshot = MailboxSnapshot(uidvalidity=uidvalidity, uids=uids)
+        self._capabilities = normalized_capabilities
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         client = self._client
         self._client = None
         self._snapshot = None
+        self._capabilities = None
         self._password = ""
         if client is not None:
             try:
@@ -492,63 +569,60 @@ class ScopedMailbox:
                     message=parse_message(uid, raw, max_body_chars=self._max_body_chars),
                 )
 
+    def move_uids(self, uids: Sequence[int], destination: str) -> MoveResult:
+        if destination not in self._allowed_destinations:
+            raise UnsafeMailboxOperation("refusing to move to a destination outside the configured allow-list")
+        if destination == self._folder:
+            raise UnsafeMailboxOperation("refusing to move messages to their source folder")
+        client, requested = self._validate_mutation_uids(
+            uids,
+            required_capability=b"MOVE",
+            operation_prefix="move",
+        )
+        if not requested:
+            return MoveResult(moved=(), destination=destination)
+        batch_count = (len(requested) + self._mutation_batch_size - 1) // self._mutation_batch_size
+        completed: list[int] = []
+        for batch_number, uid_batch in enumerate(_iter_chunks(requested, self._mutation_batch_size), start=1):
+            self._emit(
+                f"move batch={batch_number}/{batch_count} destination={destination!r} "
+                f"uid_count={len(uid_batch)} uid_min={min(uid_batch)} uid_max={max(uid_batch)}"
+            )
+            try:
+                client.move(uid_batch, destination)
+            except Exception as exc:
+                failure = _operation_error(
+                    operation="imap_uid_move",
+                    message="UID MOVE failed",
+                    exc=exc,
+                    folder=self._folder,
+                    selector=f"destination={destination}",
+                    uids=uid_batch,
+                    batch=batch_number,
+                    batch_count=batch_count,
+                )
+                raise PartialMoveError(
+                    moved=completed,
+                    pending=requested[len(completed) :],
+                    destination=destination,
+                    failure=failure,
+                ) from exc
+            completed.extend(uid_batch)
+        return MoveResult(moved=tuple(completed), destination=destination)
+
     def delete_uids(self, uids: Sequence[int]) -> DeleteResult:
-        if not self._writable:
-            raise UnsafeMailboxOperation("mailbox is read-only")
-        client = self._require_client()
-        snapshot = self.snapshot()
-        requested = tuple(sorted({int(uid) for uid in uids}))
+        if not self._allow_delete:
+            raise UnsafeMailboxOperation("deletion is not allowed by the configured spam action")
+        client, requested = self._validate_mutation_uids(
+            uids,
+            required_capability=b"UIDPLUS",
+            operation_prefix="delete",
+        )
         if not requested:
             return DeleteResult(deleted=())
-        outside = set(requested) - snapshot.uids
-        if outside:
-            raise UnsafeMailboxOperation(f"refusing UIDs outside initial mailbox snapshot: {sorted(outside)}")
-        try:
-            has_uidplus = _has_capability(client, b"UIDPLUS")
-        except Exception as exc:
-            raise _operation_error(
-                operation="imap_capabilities",
-                message="could not verify UIDPLUS before deletion",
-                exc=exc,
-                folder=self._folder,
-                uids=requested,
-            ) from exc
-        if not has_uidplus:
-            raise UnsafeMailboxOperation("UIDPLUS disappeared; refusing deletion")
-
-        try:
-            selected = client.select_folder(self._folder, readonly=False)
-        except Exception as exc:
-            raise _operation_error(
-                operation="imap_predelete_select",
-                message="could not reselect configured folder before deletion",
-                exc=exc,
-                folder=self._folder,
-                uids=requested,
-            ) from exc
-        current_uidvalidity = _uidvalidity(selected)
-        if current_uidvalidity != snapshot.uidvalidity:
-            raise UnsafeMailboxOperation(
-                f"UIDVALIDITY changed from {snapshot.uidvalidity} to {current_uidvalidity}; refusing deletion"
-            )
-
-        try:
-            current_uids = {int(uid) for uid in client.search("ALL")}
-        except Exception as exc:
-            raise _operation_error(
-                operation="imap_predelete_search",
-                message="UID SEARCH ALL failed before deletion",
-                exc=exc,
-                folder=self._folder,
-                uids=requested,
-            ) from exc
-        missing = set(requested) - current_uids
-        if missing:
-            raise UnsafeMailboxOperation(f"approved UIDs no longer exist in scoped mailbox: {sorted(missing)}")
-
-        batch_count = (len(requested) + self._delete_batch_size - 1) // self._delete_batch_size
+        batch_count = (len(requested) + self._mutation_batch_size - 1) // self._mutation_batch_size
         completed: list[int] = []
-        for batch_number, uid_batch in enumerate(_iter_chunks(requested, self._delete_batch_size), start=1):
+        for batch_number, uid_batch in enumerate(_iter_chunks(requested, self._mutation_batch_size), start=1):
             self._emit(
                 f"delete batch={batch_number}/{batch_count} uid_count={len(uid_batch)} "
                 f"uid_min={min(uid_batch)} uid_max={max(uid_batch)}"
@@ -566,6 +640,67 @@ class ScopedMailbox:
             completed.extend(uid_batch)
         return DeleteResult(deleted=tuple(completed))
 
+    def _validate_mutation_uids(
+        self,
+        uids: Sequence[int],
+        *,
+        required_capability: bytes,
+        operation_prefix: str,
+    ) -> tuple[_Client, tuple[int, ...]]:
+        if not self._writable:
+            raise UnsafeMailboxOperation("mailbox is read-only")
+        client = self._require_client()
+        requested = tuple(sorted({int(uid) for uid in uids}))
+        if not requested:
+            return client, ()
+        snapshot = self.snapshot()
+        outside = set(requested) - snapshot.uids
+        if outside:
+            raise UnsafeMailboxOperation(f"refusing UIDs outside initial mailbox snapshot: {sorted(outside)}")
+        capability_name = required_capability.decode("ascii")
+        try:
+            has_capability = _has_capability(client, required_capability)
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_capabilities",
+                message=f"could not verify {capability_name} before mutation",
+                exc=exc,
+                folder=self._folder,
+                uids=requested,
+            ) from exc
+        if not has_capability:
+            raise UnsafeMailboxOperation(f"{capability_name} disappeared; refusing {operation_prefix}")
+
+        try:
+            selected = client.select_folder(self._folder, readonly=False)
+        except Exception as exc:
+            raise _operation_error(
+                operation=f"imap_pre{operation_prefix}_select",
+                message="could not reselect configured folder before mutation",
+                exc=exc,
+                folder=self._folder,
+                uids=requested,
+            ) from exc
+        current_uidvalidity = _uidvalidity(selected)
+        if current_uidvalidity != snapshot.uidvalidity:
+            raise UnsafeMailboxOperation(
+                f"UIDVALIDITY changed from {snapshot.uidvalidity} to {current_uidvalidity}; refusing {operation_prefix}"
+            )
+
+        try:
+            current_uids = {int(uid) for uid in client.search("ALL")}
+        except Exception as exc:
+            raise _operation_error(
+                operation=f"imap_pre{operation_prefix}_search",
+                message="UID SEARCH ALL failed before mutation",
+                exc=exc,
+                folder=self._folder,
+                uids=requested,
+            ) from exc
+        missing = set(requested) - current_uids
+        if missing:
+            raise UnsafeMailboxOperation(f"approved UIDs no longer exist in scoped mailbox: {sorted(missing)}")
+        return client, requested
     def _delete_batch(self, client: _Client, uids: Sequence[int]) -> None:
         try:
             client.add_flags(uids, [DELETED_FLAG], silent=True)

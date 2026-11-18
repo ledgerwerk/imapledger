@@ -5,7 +5,9 @@ from imapledger.mailbox import (
     ImapOperationError,
     MessageSelection,
     MessageSort,
+    MoveResult,
     PartialDeleteError,
+    PartialMoveError,
     ScopedMailbox,
     UnsafeMailboxOperation,
 )
@@ -14,7 +16,7 @@ RAW = b"From: spammer@example.org\r\nTo: me@example.org\r\nSubject: Buy now\r\n\
 
 
 class FakeClient:
-    def __init__(self, *, capabilities=(b"IMAP4rev1", b"UIDPLUS"), uidvalidity=42, size=None, uids=None):
+    def __init__(self, *, capabilities=(b"IMAP4rev1", b"UIDPLUS", b"MOVE"), uidvalidity=42, size=None, uids=None):
         self._capabilities = capabilities
         self.uidvalidity = uidvalidity
         self.size = len(RAW) if size is None else size
@@ -24,8 +26,12 @@ class FakeClient:
         self.added = []
         self.removed = []
         self.expunged = []
+        self.moves = []
+        self.existing_folders = {"INBOX.Trash"}
+        self.folder_queries = []
         self.logged_out = False
         self.fail_on = None
+        self.fail_move_on_call = None
         self.failure_text = "FETCH command error: BAD password=secret raw_message=" + RAW.decode()
 
     def _maybe_fail(self, operation):
@@ -48,6 +54,11 @@ class FakeClient:
         self.selected.append((folder, readonly))
         return {b"UIDVALIDITY": self.uidvalidity, b"EXISTS": len(self.uids), b"FLAGS": (), b"RECENT": 0}
 
+    def folder_exists(self, folder):
+        self._maybe_fail("folder_exists")
+        self.folder_queries.append(folder)
+        return folder in self.existing_folders
+
     def search(self, criteria="ALL", charset=None):
         self._maybe_fail("search")
         return self.uids
@@ -62,6 +73,12 @@ class FakeClient:
         self._maybe_fail("fetch_body")
         return {uid: {b"BODY[]": RAW} for uid in messages}
 
+    def move(self, messages, folder):
+        if self.fail_move_on_call == len(self.moves) + 1:
+            raise RuntimeError(self.failure_text)
+        self._maybe_fail("move")
+        self.moves.append((tuple(messages), folder))
+
     def add_flags(self, messages, flags, silent=False):
         self._maybe_fail("add_flags")
         self.added.append((tuple(messages), tuple(flags), silent))
@@ -74,7 +91,6 @@ class FakeClient:
         self._maybe_fail("uid_expunge")
         self.expunged.append(tuple(messages))
 
-
 def factory_for(client):
     return lambda *args, **kwargs: client
 
@@ -85,10 +101,15 @@ def make_mailbox(
     writable,
     max_message_bytes=1_000_000,
     fetch_batch_size=100,
-    delete_batch_size=100,
+    mutation_batch_size=100,
+    delete_batch_size=None,
+    allowed_destinations=(),
+    allow_delete=None,
     event_callback=None,
     client_factory=None,
 ):
+    if allow_delete is None:
+        allow_delete = writable
     return ScopedMailbox(
         host="imap.example.org",
         port=993,
@@ -99,11 +120,13 @@ def make_mailbox(
         max_message_bytes=max_message_bytes,
         max_body_chars=20_000,
         fetch_batch_size=fetch_batch_size,
+        mutation_batch_size=mutation_batch_size,
         delete_batch_size=delete_batch_size,
+        allowed_destinations=allowed_destinations,
+        allow_delete=allow_delete,
         client_factory=client_factory or factory_for(client),
         event_callback=event_callback,
     )
-
 
 def test_writable_mode_requires_uidplus() -> None:
     client = FakeClient(capabilities=(b"IMAP4rev1",))
@@ -415,3 +438,147 @@ def test_uid_mode_and_password_reference_lifetime():
     with pytest.raises(ImapOperationError, match="imap_login"):
         failed_mailbox.__enter__()
     assert failed_mailbox._password == ""
+
+
+
+def test_writable_keep_only_does_not_require_mutation_capabilities() -> None:
+    client = FakeClient(capabilities=(b"IMAP4rev1",))
+
+    with make_mailbox(client, writable=True, allow_delete=False):
+        pass
+
+    assert client.selected == [("Spam", False)]
+
+
+def test_move_only_apply_does_not_require_uidplus() -> None:
+    client = FakeClient(capabilities=(b"IMAP4rev1", b"MOVE"), uids=[10])
+    with make_mailbox(
+        client,
+        writable=True,
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+    ) as mailbox:
+        result = mailbox.move_uids([10], "INBOX.Trash")
+
+    assert result == MoveResult(moved=(10,), destination="INBOX.Trash")
+    assert client.moves == [((10,), "INBOX.Trash")]
+    assert client.expunged == []
+    assert client.selected == [("Spam", False), ("Spam", False)]
+
+
+def test_move_requires_capability_before_selecting_source() -> None:
+    client = FakeClient(capabilities=(b"IMAP4rev1", b"UIDPLUS"))
+    with pytest.raises(UnsafeMailboxOperation, match="requires IMAP MOVE"):
+        with make_mailbox(client, writable=True, allowed_destinations=("INBOX.Trash",), allow_delete=False):
+            pass
+    assert client.selected == []
+
+
+def test_move_rejects_unallowed_destination_and_source_destination() -> None:
+    client = FakeClient()
+    with make_mailbox(client, writable=True, allowed_destinations=("INBOX.Trash",), allow_delete=False) as mailbox:
+        with pytest.raises(UnsafeMailboxOperation, match="outside the configured allow-list"):
+            mailbox.move_uids([10], "INBOX.Other")
+    assert client.moves == []
+
+    source_client = FakeClient()
+    with make_mailbox(source_client, writable=True, allowed_destinations=("Spam",), allow_delete=False) as mailbox:
+        with pytest.raises(UnsafeMailboxOperation, match="source folder"):
+            mailbox.move_uids([10], "Spam")
+    assert source_client.moves == []
+
+
+def test_move_normalizes_uids_and_batches_exact_uid_commands() -> None:
+    client = FakeClient(uids=[1, 2, 3, 4, 5])
+    with make_mailbox(
+        client,
+        writable=True,
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+        mutation_batch_size=2,
+    ) as mailbox:
+        result = mailbox.move_uids([5, 3, 4, 3, 1], "INBOX.Trash")
+
+    assert result.moved == (1, 3, 4, 5)
+    assert client.moves == [((1, 3), "INBOX.Trash"), ((4, 5), "INBOX.Trash")]
+
+
+def test_move_rejects_uid_outside_initial_snapshot() -> None:
+    client = FakeClient()
+    with make_mailbox(client, writable=True, allowed_destinations=("INBOX.Trash",), allow_delete=False) as mailbox:
+        with pytest.raises(UnsafeMailboxOperation, match="outside initial"):
+            mailbox.move_uids([999], "INBOX.Trash")
+    assert client.moves == []
+
+
+def test_uidvalidity_change_aborts_move_before_mutation() -> None:
+    client = FakeClient()
+    with make_mailbox(client, writable=True, allowed_destinations=("INBOX.Trash",), allow_delete=False) as mailbox:
+        client.uidvalidity = 43
+        with pytest.raises(UnsafeMailboxOperation, match="UIDVALIDITY changed"):
+            mailbox.move_uids([10], "INBOX.Trash")
+    assert client.moves == []
+
+
+def test_disappeared_uid_aborts_move_before_mutation() -> None:
+    client = FakeClient(uids=[10, 20])
+    with make_mailbox(client, writable=True, allowed_destinations=("INBOX.Trash",), allow_delete=False) as mailbox:
+        client.uids = [20]
+        with pytest.raises(UnsafeMailboxOperation, match="no longer exist"):
+            mailbox.move_uids([10], "INBOX.Trash")
+    assert client.moves == []
+
+
+def test_partial_move_reports_confirmed_and_pending_uids_safely() -> None:
+    client = FakeClient(uids=[1, 2, 3, 4, 5])
+    client.fail_move_on_call = 2
+    with make_mailbox(
+        client,
+        writable=True,
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+        mutation_batch_size=2,
+    ) as mailbox:
+        with pytest.raises(PartialMoveError) as raised:
+            mailbox.move_uids([1, 2, 3, 4, 5], "INBOX.Trash")
+
+    error = raised.value
+    rendered = str(error)
+    assert error.moved == (1, 2)
+    assert error.pending == (3, 4, 5)
+    assert error.destination == "INBOX.Trash"
+    assert error.operation == "imap_uid_move"
+    assert error.batch == 2 and error.batch_count == 3
+    assert client.moves == [((1, 2), "INBOX.Trash")]
+    assert "server_status=BAD" in rendered
+    assert "password=secret" not in rendered
+    assert RAW.decode() not in rendered
+
+
+def test_destination_existence_is_allow_listed_and_read_only() -> None:
+    client = FakeClient()
+    with make_mailbox(client, writable=False, allowed_destinations=("INBOX.Trash", "INBOX.Missing")) as mailbox:
+        assert mailbox.destination_exists("INBOX.Trash")
+        assert not mailbox.destination_exists("INBOX.Missing")
+        with pytest.raises(UnsafeMailboxOperation, match="outside the configured allow-list"):
+            mailbox.destination_exists("INBOX.Other")
+
+    assert client.folder_queries == ["INBOX.Trash", "INBOX.Missing"]
+    assert client.moves == []
+    assert client.expunged == []
+
+
+def test_delete_requires_explicit_allow_delete() -> None:
+    client = FakeClient()
+    with make_mailbox(client, writable=True, allow_delete=False) as mailbox:
+        with pytest.raises(UnsafeMailboxOperation, match="not allowed"):
+            mailbox.delete_uids([10])
+    assert client.expunged == []
+
+
+def test_delete_requires_uidplus_but_not_move() -> None:
+    client = FakeClient(capabilities=(b"IMAP4rev1", b"UIDPLUS"))
+    with make_mailbox(client, writable=True, allow_delete=True) as mailbox:
+        result = mailbox.delete_uids([10])
+    assert result.deleted == (10,)
+    assert client.expunged == [(10,)]
