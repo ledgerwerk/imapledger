@@ -7,6 +7,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from imapledger import cli
+from imapledger.classifier import SemanticSpamSignals
 from imapledger.cleaner import CleanReport, MessageResult
 from imapledger.config import ImapSettings, Settings, SpamSettings
 from imapledger.mailbox import (
@@ -16,6 +17,7 @@ from imapledger.mailbox import (
     PartialDeleteError,
     ScopedMailbox,
 )
+from imapledger.policy import SpamVerdict
 
 
 class FailingMailbox:
@@ -96,6 +98,9 @@ class CleanFakeMailbox:
 
 
 class CleanFakeClassifier:
+    def __init__(self, **kwargs):
+        self.options = kwargs
+
     def __enter__(self):
         return self
 
@@ -117,7 +122,7 @@ def _configure_clean(monkeypatch, report, output):
     monkeypatch.setattr(cli, "PyJevSpamClassifier", CleanFakeClassifier)
 
     class FakeCleaner:
-        def __init__(self, mailbox, classifier, *, threshold):
+        def __init__(self, mailbox, classifier, *, policy):
             pass
 
         def run(self, *, apply, selection, on_result):
@@ -136,15 +141,16 @@ def _configure_clean(monkeypatch, report, output):
 def _stream_report(*, apply=False):
     return CleanReport(
         folder="Spam",
-        threshold=0.95,
         apply=apply,
         results=[
             MessageResult(
                 uid=40,
-                subject="spam-subject",
+                subject="spam-subject https://tracking.example/path?token=secret",
                 sender="spam@example.org",
-                probability=0.992,
-                status="spam",
+                verdict=SpamVerdict.DELETE,
+                signals=SemanticSpamSignals(0.97, 0.02, 0.15, 0.01, 0.99),
+                reasons=("unsolicited-bulk", "delete-safe-corroboration"),
+                status="delete",
                 inclination="DELETE-APPROVED",
                 deleted=apply,
             ),
@@ -152,7 +158,9 @@ def _stream_report(*, apply=False):
                 uid=30,
                 subject="keep-subject",
                 sender="keep@example.org",
-                probability=0.021,
+                verdict=SpamVerdict.KEEP,
+                signals=SemanticSpamSignals(0.02, 0.01, 0.03, 0.92, 0.05),
+                reasons=("strong-legitimate-or-expected",),
                 status="keep",
                 inclination="KEEP",
             ),
@@ -160,7 +168,9 @@ def _stream_report(*, apply=False):
                 uid=20,
                 subject="",
                 sender="",
-                probability=None,
+                verdict=None,
+                signals=None,
+                reasons=(),
                 status="skip",
                 inclination="SKIP",
                 detail="message too large",
@@ -169,18 +179,19 @@ def _stream_report(*, apply=False):
                 uid=10,
                 subject="error-subject",
                 sender="error@example.org",
-                probability=None,
+                verdict=None,
+                signals=None,
+                reasons=(),
                 status="error",
                 inclination="ERROR / KEEP",
-                detail="RuntimeError: classifier evaluation failed",
+                detail="RuntimeError: classification evaluation failed",
             ),
         ],
     )
 
-
 def test_clean_forwards_selection_arguments(monkeypatch):
     output = StringIO()
-    report = CleanReport(folder="Spam", threshold=0.95, apply=False, results=[])
+    report = CleanReport(folder="Spam", apply=False, results=[])
     mailbox, observed = _configure_clean(monkeypatch, report, output)
 
     result = CliRunner().invoke(
@@ -215,13 +226,16 @@ def test_clean_streams_decisions_once_with_summary(monkeypatch):
     rendered = output.getvalue()
     assert result.exit_code == 0
     assert "folder=Spam messages=4 selected=4 sort=newest offset=0 limit=all" in rendered
-    assert "[1/4] UID 40  WOULD DELETE  P(spam)=0.992" in rendered
-    assert "Inclination=DELETE-APPROVED" in rendered
-    assert "[2/4] UID 30  KEEP  P(spam)=0.021" in rendered
-    assert "[3/4] UID 20  SKIP / KEEP  P(spam)=-" in rendered
-    assert "[4/4] UID 10  ERROR / KEEP  P(spam)=-" in rendered
+    assert "[1/4] UID 40  WOULD DELETE  Verdict=DELETE" in rendered
+    assert "Signals=bulk=0.97 phishing=0.02 identity=0.15 legit=0.01 delete=0.99" in rendered
+    assert "Reasons=unsolicited-bulk,delete-safe-corroboration" in rendered
+    assert "[2/4] UID 30  KEEP  Verdict=KEEP" in rendered
+    assert "[3/4] UID 20  SKIP / KEEP  Verdict=-  Signals=-" in rendered
+    assert "[4/4] UID 10  ERROR / KEEP  Verdict=-  Signals=-" in rendered
     assert rendered.count("spam-subject") == 1
-    assert "Scanned 4; spam 1; kept 1; skipped 1; errors 1; deleted 0." in rendered
+    assert "token=secret" not in rendered
+    assert "/path" not in rendered
+    assert "Scanned 4; delete 1; kept 1; review 0; skipped 1; errors 1; deleted 0." in rendered
     assert "Dry-run only." in rendered
 
 
@@ -397,27 +411,30 @@ def test_doctor_logout_failure_is_contextual_and_private(monkeypatch):
 
 
 
-def test_report_shows_inclination_and_skip_error_detail(monkeypatch):
+def test_report_shows_verdict_signals_reasons_and_safe_skip_error_detail(monkeypatch):
     output = StringIO()
     monkeypatch.setattr(cli, "console", Console(file=output, width=200))
     report = CleanReport(
         folder="Spam",
-        threshold=0.95,
         apply=False,
         results=[
             MessageResult(
                 uid=1,
-                subject="spam",
+                subject="spam https://tracking.example/path?token=secret",
                 sender="a@example.org",
-                probability=0.99,
-                status="spam",
+                verdict=SpamVerdict.DELETE,
+                signals=SemanticSpamSignals(0.97, 0.1, 0.2, 0.03, 0.91),
+                reasons=("unsolicited-bulk",),
+                status="delete",
                 inclination="DELETE-APPROVED",
             ),
             MessageResult(
                 uid=2,
                 subject="",
                 sender="",
-                probability=None,
+                verdict=None,
+                signals=None,
+                reasons=(),
                 status="skip",
                 inclination="SKIP",
                 detail="message exceeds size limit",
@@ -426,10 +443,22 @@ def test_report_shows_inclination_and_skip_error_detail(monkeypatch):
                 uid=3,
                 subject="real",
                 sender="b@example.org",
-                probability=None,
+                verdict=None,
+                signals=None,
+                reasons=(),
                 status="error",
                 inclination="ERROR / KEEP",
-                detail="RuntimeError: classifier evaluation failed",
+                detail="RuntimeError: classification evaluation failed",
+            ),
+            MessageResult(
+                uid=4,
+                subject="maybe",
+                sender="c@example.org",
+                verdict=SpamVerdict.REVIEW,
+                signals=SemanticSpamSignals(0.2, 0.2, 0.1, 0.1, 0.99),
+                reasons=("insufficient-evidence",),
+                status="review",
+                inclination="REVIEW / KEEP",
             ),
         ],
     )
@@ -437,12 +466,16 @@ def test_report_shows_inclination_and_skip_error_detail(monkeypatch):
     cli._print_report(report)
 
     rendered = output.getvalue()
-    assert "Inclination" in rendered
-    assert "DELETE-APPROVED" in rendered
+    assert "Verdict" in rendered
+    assert "Signals" in rendered
+    assert "Reasons" in rendered
+    assert "WOULD DELETE" in rendered
+    assert "REVIEW / KEEP" in rendered
     assert "ERROR / KEEP" in rendered
     assert "message exceeds size limit" in rendered
-    assert "classifier evaluation failed" in rendered
-
+    assert "tracking.example" in rendered
+    assert "token=secret" not in rendered
+    assert "/path" not in rendered
 
 
 def test_partial_delete_report_distinguishes_confirmed_and_pending_uids(monkeypatch):
@@ -458,9 +491,9 @@ def test_partial_delete_report_distinguishes_confirmed_and_pending_uids(monkeypa
     partial = PartialDeleteError(deleted=(1,), pending=(2,), failure=failure)
     output = StringIO()
     monkeypatch.setattr(cli, "console", Console(file=output, width=200))
+    signals = SemanticSpamSignals(0.1, 0.99, 0.1, 0.1, 0.9)
     report = CleanReport(
         folder="Spam",
-        threshold=0.95,
         apply=True,
         partial_delete_error=partial,
         results=[
@@ -468,8 +501,10 @@ def test_partial_delete_report_distinguishes_confirmed_and_pending_uids(monkeypa
                 uid=1,
                 subject="confirmed",
                 sender="a@example.org",
-                probability=0.99,
-                status="spam",
+                verdict=SpamVerdict.DELETE,
+                signals=signals,
+                reasons=("phishing",),
+                status="delete",
                 inclination="DELETE-APPROVED",
                 deleted=True,
             ),
@@ -477,8 +512,10 @@ def test_partial_delete_report_distinguishes_confirmed_and_pending_uids(monkeypa
                 uid=2,
                 subject="pending",
                 sender="b@example.org",
-                probability=0.99,
-                status="spam",
+                verdict=SpamVerdict.DELETE,
+                signals=signals,
+                reasons=("phishing",),
+                status="delete",
                 inclination="DELETE-APPROVED",
                 detail="Deletion was not confirmed; see the operation error.",
             ),
@@ -491,7 +528,6 @@ def test_partial_delete_report_distinguishes_confirmed_and_pending_uids(monkeypa
     assert "DELETED" in rendered
     assert "NOT CONFIRMED" in rendered
     assert "Partial deletion: 1 confirmed; 1 pending." in rendered
-
 
 
 def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
@@ -509,9 +545,9 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
         cause_type="RuntimeError",
     )
     partial = PartialDeleteError(deleted=(1,), pending=(2,), failure=failure)
+    signals = SemanticSpamSignals(0.1, 0.99, 0.1, 0.1, 0.9)
     report = CleanReport(
         folder="Spam",
-        threshold=0.95,
         apply=True,
         partial_delete_error=partial,
         results=[
@@ -519,8 +555,10 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
                 uid=1,
                 subject="confirmed",
                 sender="a@example.org",
-                probability=0.99,
-                status="spam",
+                verdict=SpamVerdict.DELETE,
+                signals=signals,
+                reasons=("phishing",),
+                status="delete",
                 inclination="DELETE-APPROVED",
                 deleted=True,
             ),
@@ -528,8 +566,10 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
                 uid=2,
                 subject="pending",
                 sender="b@example.org",
-                probability=0.99,
-                status="spam",
+                verdict=SpamVerdict.DELETE,
+                signals=signals,
+                reasons=("phishing",),
+                status="delete",
                 inclination="DELETE-APPROVED",
             ),
         ],
@@ -552,7 +592,7 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
             return len(self.uids)
 
     class FakeCleaner:
-        def __init__(self, mailbox, classifier, *, threshold):
+        def __init__(self, mailbox, classifier, *, policy):
             pass
 
         def run(self, *, apply, selection, on_result):
@@ -566,7 +606,7 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
     monkeypatch.setattr(cli, "ScopedMailbox", lambda **kwargs: Context())
-    monkeypatch.setattr(cli, "PyJevSpamClassifier", Context)
+    monkeypatch.setattr(cli, "PyJevSpamClassifier", CleanFakeClassifier)
     monkeypatch.setattr(cli, "SpamCleaner", FakeCleaner)
 
     result = CliRunner().invoke(cli.app, ["clean", "--apply"])

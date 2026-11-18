@@ -19,6 +19,7 @@ from .config import (
     load_settings,
     write_settings,
 )
+from .evidence import redact_urls
 from .mailbox import ImapOperationError, MailboxError, MessageSelection, MessageSort, ScopedMailbox
 
 app = typer.Typer(no_args_is_help=True, help="Security-scoped IMAP automation.")
@@ -32,7 +33,6 @@ def init_config(
     username: str = typer.Option(..., prompt=True, help="IMAP username"),
     folder: str = typer.Option("Spam", prompt=True, help="The only folder this cleaner may access"),
     port: int = typer.Option(993, help="IMAPS port"),
-    spam_threshold: float = typer.Option(0.95, min=0.0, max=1.0, help="Delete threshold"),
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config"),
 ) -> None:
@@ -41,7 +41,7 @@ def init_config(
         path = write_settings(
             Settings(
                 imap=ImapSettings(host=host, port=port, username=username),
-                spam=SpamSettings(folder=folder, threshold=spam_threshold),
+                spam=SpamSettings(folder=folder),
             ),
             config,
             overwrite=force,
@@ -114,7 +114,7 @@ def clean(
     apply: bool = typer.Option(
         False,
         "--apply",
-        help="Permanently delete messages classified as spam. Without this flag, run read-only.",
+        help="Permanently delete messages with a DELETE verdict. Without this flag, run read-only.",
     ),
     limit: int | None = typer.Option(
         None,
@@ -142,7 +142,7 @@ def clean(
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
     debug: bool = typer.Option(False, "--debug", help="Print a traceback without exception payloads"),
 ) -> None:
-    """Classify a selected window in the configured folder and optionally delete approved spam."""
+    """Classify a selected window in the configured junk folder and optionally delete DELETE verdicts."""
     try:
         settings = load_settings(config)
     except ConfigError as exc:
@@ -180,8 +180,11 @@ def clean(
                 ),
                 markup=False,
             )
-            with PyJevSpamClassifier() as classifier:
-                report = SpamCleaner(mailbox, classifier, threshold=settings.spam.threshold).run(
+            with PyJevSpamClassifier(
+                trusted_authserv_ids=settings.spam.trusted_authserv_ids,
+                trusted_provider_headers=settings.spam.trusted_provider_headers,
+            ) as classifier:
+                report = SpamCleaner(mailbox, classifier, policy=settings.spam.policy).run(
                     apply=apply,
                     selection=selection,
                     on_result=(
@@ -226,6 +229,21 @@ def _selection_summary(
     )
 
 
+def _signal_summary(row: MessageResult) -> str:
+    if row.signals is None:
+        return "-"
+    signals = row.signals
+    return (
+        f"bulk={signals.unsolicited_bulk:.2f} phishing={signals.phishing_or_scam:.2f} "
+        f"identity={signals.identity_deception:.2f} legit={signals.legitimate_expected:.2f} "
+        f"delete={signals.delete_safe:.2f}"
+    )
+
+
+def _safe_text(value: str) -> str:
+    return redact_urls(value)[:200]
+
+
 def _print_result(
     row: MessageResult,
     *,
@@ -233,32 +251,35 @@ def _print_result(
     total: int,
     apply: bool,
 ) -> None:
-    probability = "-" if row.probability is None else f"{row.probability:.3f}"
     if row.status == "error":
         action = "ERROR / KEEP"
     elif row.status == "skip":
         action = "SKIP / KEEP"
-    elif row.status == "spam":
+    elif row.status == "delete":
         action = "DELETE-APPROVED" if apply else "WOULD DELETE"
+    elif row.status == "review":
+        action = "REVIEW / KEEP"
     else:
         action = "KEEP"
-    detail = f"  Detail={row.detail}" if row.detail else ""
+    reasons = ",".join(row.reasons) or (row.detail or "-")
+    verdict = row.verdict.name if row.verdict else "-"
     console.print(
-        f"[{position}/{total}] UID {row.uid}  {action}  P(spam)={probability}  "
-        f"Inclination={row.inclination}  From={row.sender}  Subject={row.subject}{detail}",
+        f"[{position}/{total}] UID {row.uid}  {action}  Verdict={verdict}  "
+        f"Signals={_signal_summary(row)}  Reasons={reasons}  "
+        f"From={_safe_text(row.sender)}  Subject={_safe_text(row.subject)}",
         markup=False,
     )
 
 
 def _print_summary(report: CleanReport) -> None:
     console.print(
-        f"Scanned {report.scanned}; spam {report.spam}; kept {report.kept}; "
+        f"Scanned {report.scanned}; delete {report.spam}; kept {report.kept}; review {report.review}; "
         f"skipped {report.skipped}; errors {report.errors}; deleted {report.deleted}."
     )
     if report.apply:
         console.print(f"Deletion: {report.spam} approved; {report.deleted} confirmed deleted.")
     elif report.spam:
-        console.print("Dry-run only. Re-run with --apply to permanently delete approved spam UIDs.")
+        console.print("Dry-run only. Re-run with --apply to permanently delete approved UIDs.")
     if report.partial_delete_error is not None:
         console.print(
             f"Partial deletion: {len(report.partial_delete_error.deleted)} confirmed; "
@@ -269,7 +290,7 @@ def _print_summary(report: CleanReport) -> None:
 def _print_partial_delete_details(report: CleanReport) -> None:
     console.print("Deletion details:")
     for row in report.results:
-        if row.status == "spam":
+        if row.status == "delete":
             action = "DELETED" if row.deleted else "NOT CONFIRMED"
             detail = f"  {row.detail}" if row.detail else ""
             console.print(f"UID {row.uid}  {action}{detail}", markup=False)
@@ -295,42 +316,45 @@ def _print_failure(exc: Exception, *, debug: bool) -> None:
 
 
 def _print_report(report: CleanReport) -> None:
-    table = Table(title=f"imapledger — {report.folder} ({'APPLY' if report.apply else 'DRY RUN'})")
+    table = Table(title=f"imapledger | {report.folder} ({'APPLY' if report.apply else 'DRY RUN'})")
     table.add_column("UID", justify="right")
-    table.add_column("P(spam)", justify="right")
-    table.add_column("Inclination")
+    table.add_column("Verdict")
+    table.add_column("Signals")
+    table.add_column("Reasons")
     table.add_column("Action")
     table.add_column("From")
     table.add_column("Subject")
     table.add_column("Detail")
     for row in report.results:
-        probability = "-" if row.probability is None else f"{row.probability:.3f}"
         if row.status == "error":
             action = "ERROR / KEEP"
         elif row.status == "skip":
             action = "SKIP / KEEP"
         elif row.deleted:
             action = "DELETED"
-        elif row.status == "spam" and report.partial_delete_error is not None:
+        elif row.status == "delete" and report.partial_delete_error is not None:
             action = "NOT CONFIRMED"
-        elif row.status == "spam" and report.apply:
+        elif row.status == "delete" and report.apply:
             action = "DELETE-APPROVED"
-        elif row.status == "spam":
+        elif row.status == "delete":
             action = "WOULD DELETE"
+        elif row.status == "review":
+            action = "REVIEW / KEEP"
         else:
             action = "KEEP"
         table.add_row(
             str(row.uid),
-            probability,
-            row.inclination,
+            row.verdict.name if row.verdict else "-",
+            _signal_summary(row),
+            ",".join(row.reasons) or "-",
             action,
-            row.sender,
-            row.subject,
+            _safe_text(row.sender),
+            _safe_text(row.subject),
             row.detail or "",
         )
     console.print(table, markup=False)
     console.print(
-        f"Scanned {report.scanned}; spam {report.spam}; kept {report.kept}; "
+        f"Scanned {report.scanned}; delete {report.spam}; kept {report.kept}; review {report.review}; "
         f"skipped {report.skipped}; errors {report.errors}; deleted {report.deleted}."
     )
     if report.partial_delete_error is not None:
@@ -339,4 +363,4 @@ def _print_report(report: CleanReport) -> None:
             f"{len(report.partial_delete_error.pending)} pending."
         )
     if not report.apply and report.spam:
-        console.print("Dry-run only. Re-run with --apply to permanently delete approved spam UIDs.")
+        console.print("Dry-run only. Re-run with --apply to permanently delete approved UIDs.")

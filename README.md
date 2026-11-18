@@ -1,6 +1,6 @@
 # imapledger
 
-A deliberately small, security-scoped IMAP automation tool. The MVP scans exactly one configured mailbox, asks `pyjev` whether each selected message is clearly spam, and can permanently delete only the exact UIDs that pass an application-owned threshold.
+A deliberately small, security-scoped IMAP automation tool. The MVP scans exactly one configured junk folder, asks `pyjev` to assess structured spam evidence, then applies an explicit application policy. Only a DELETE verdict can approve permanent removal of exact UIDs.
 
 The semantic model never receives an IMAP client and cannot select folders or issue IMAP commands.
 
@@ -57,11 +57,27 @@ username = "me@example.org"
 
 [spam]
 folder = "Spam"
-threshold = 0.95
 max_message_bytes = 2000000
 max_body_chars = 20000
+
+[spam.policy]
+legitimate_veto_at = 0.80
+phishing_delete_at = 0.90
+identity_deception_at = 0.90
+unsolicited_bulk_at = 0.92
+delete_safe_at = 0.88
+provider_junk_support_at = 0.80
+
+[spam.authentication]
+trusted_authserv_ids = []
+
+[spam.provider]
+trusted_spam_headers = []
 ```
 
+
+
+Legacy `spam.threshold` values are deprecated, warned about, and ignored. They are not mapped to the new named thresholds. The documented policy defaults apply when `[spam.policy]` is absent.
 There is deliberately no password setting.
 
 `pyjev` authentication is separate; configure it as documented by `pyjev`.
@@ -81,12 +97,12 @@ imapledger clean --limit 25 --sort oldest
 imapledger clean --limit 10 --no-progress
 ```
 
-Every invocation prompts for the IMAP password. The default run is read-only and reports `WOULD DELETE` rather than changing mail. With no `--limit`, the selected window extends from `--offset` to the end of the initial mailbox snapshot.
+Every invocation prompts for the IMAP password. The default run is read-only and reports `WOULD DELETE` for DELETE verdicts. REVIEW is a distinct non-destructive outcome and is kept. With no `--limit`, the selected window extends from `--offset` to the end of the initial mailbox snapshot.
 
 `--sort newest` orders by descending IMAP UID, and `--sort oldest` orders by ascending IMAP UID. This is mailbox arrival order, not the message `Date:` header. `--offset` skips messages after sorting. The window is chosen from one stable initial UID snapshot, and only its selected UIDs are fetched for size metadata and eligible message bodies.
 
 Progress is enabled by default. It streams one decision with its position and selected total as each message is classified. Use `--no-progress` to suppress per-message rows and render the detailed report at the end. `--verbose` is separate and adds safe IMAP protocol-operation diagnostics; it does not control classification progress.
-## Delete approved spam
+## Apply DELETE verdicts
 
 ```bash
 imapledger clean --apply
@@ -98,7 +114,7 @@ IMAP password:
 `--apply` refuses to run if the IMAP server does not advertise `UIDPLUS`. After classification, `imapledger` rechecks the mailbox `UIDVALIDITY`, verifies every approved UID still belongs to the same scoped mailbox, marks only those UIDs `\\Deleted`, and performs `UID EXPUNGE` only for those UIDs.
 
 
-With progress enabled, apply-mode spam rows say `DELETE-APPROVED` while classification is pending. `DELETED` is reported only after the exact UID expunge succeeds. The summary distinguishes approved UIDs from confirmed deletions; partial deletion shows confirmed and pending UIDs and exits with a failure status.
+With progress enabled, apply-mode DELETE rows say `DELETE-APPROVED` while classification is pending. `DELETED` is reported only after the exact UID expunge succeeds. The summary distinguishes approved UIDs from confirmed deletions; partial deletion shows confirmed and pending UIDs and exits with a failure status.
 
 ## Partial deletion results
 
@@ -120,12 +136,17 @@ Errors identify the failed operation and include safe context such as the config
 
 For `FETCH` failures, note whether the operation is `imap_fetch_size` or `imap_fetch_body`. A size-fetch error includes its bounded batch number and UID range; a body-fetch error identifies one UID. `doctor --verbose` can determine whether the read path and one-message probes work independently of classification. If a destructive run reports pending UIDs, check the mailbox directly before retrying because their outcome was not confirmed.
 
-## pyjev decision
+## Evidence bundle and policy
 
-`imapledger/decisions.toml` contains a named Noul decision named `spam`. `NoulResult.value` is treated as the probability of true. The application owns the threshold; the decision cannot perform side effects.
+`imapledger/decisions.toml` defines one `spam-evidence` bundle with independent unsolicited-bulk, phishing/scam, identity-deception, legitimate/expected, and delete-safe questions. The classifier sends one structured state per message and validates every child probability. Operational UID data and raw authentication payloads are not sent as semantic evidence.
 
-The message state sent to `pyjev` contains the UID, decoded subject/from/to/date fields, and a bounded plain-text body. Attachments are not sent in the MVP. Large messages are size-checked before their full body is fetched; oversized messages are reported as skipped and kept.
+Local evidence extraction normalizes sender and reply identities, list/automation metadata, provider markers, Unicode display-name hints, and bounded URL hostnames. URL paths and query tokens are removed from model state and normal reports. Message-provided values are untrusted content, never instructions.
 
+Authentication results remain untrusted unless an exact receiver `authserv-id` is explicitly configured under `[spam.authentication]`. Do not add guessed IDs. Generic spam headers remain soft evidence unless a trusted provider header is explicitly configured and the operator has verified that the provider inserts it. A passing SPF, DKIM, DMARC, or ARC result is identity evidence, not proof that a message is harmless.
+
+The pure deterministic policy applies named thresholds. Strong legitimate/expected evidence vetoes deletion, phishing can qualify directly, and identity or unsolicited-bulk findings need corroboration. Provider and subject spam markers alone lead to REVIEW. Both REVIEW and KEEP are non-destructive; classifier, evidence, and policy errors fail closed.
+
+The streamed row reports verdict, principal signals, and concise reasons. `--limit`, `--offset`, `--sort`, progress output, dry-run defaults, single-folder scope, UIDPLUS requirements, UIDVALIDITY checks, and exact-UID deletion remain unchanged. The small offline examples in `eval/spam_cases.jsonl` are synthetic and do not include real message bodies or recipient data.
 ## Tests
 
 ```bash

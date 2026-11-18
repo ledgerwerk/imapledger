@@ -4,11 +4,13 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from .classifier import SpamClassifier
+from .classifier import SemanticSpamSignals, SpamClassifier
+from .evidence import MessageEvidence
 from .mailbox import DeleteResult, MailboxItem, MessageSelection, PartialDeleteError
+from .policy import SpamPolicy, SpamVerdict
 
-Status = Literal["spam", "keep", "skip", "error"]
-Inclination = Literal["DELETE-APPROVED", "KEEP", "SKIP", "ERROR / KEEP"]
+Status = Literal["delete", "keep", "review", "skip", "error"]
+Inclination = Literal["DELETE-APPROVED", "KEEP", "REVIEW / KEEP", "SKIP", "ERROR / KEEP"]
 
 
 class Mailbox(Protocol):
@@ -21,6 +23,7 @@ class Mailbox(Protocol):
     def selected_count(self, selection: MessageSelection) -> int: ...
 
     def iter_messages(self, selection: MessageSelection) -> Iterator[MailboxItem]: ...
+
     def delete_uids(self, uids: Sequence[int]) -> DeleteResult: ...
 
 
@@ -29,7 +32,9 @@ class MessageResult:
     uid: int
     subject: str
     sender: str
-    probability: float | None
+    verdict: SpamVerdict | None
+    signals: SemanticSpamSignals | None
+    reasons: tuple[str, ...]
     status: Status
     inclination: Inclination
     detail: str | None = None
@@ -44,7 +49,6 @@ ResultCallback = Callable[[MessageResult, int, int], None]
 @dataclass(slots=True)
 class CleanReport:
     folder: str
-    threshold: float
     apply: bool
     results: list[MessageResult]
     partial_delete_error: PartialDeleteError | None = None
@@ -55,11 +59,15 @@ class CleanReport:
 
     @property
     def spam(self) -> int:
-        return sum(row.status == "spam" for row in self.results)
+        return sum(row.status == "delete" for row in self.results)
 
     @property
     def kept(self) -> int:
         return sum(row.status == "keep" for row in self.results)
+
+    @property
+    def review(self) -> int:
+        return sum(row.status == "review" for row in self.results)
 
     @property
     def skipped(self) -> int:
@@ -75,12 +83,10 @@ class CleanReport:
 
 
 class SpamCleaner:
-    def __init__(self, mailbox: Mailbox, classifier: SpamClassifier, *, threshold: float) -> None:
-        if not 0 <= threshold <= 1:
-            raise ValueError("threshold must be between 0 and 1")
+    def __init__(self, mailbox: Mailbox, classifier: SpamClassifier, *, policy: SpamPolicy | None = None) -> None:
         self._mailbox = mailbox
         self._classifier = classifier
-        self._threshold = threshold
+        self._policy = policy or SpamPolicy()
 
     def run(
         self,
@@ -108,7 +114,9 @@ class SpamCleaner:
                         uid=item.uid,
                         subject="",
                         sender="",
-                        probability=None,
+                        verdict=None,
+                        signals=None,
+                        reasons=(),
                         status="skip",
                         inclination="SKIP",
                         detail=item.skip_reason or "message not available",
@@ -119,31 +127,42 @@ class SpamCleaner:
             message = item.message
             try:
                 assessment = self._classifier.assess(message)
-            except Exception as exc:  # fail closed: classifier failures never authorize deletion
+                evidence: MessageEvidence = assessment.evidence
+                decision = self._policy.decide(assessment.signals, evidence)
+            except Exception as exc:  # Fail closed: assessment and policy failures never authorize deletion.
                 record(
                     MessageResult(
                         uid=message.uid,
                         subject=message.subject,
                         sender=message.sender,
-                        probability=None,
+                        verdict=None,
+                        signals=None,
+                        reasons=(),
                         status="error",
                         inclination="ERROR / KEEP",
-                        detail=f"{type(exc).__name__}: classifier evaluation failed",
+                        detail=f"{type(exc).__name__}: classification evaluation failed",
                     )
                 )
                 continue
 
-            is_spam = assessment.probability >= self._threshold
-            if is_spam:
+            status = decision.verdict.value
+            inclination: Inclination = {
+                SpamVerdict.DELETE: "DELETE-APPROVED",
+                SpamVerdict.KEEP: "KEEP",
+                SpamVerdict.REVIEW: "REVIEW / KEEP",
+            }[decision.verdict]
+            if decision.verdict is SpamVerdict.DELETE:
                 approved.append(message.uid)
             record(
                 MessageResult(
                     uid=message.uid,
                     subject=message.subject,
                     sender=message.sender,
-                    probability=assessment.probability,
-                    status="spam" if is_spam else "keep",
-                    inclination="DELETE-APPROVED" if is_spam else "KEEP",
+                    verdict=decision.verdict,
+                    signals=assessment.signals,
+                    reasons=decision.reasons,
+                    status=status,
+                    inclination=inclination,
                     model=assessment.model,
                     request_id=assessment.request_id,
                 )
@@ -158,17 +177,16 @@ class SpamCleaner:
                 confirmed_deleted = set(exc.deleted)
                 pending = set(exc.pending)
                 for row in rows:
-                    if row.uid in pending and row.status == "spam":
+                    if row.uid in pending and row.status == "delete":
                         row.detail = "Deletion was not confirmed; see the operation error."
             else:
                 confirmed_deleted = set(deletion.deleted)
             for row in rows:
-                if row.uid in confirmed_deleted and row.status == "spam":
+                if row.uid in confirmed_deleted and row.status == "delete":
                     row.deleted = True
 
         return CleanReport(
             folder=self._mailbox.folder,
-            threshold=self._threshold,
             apply=apply,
             results=rows,
             partial_delete_error=partial_delete_error,

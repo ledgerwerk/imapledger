@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from pathlib import Path
 
@@ -13,20 +15,26 @@ from imapledger.config import (
     load_settings,
     write_settings,
 )
+from imapledger.policy import SpamPolicy
 
 
 def test_config_roundtrip_does_not_store_password(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     settings = Settings(
         imap=ImapSettings(host="imap.example.org", username="me@example.org"),
-        spam=SpamSettings(folder="Spam", threshold=0.97),
+        spam=SpamSettings(
+            folder="Spam",
+            policy=SpamPolicy(delete_safe_at=0.97),
+            trusted_authserv_ids=("mx.example.org",),
+            trusted_provider_headers=("X-Spam-Flag",),
+        ),
     )
     write_settings(settings, path)
 
     text = path.read_text(encoding="utf-8")
     assert "password" not in text.lower()
+    assert "threshold =" not in text
     assert load_settings(path) == settings
-
 
 
 def test_config_write_uses_atomic_writer(monkeypatch, tmp_path: Path) -> None:
@@ -46,6 +54,7 @@ def test_config_write_uses_atomic_writer(monkeypatch, tmp_path: Path) -> None:
     assert write_settings(settings, path) == path
     assert calls[0][0] == path
     assert "[imap]" in calls[0][1]
+    assert "[spam.policy]" in calls[0][1]
     assert "password" not in calls[0][1].lower()
 
 
@@ -77,3 +86,17 @@ def test_config_mode_is_0600_on_posix(tmp_path: Path) -> None:
     write_settings(settings, path)
 
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_legacy_scalar_threshold_is_warned_about_and_ignored(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.toml"
+    path.write_text(
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
+        '[spam]\nfolder = "Spam"\nthreshold = 0.99\n',
+        encoding="utf-8",
+    )
+
+    with pytest.warns(UserWarning, match="deprecated and ignored"):
+        settings = load_settings(path)
+
+    assert settings.spam.policy == SpamPolicy()

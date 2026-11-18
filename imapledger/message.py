@@ -7,6 +7,7 @@ from email.message import Message
 from email.parser import BytesParser
 from email.utils import getaddresses
 from html.parser import HTMLParser
+from urllib.parse import urlsplit
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,10 +18,28 @@ class MailMessage:
     recipients: tuple[str, ...]
     date: str
     body: str
+    from_display_name: str = ""
+    from_address: str = ""
+    reply_to: str = ""
+    sender_header: str = ""
+    return_path: str = ""
+    message_id: str = ""
+    list_id: str = ""
+    list_unsubscribe: tuple[str, ...] = ()
+    list_unsubscribe_post: tuple[str, ...] = ()
+    precedence: str = ""
+    auto_submitted: str = ""
+    authentication_results_raw: tuple[str, ...] = ()
+    received_spf_raw: tuple[str, ...] = ()
+    arc_authentication_results_raw: tuple[str, ...] = ()
+    dkim_signatures: tuple[str, ...] = ()
+    x_spam_flag: str = ""
+    x_spam_status: str = ""
+    x_spam_score: str = ""
+    link_domains: tuple[str, ...] = ()
 
     def as_state(self) -> dict[str, object]:
         return {
-            "uid": self.uid,
             "subject": self.subject,
             "from": self.sender,
             "to": list(self.recipients),
@@ -32,13 +51,35 @@ class MailMessage:
 
 def parse_message(uid: int, raw: bytes, *, max_body_chars: int) -> MailMessage:
     msg = BytesParser(policy=policy.default).parsebytes(raw)
+    sender = _decode_header_value(msg.get("From", ""))
+    from_display_name, from_address = _first_mailbox(sender)
+    body, link_domains = _extract_body(msg, max_body_chars=max_body_chars)
     return MailMessage(
         uid=uid,
         subject=_decode_header_value(msg.get("Subject", "")),
-        sender=_decode_header_value(msg.get("From", "")),
+        sender=sender,
         recipients=tuple(address for _, address in getaddresses(msg.get_all("To", [])) if address),
         date=_decode_header_value(msg.get("Date", "")),
-        body=_extract_body(msg, max_body_chars=max_body_chars),
+        body=body,
+        from_display_name=from_display_name,
+        from_address=from_address,
+        reply_to=_first_address(_header_values(msg, "Reply-To")),
+        sender_header=_first_address(_header_values(msg, "Sender")),
+        return_path=_first_address(_header_values(msg, "Return-Path")),
+        message_id=_first(_header_values(msg, "Message-ID")),
+        list_id=_first(_header_values(msg, "List-ID")),
+        list_unsubscribe=_header_values(msg, "List-Unsubscribe"),
+        list_unsubscribe_post=_header_values(msg, "List-Unsubscribe-Post"),
+        precedence=_first(_header_values(msg, "Precedence")),
+        auto_submitted=_first(_header_values(msg, "Auto-Submitted")),
+        authentication_results_raw=_header_values(msg, "Authentication-Results"),
+        received_spf_raw=_header_values(msg, "Received-SPF"),
+        arc_authentication_results_raw=_header_values(msg, "ARC-Authentication-Results"),
+        dkim_signatures=_header_values(msg, "DKIM-Signature"),
+        x_spam_flag=_first(_header_values(msg, "X-Spam-Flag")),
+        x_spam_status=_first(_header_values(msg, "X-Spam-Status")),
+        x_spam_score=_first(_header_values(msg, "X-Spam-Score")),
+        link_domains=link_domains,
     )
 
 
@@ -48,15 +89,46 @@ def _decode_header_value(value: str) -> str:
     except (LookupError, UnicodeError, ValueError):
         return str(value)
 
+
+def _header_values(msg: Message, name: str) -> tuple[str, ...]:
+    return tuple(_decode_header_value(str(value)) for value in msg.get_all(name, []))
+
+
+def _first(values: tuple[str, ...]) -> str:
+    return values[0] if values else ""
+
+
+def _first_mailbox(value: str) -> tuple[str, str]:
+    addresses = getaddresses([value])
+    if not addresses:
+        return "", ""
+    display_name, address = addresses[0]
+    return _decode_header_value(display_name), address.strip()
+
+
+def _first_address(values: tuple[str, ...]) -> str:
+    for value in values:
+        _, address = _first_mailbox(value)
+        if address and "@" in address:
+            return address
+    return ""
+
+
 class _VisibleTextParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self._ignored_depth = 0
         self._parts: list[str] = []
+        self._links: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in {"script", "style"}:
             self._ignored_depth += 1
+        for name, value in attrs:
+            if name in {"href", "action"} and value and len(self._links) < 100:
+                hostname = _url_hostname(value)
+                if hostname:
+                    self._links.append(hostname)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in {"script", "style"} and self._ignored_depth:
@@ -71,10 +143,25 @@ class _VisibleTextParser(HTMLParser):
         self.close()
         return " ".join(" ".join(self._parts).split())
 
+    @property
+    def link_domains(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(self._links))[:20]
 
-def _extract_body(msg: Message, *, max_body_chars: int) -> str:
+
+def _url_hostname(value: str) -> str | None:
+    try:
+        parsed = urlsplit(value.strip())
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return None
+        return parsed.hostname.rstrip(".").encode("idna").decode("ascii").lower() or None
+    except (UnicodeError, ValueError):
+        return None
+
+
+def _extract_body(msg: Message, *, max_body_chars: int) -> tuple[str, tuple[str, ...]]:
     plain_candidates: list[str] = []
     html_candidates: list[str] = []
+    link_domains: list[str] = []
     parts = msg.walk() if msg.is_multipart() else (msg,)
     for part in parts:
         if part.is_multipart() or part.get_content_disposition() == "attachment":
@@ -87,13 +174,15 @@ def _extract_body(msg: Message, *, max_body_chars: int) -> str:
         elif content_type == "text/html":
             html = _part_text(part)
             if html:
-                text = _VisibleTextParser().visible_text(html)
+                parser = _VisibleTextParser()
+                text = parser.visible_text(html)
                 if text:
                     html_candidates.append(text)
+                link_domains.extend(parser.link_domains)
 
     body = "\n\n".join(plain_candidates or html_candidates)
     body = "\n".join(line.rstrip() for line in body.splitlines()).strip()
-    return body[:max_body_chars]
+    return body[:max_body_chars], tuple(dict.fromkeys(link_domains))[:20]
 
 
 def _part_text(part: Message) -> str:
