@@ -6,6 +6,7 @@ from email.header import decode_header, make_header
 from email.message import Message
 from email.parser import BytesParser
 from email.utils import getaddresses
+from html.parser import HTMLParser
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,26 +48,50 @@ def _decode_header_value(value: str) -> str:
     except (LookupError, UnicodeError, ValueError):
         return str(value)
 
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._ignored_depth = 0
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style"}:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"} and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self._parts.append(data)
+
+    def visible_text(self, html: str) -> str:
+        self.feed(html)
+        self.close()
+        return " ".join(" ".join(self._parts).split())
+
 
 def _extract_body(msg: Message, *, max_body_chars: int) -> str:
-    candidates: list[str] = []
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.is_multipart():
-                continue
-            if part.get_content_disposition() == "attachment":
-                continue
-            if part.get_content_type() != "text/plain":
-                continue
+    plain_candidates: list[str] = []
+    html_candidates: list[str] = []
+    parts = msg.walk() if msg.is_multipart() else (msg,)
+    for part in parts:
+        if part.is_multipart() or part.get_content_disposition() == "attachment":
+            continue
+        content_type = part.get_content_type()
+        if content_type == "text/plain":
             text = _part_text(part)
             if text:
-                candidates.append(text)
-    elif msg.get_content_type() == "text/plain":
-        text = _part_text(msg)
-        if text:
-            candidates.append(text)
+                plain_candidates.append(text)
+        elif content_type == "text/html":
+            html = _part_text(part)
+            if html:
+                text = _VisibleTextParser().visible_text(html)
+                if text:
+                    html_candidates.append(text)
 
-    body = "\n\n".join(candidates)
+    body = "\n\n".join(plain_candidates or html_candidates)
     body = "\n".join(line.rstrip() for line in body.splitlines()).strip()
     return body[:max_body_chars]
 

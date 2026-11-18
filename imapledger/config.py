@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from ledgercore import AtomicWriteError, atomic_write_text
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
@@ -116,7 +118,10 @@ def write_settings(settings: Settings, path: Path | None = None, *, overwrite: b
         f"max_message_bytes = {settings.spam.max_message_bytes}\n"
         f"max_body_chars = {settings.spam.max_body_chars}\n"
     )
-    config_path.write_text(text, encoding="utf-8")
+    try:
+        atomic_write_text(config_path, text)
+    except AtomicWriteError as exc:
+        raise ConfigError(f"could not write config {config_path}: {exc}") from exc
     try:
         config_path.chmod(0o600)
     except OSError:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import getpass
+import traceback
 from pathlib import Path
 
 import typer
@@ -18,7 +19,7 @@ from .config import (
     load_settings,
     write_settings,
 )
-from .mailbox import ScopedMailbox
+from .mailbox import ImapOperationError, MailboxError, ScopedMailbox
 
 app = typer.Typer(no_args_is_help=True, help="Security-scoped IMAP automation.")
 console = Console()
@@ -32,7 +33,7 @@ def init_config(
     folder: str = typer.Option("Spam", prompt=True, help="The only folder this cleaner may access"),
     port: int = typer.Option(993, help="IMAPS port"),
     spam_threshold: float = typer.Option(0.95, min=0.0, max=1.0, help="Delete threshold"),
-    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config"),
 ) -> None:
     """Write non-secret configuration. The IMAP password is never stored."""
@@ -52,13 +53,72 @@ def init_config(
 
 
 @app.command()
+def doctor(
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """Probe the configured IMAP read path without classification or writes."""
+    console.print("imapledger doctor")
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    console.print("config: OK")
+
+    password = getpass.getpass("IMAP password: ")
+    if not password:
+        err_console.print("[red]Empty password; aborting.[/red]")
+        raise typer.Exit(2)
+
+    try:
+        with ScopedMailbox(
+            host=settings.imap.host,
+            port=settings.imap.port,
+            username=settings.imap.username,
+            password=password,
+            folder=settings.spam.folder,
+            writable=False,
+            max_message_bytes=settings.spam.max_message_bytes,
+            max_body_chars=settings.spam.max_body_chars,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+        ) as mailbox:
+            probe = mailbox.probe()
+    except Exception as exc:
+        _print_failure(exc, debug=False)
+        raise typer.Exit(1) from exc
+    finally:
+        password = ""
+
+    console.print("TLS connect: OK")
+    console.print("login: OK")
+    console.print("capabilities: OK")
+    console.print(f"folder: {settings.spam.folder} (read-only)", markup=False)
+    console.print(f"UIDVALIDITY: {probe.uidvalidity}")
+    console.print(f"messages: {probe.message_count}")
+    if probe.uid_min is not None and probe.uid_max is not None:
+        console.print(f"UID range: {probe.uid_min}..{probe.uid_max}")
+    if probe.size_fetch_uid is None:
+        console.print("FETCH RFC822.SIZE (1 UID): SKIPPED (mailbox is empty)")
+    else:
+        console.print("FETCH RFC822.SIZE (1 UID): OK")
+    if probe.body_fetch_uid is not None:
+        console.print("FETCH BODY.PEEK[] (1 UID): OK")
+    else:
+        console.print(f"FETCH BODY.PEEK[]: SKIPPED ({probe.body_skip_reason})", markup=False)
+    console.print("result: IMAP read path is healthy")
+
+
+@app.command()
 def clean(
     apply: bool = typer.Option(
         False,
         "--apply",
         help="Permanently delete messages classified as spam. Without this flag, run read-only.",
     ),
-    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
+    debug: bool = typer.Option(False, "--debug", help="Print a traceback without exception payloads"),
 ) -> None:
     """Classify every message in the configured folder and optionally delete spam."""
     try:
@@ -84,25 +144,50 @@ def clean(
             writable=apply,
             max_message_bytes=settings.spam.max_message_bytes,
             max_body_chars=settings.spam.max_body_chars,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
         ) as mailbox:
             with PyJevSpamClassifier() as classifier:
                 report = SpamCleaner(mailbox, classifier, threshold=settings.spam.threshold).run(apply=apply)
     except Exception as exc:
-        err_console.print(f"[red]{type(exc).__name__}:[/red] {exc}")
+        _print_failure(exc, debug=debug)
         raise typer.Exit(1) from exc
     finally:
         password = ""
 
     _print_report(report)
+    if report.partial_delete_error is not None:
+        _print_failure(report.partial_delete_error, debug=debug)
+        raise typer.Exit(1)
+
+
+def _print_failure(exc: Exception, *, debug: bool) -> None:
+    if isinstance(exc, ImapOperationError):
+        err_console.print(str(exc), markup=False)
+        err_console.print("hint: run imapledger doctor --verbose")
+    elif isinstance(exc, MailboxError):
+        err_console.print(f"{type(exc).__name__}: {exc}", markup=False)
+    else:
+        err_console.print(f"{type(exc).__name__}: operation failed")
+
+    if debug:
+        err_console.print("Traceback (most recent call last):")
+        for frame in traceback.extract_tb(exc.__traceback__):
+            err_console.print(f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}', markup=False)
+        cause = exc.__cause__ or exc.__context__
+        while cause is not None:
+            err_console.print(f"Caused by: {type(cause).__name__}")
+            cause = cause.__cause__ or cause.__context__
 
 
 def _print_report(report: CleanReport) -> None:
     table = Table(title=f"imapledger — {report.folder} ({'APPLY' if report.apply else 'DRY RUN'})")
     table.add_column("UID", justify="right")
     table.add_column("P(spam)", justify="right")
+    table.add_column("Inclination")
     table.add_column("Action")
     table.add_column("From")
     table.add_column("Subject")
+    table.add_column("Detail")
     for row in report.results:
         probability = "-" if row.probability is None else f"{row.probability:.3f}"
         if row.status == "error":
@@ -111,15 +196,30 @@ def _print_report(report: CleanReport) -> None:
             action = "SKIP / KEEP"
         elif row.deleted:
             action = "DELETED"
+        elif row.status == "spam" and report.partial_delete_error is not None:
+            action = "NOT CONFIRMED"
         elif row.status == "spam":
             action = "WOULD DELETE"
         else:
             action = "KEEP"
-        table.add_row(str(row.uid), probability, action, row.sender, row.subject)
-    console.print(table)
+        table.add_row(
+            str(row.uid),
+            probability,
+            row.inclination,
+            action,
+            row.sender,
+            row.subject,
+            row.detail or "",
+        )
+    console.print(table, markup=False)
     console.print(
         f"Scanned {report.scanned}; spam {report.spam}; kept {report.kept}; "
         f"skipped {report.skipped}; errors {report.errors}; deleted {report.deleted}."
     )
+    if report.partial_delete_error is not None:
+        console.print(
+            f"Partial deletion: {len(report.partial_delete_error.deleted)} confirmed; "
+            f"{len(report.partial_delete_error.pending)} pending."
+        )
     if not report.apply and report.spam:
         console.print("Dry-run only. Re-run with --apply to permanently delete approved spam UIDs.")

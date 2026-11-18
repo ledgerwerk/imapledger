@@ -1,51 +1,75 @@
 import pytest
 
-from imapledger.mailbox import ScopedMailbox, UnsafeMailboxOperation
+from imapledger.mailbox import (
+    DeleteResult,
+    ImapOperationError,
+    PartialDeleteError,
+    ScopedMailbox,
+    UnsafeMailboxOperation,
+)
 
 RAW = b"From: spammer@example.org\r\nTo: me@example.org\r\nSubject: Buy now\r\n\r\nCheap pills"
 
 
 class FakeClient:
-    def __init__(self, *, capabilities=(b"IMAP4rev1", b"UIDPLUS"), uidvalidity=42, size=None):
+    def __init__(self, *, capabilities=(b"IMAP4rev1", b"UIDPLUS"), uidvalidity=42, size=None, uids=None):
         self._capabilities = capabilities
         self.uidvalidity = uidvalidity
         self.size = len(RAW) if size is None else size
+        self.uids = [10] if uids is None else list(uids)
         self.selected = []
         self.fetches = []
         self.added = []
         self.removed = []
         self.expunged = []
         self.logged_out = False
+        self.fail_on = None
+        self.failure_text = "FETCH command error: BAD password=secret raw_message=" + RAW.decode()
+
+    def _maybe_fail(self, operation):
+        if self.fail_on == operation or (isinstance(self.fail_on, set) and operation in self.fail_on):
+            raise RuntimeError(self.failure_text)
 
     def login(self, username, password):
+        self._maybe_fail("login")
         self.login_args = (username, password)
 
     def logout(self):
         self.logged_out = True
 
     def capabilities(self):
+        self._maybe_fail("capabilities")
         return self._capabilities
 
     def select_folder(self, folder, readonly=False):
+        self._maybe_fail("select")
         self.selected.append((folder, readonly))
-        return {b"UIDVALIDITY": self.uidvalidity, b"EXISTS": 1, b"FLAGS": (), b"RECENT": 0}
+        return {b"UIDVALIDITY": self.uidvalidity, b"EXISTS": len(self.uids), b"FLAGS": (), b"RECENT": 0}
 
     def search(self, criteria="ALL", charset=None):
-        return [10]
+        self._maybe_fail("search")
+        return self.uids
 
     def fetch(self, messages, data, modifiers=None):
-        self.fetches.append((tuple(messages), tuple(data)))
-        if tuple(data) == ("RFC822.SIZE",):
-            return {10: {b"RFC822.SIZE": self.size}}
-        return {10: {b"BODY[]": RAW}}
+        messages = tuple(messages)
+        data = tuple(data)
+        self.fetches.append((messages, data))
+        if data == ("RFC822.SIZE",):
+            self._maybe_fail("fetch_size")
+            return {uid: {b"RFC822.SIZE": self.size} for uid in messages}
+        self._maybe_fail("fetch_body")
+        return {uid: {b"BODY[]": RAW} for uid in messages}
 
     def add_flags(self, messages, flags, silent=False):
+        self._maybe_fail("add_flags")
         self.added.append((tuple(messages), tuple(flags), silent))
 
     def remove_flags(self, messages, flags, silent=False):
+        self._maybe_fail("remove_flags")
         self.removed.append((tuple(messages), tuple(flags), silent))
 
     def uid_expunge(self, messages):
+        self._maybe_fail("uid_expunge")
         self.expunged.append(tuple(messages))
 
 
@@ -53,7 +77,16 @@ def factory_for(client):
     return lambda *args, **kwargs: client
 
 
-def make_mailbox(client, *, writable, max_message_bytes=1_000_000):
+def make_mailbox(
+    client,
+    *,
+    writable,
+    max_message_bytes=1_000_000,
+    fetch_batch_size=100,
+    delete_batch_size=100,
+    event_callback=None,
+    client_factory=None,
+):
     return ScopedMailbox(
         host="imap.example.org",
         port=993,
@@ -63,7 +96,10 @@ def make_mailbox(client, *, writable, max_message_bytes=1_000_000):
         writable=writable,
         max_message_bytes=max_message_bytes,
         max_body_chars=20_000,
-        client_factory=factory_for(client),
+        fetch_batch_size=fetch_batch_size,
+        delete_batch_size=delete_batch_size,
+        client_factory=client_factory or factory_for(client),
+        event_callback=event_callback,
     )
 
 
@@ -119,3 +155,190 @@ def test_uidvalidity_change_aborts_before_flagging() -> None:
         with pytest.raises(UnsafeMailboxOperation, match="UIDVALIDITY changed"):
             mailbox.delete_uids([10])
     assert client.added == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "operation"),
+    [
+        ("login", "imap_login"),
+        ("capabilities", "imap_capabilities"),
+        ("select", "imap_select_folder"),
+        ("search", "imap_search"),
+    ],
+)
+def test_protocol_errors_are_contextual_and_do_not_expose_sensitive_data(failure, operation):
+    client = FakeClient()
+    client.fail_on = failure
+    with pytest.raises(ImapOperationError) as raised:
+        with make_mailbox(client, writable=False):
+            pass
+    rendered = str(raised.value)
+    assert f"error [{operation}]" in rendered
+    assert "folder='Spam'" in rendered if failure in {"select", "search"} else True
+    assert "password=secret" not in rendered
+    assert RAW.decode() not in rendered
+    assert raised.value.__cause__ is not None
+
+
+def test_size_fetch_is_chunked_for_large_snapshot():
+    uids = list(range(1, 10_001))
+    client = FakeClient(size=2, uids=uids)
+    with make_mailbox(client, writable=False, max_message_bytes=1) as mailbox:
+        items = list(mailbox.iter_messages())
+
+    size_fetches = [messages for messages, selector in client.fetches if selector == ("RFC822.SIZE",)]
+    assert len(size_fetches) == 100
+    assert max(map(len, size_fetches)) == 100
+    assert all(len(messages) <= 100 for messages in size_fetches)
+    assert [item.uid for item in items] == uids
+    assert all(item.message is None for item in items)
+    assert len(client.fetches) == 100
+
+
+def test_size_fetch_error_reports_phase_batch_and_uid_range_without_payload():
+    client = FakeClient(size=1, uids=[9, 1, 4])
+    client.fail_on = "fetch_size"
+    with make_mailbox(client, writable=False, fetch_batch_size=2) as mailbox:
+        with pytest.raises(ImapOperationError) as raised:
+            next(mailbox.iter_messages())
+
+    rendered = str(raised.value)
+    assert "error [imap_fetch_size]" in rendered
+    assert "selector=RFC822.SIZE" in rendered
+    assert "batch=1/2" in rendered
+    assert "uid_count=2" in rendered
+    assert "uid_min=1" in rendered and "uid_max=4" in rendered
+    assert "server_status=BAD" in rendered
+    assert "password=secret" not in rendered
+    assert RAW.decode() not in rendered
+
+
+def test_body_fetch_remains_single_uid_and_errors_identify_uid():
+    client = FakeClient(size=1, uids=[11, 12])
+    client.fail_on = "fetch_body"
+    with make_mailbox(client, writable=False) as mailbox:
+        with pytest.raises(ImapOperationError) as raised:
+            next(mailbox.iter_messages())
+
+    rendered = str(raised.value)
+    assert "error [imap_fetch_body]" in rendered
+    assert "selector=BODY.PEEK[]" in rendered
+    assert "uid=11" in rendered
+    assert "password=secret" not in rendered
+    assert RAW.decode() not in rendered
+    body_fetches = [messages for messages, selector in client.fetches if selector == ("BODY.PEEK[]",)]
+    assert body_fetches == [(11,)]
+
+
+def test_fetch_batch_size_must_be_positive():
+    with pytest.raises(ValueError, match="fetch_batch_size must be positive"):
+        make_mailbox(FakeClient(), writable=False, fetch_batch_size=0)
+
+
+def test_verbose_mailbox_events_contain_only_safe_metadata():
+    client = FakeClient(size=1)
+    events = []
+    with make_mailbox(client, writable=False, event_callback=events.append) as mailbox:
+        list(mailbox.iter_messages())
+
+    assert any("connect host=imap.example.org port=993 tls=true" in event for event in events)
+    assert any("size-fetch batch=1/1 uid_count=1" in event for event in events)
+    assert any("body-fetch uid=10" in event for event in events)
+    assert all("password" not in event and RAW.decode() not in event for event in events)
+
+
+
+def test_delete_error_reports_expunge_and_rollback_failures_without_payload():
+    client = FakeClient()
+    client.fail_on = {"uid_expunge", "remove_flags"}
+    with make_mailbox(client, writable=True) as mailbox:
+        with pytest.raises(ImapOperationError) as raised:
+            mailbox.delete_uids([10])
+
+    rendered = str(raised.value)
+    assert "error [imap_uid_expunge]" in rendered
+    assert "rollback_error_type=RuntimeError" in rendered
+    assert "password=secret" not in rendered
+    assert RAW.decode() not in rendered
+
+
+
+    assert client.added == [((10,), ("\\Deleted",), True)]
+    assert client.expunged == []
+
+
+
+def test_delete_is_chunked_and_returns_confirmed_uids():
+    client = FakeClient(uids=[1, 2, 3, 4, 5])
+    with make_mailbox(client, writable=True, delete_batch_size=2) as mailbox:
+        result = mailbox.delete_uids([1, 2, 3, 4, 5])
+
+    assert isinstance(result, DeleteResult)
+    assert result.deleted == (1, 2, 3, 4, 5)
+    assert [item[0] for item in client.added] == [(1, 2), (3, 4), (5,)]
+    assert client.expunged == [(1, 2), (3, 4), (5,)]
+
+
+def test_partial_delete_reports_only_completed_chunks_and_rolls_back_failing_batch():
+    class FailSecondExpunge(FakeClient):
+        def uid_expunge(self, messages):
+            if len(self.expunged) == 1:
+                raise RuntimeError(self.failure_text)
+            super().uid_expunge(messages)
+
+    client = FailSecondExpunge(uids=[1, 2, 3, 4, 5])
+    with make_mailbox(client, writable=True, delete_batch_size=2) as mailbox:
+        with pytest.raises(PartialDeleteError) as raised:
+            mailbox.delete_uids([1, 2, 3, 4, 5])
+
+    error = raised.value
+    assert error.deleted == (1, 2)
+    assert error.pending == (3, 4, 5)
+    assert error.operation == "imap_uid_expunge"
+    assert error.batch == 2 and error.batch_count == 3
+    assert client.expunged == [(1, 2)]
+    assert client.removed == [((3, 4), ("\\Deleted",), True)]
+    assert "confirmed_deleted_count=2 pending_count=3" in str(error)
+    assert "password=secret" not in str(error)
+    assert RAW.decode() not in str(error)
+
+
+def test_store_failure_rolls_back_only_failing_batch():
+    class FailSecondStore(FakeClient):
+        def add_flags(self, messages, flags, silent=False):
+            if len(self.added) == 1:
+                self.added.append((tuple(messages), tuple(flags), silent))
+                raise RuntimeError(self.failure_text)
+            super().add_flags(messages, flags, silent)
+
+    client = FailSecondStore(uids=[1, 2, 3, 4, 5])
+    with make_mailbox(client, writable=True, delete_batch_size=2) as mailbox:
+        with pytest.raises(PartialDeleteError) as raised:
+            mailbox.delete_uids([1, 2, 3, 4, 5])
+
+    assert raised.value.deleted == (1, 2)
+    assert raised.value.pending == (3, 4, 5)
+    assert raised.value.operation == "imap_add_deleted_flag"
+    assert client.removed == [((3, 4), ("\\Deleted",), True)]
+    assert client.expunged == [(1, 2)]
+
+
+
+def test_uid_mode_and_password_reference_lifetime():
+    client = FakeClient()
+    factory_options = {}
+
+    def factory(*args, **kwargs):
+        factory_options.update(kwargs)
+        return client
+
+    mailbox = make_mailbox(client, writable=False, client_factory=factory)
+    with mailbox:
+        assert mailbox._password == ""
+    assert factory_options["use_uid"] is True
+
+    client.fail_on = "login"
+    failed_mailbox = make_mailbox(client, writable=False)
+    with pytest.raises(ImapOperationError, match="imap_login"):
+        failed_mailbox.__enter__()
+    assert failed_mailbox._password == ""

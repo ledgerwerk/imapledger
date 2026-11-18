@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -9,8 +10,106 @@ from .message import MailMessage, parse_message
 DELETED_FLAG = "\\Deleted"
 
 
+DEFAULT_FETCH_BATCH_SIZE = 100
+DEFAULT_DELETE_BATCH_SIZE = 100
+
+
 class MailboxError(RuntimeError):
     pass
+
+
+class ImapOperationError(MailboxError):
+    def __init__(
+        self,
+        *,
+        operation: str,
+        message: str,
+        folder: str | None = None,
+        selector: str | None = None,
+        uids: Sequence[int] = (),
+        batch: int | None = None,
+        batch_count: int | None = None,
+        cause_type: str | None = None,
+        server_status: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        normalized = tuple(int(uid) for uid in uids)
+        self.operation = operation
+        self.message = message
+        self.folder = folder
+        self.selector = selector
+        self.uid_count = len(normalized) or None
+        self.uid_min = min(normalized) if normalized else None
+        self.uid_max = max(normalized) if normalized else None
+        self.batch = batch
+        self.batch_count = batch_count
+        self.cause_type = cause_type
+        self.server_status = server_status
+        self.rollback_error_type: str | None = None
+
+    def __str__(self) -> str:
+        lines = [f"error [{self.operation}]: {self.message}"]
+        details = []
+        if self.folder is not None:
+            details.append(f"folder={self.folder!r}")
+        if self.selector is not None:
+            details.append(f"selector={self.selector}")
+        if self.batch is not None:
+            batch = f"batch={self.batch}"
+            if self.batch_count is not None:
+                batch += f"/{self.batch_count}"
+            details.append(batch)
+        if self.uid_count is not None:
+            details.append(f"uid_count={self.uid_count}")
+            if self.uid_min == self.uid_max:
+                details.append(f"uid={self.uid_min}")
+            else:
+                details.extend((f"uid_min={self.uid_min}", f"uid_max={self.uid_max}"))
+        if self.rollback_error_type is not None:
+            details.append(f"rollback_error_type={self.rollback_error_type}")
+        if self.server_status is not None:
+            details.append(f"server_status={self.server_status}")
+        if self.cause_type is not None:
+            details.append(f"server_error_type={self.cause_type}")
+        if details:
+            lines.append(" ".join(details))
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True, slots=True)
+class DeleteResult:
+    deleted: tuple[int, ...]
+
+
+class PartialDeleteError(ImapOperationError):
+    def __init__(
+        self,
+        *,
+        deleted: Sequence[int],
+        pending: Sequence[int],
+        failure: ImapOperationError,
+    ) -> None:
+        self.deleted = tuple(int(uid) for uid in deleted)
+        self.pending = tuple(int(uid) for uid in pending)
+        self.cause = failure
+        super().__init__(
+            operation=failure.operation,
+            message="deletion stopped after a failed UID batch",
+            folder=failure.folder,
+            selector=failure.selector,
+            uids=self.pending,
+            batch=failure.batch,
+            batch_count=failure.batch_count,
+            cause_type=failure.cause_type,
+            server_status=failure.server_status,
+        )
+        self.rollback_error_type = failure.rollback_error_type
+
+    def __str__(self) -> str:
+        return (
+            f"{super().__str__()}\n"
+            f"confirmed_deleted_count={len(self.deleted)} pending_count={len(self.pending)}"
+        )
 
 
 class UnsafeMailboxOperation(MailboxError):
@@ -38,6 +137,17 @@ class MailboxSnapshot:
     uids: frozenset[int]
 
 
+
+@dataclass(frozen=True, slots=True)
+class MailboxProbe:
+    uidvalidity: int
+    message_count: int
+    uid_min: int | None
+    uid_max: int | None
+    size_fetch_uid: int | None
+    body_fetch_uid: int | None
+    body_skip_reason: str | None
+
 @dataclass(frozen=True, slots=True)
 class MailboxItem:
     uid: int
@@ -64,7 +174,10 @@ class ScopedMailbox:
         max_message_bytes: int,
         max_body_chars: int,
         timeout: float = 30.0,
+        fetch_batch_size: int = DEFAULT_FETCH_BATCH_SIZE,
+        delete_batch_size: int = DEFAULT_DELETE_BATCH_SIZE,
         client_factory: ClientFactory | None = None,
+        event_callback: Callable[[str], None] | None = None,
     ) -> None:
         if not folder.strip():
             raise ValueError("folder must not be empty")
@@ -76,8 +189,15 @@ class ScopedMailbox:
         self._writable = writable
         self._max_message_bytes = max_message_bytes
         self._max_body_chars = max_body_chars
+        if fetch_batch_size <= 0:
+            raise ValueError("fetch_batch_size must be positive")
+        if delete_batch_size <= 0:
+            raise ValueError("delete_batch_size must be positive")
         self._timeout = timeout
+        self._fetch_batch_size = fetch_batch_size
+        self._delete_batch_size = delete_batch_size
         self._client_factory = client_factory or _default_client_factory
+        self._event_callback = event_callback
         self._client: _Client | None = None
         self._snapshot: MailboxSnapshot | None = None
 
@@ -90,16 +210,67 @@ class ScopedMailbox:
         return self._writable
 
     def __enter__(self) -> ScopedMailbox:
-        client = self._client_factory(self._host, port=self._port, ssl=True, timeout=self._timeout)
+        self._emit(f"connect host={self._host} port={self._port} tls=true")
         try:
-            client.login(self._username, self._password)
-            if self._writable and not _has_capability(client, b"UIDPLUS"):
+            client = self._client_factory(self._host, port=self._port, ssl=True, timeout=self._timeout, use_uid=True)
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_connect",
+                message="could not establish IMAP connection",
+                exc=exc,
+            ) from exc
+        self._emit("TLS connect: OK")
+
+        try:
+            try:
+                client.login(self._username, self._password)
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_login",
+                    message="IMAP login failed",
+                    exc=exc,
+                ) from exc
+            finally:
+                self._password = ""
+            self._emit("login ok")
+
+            try:
+                capabilities = client.capabilities()
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_capabilities",
+                    message="could not read IMAP capabilities",
+                    exc=exc,
+                ) from exc
+            self._emit(f"capabilities count={len(capabilities)}")
+            if self._writable and not _contains_capability(capabilities, b"UIDPLUS"):
                 raise UnsafeMailboxOperation(
                     "destructive mode requires IMAP UIDPLUS so only approved UIDs can be expunged"
                 )
-            selected = client.select_folder(self._folder, readonly=not self._writable)
+
+            try:
+                selected = client.select_folder(self._folder, readonly=not self._writable)
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_select_folder",
+                    message="could not select configured folder",
+                    exc=exc,
+                    folder=self._folder,
+                ) from exc
+            self._emit(f"select folder={self._folder!r} readonly={not self._writable}")
             uidvalidity = _uidvalidity(selected)
-            uids = frozenset(int(uid) for uid in client.search("ALL"))
+            self._emit(f"uidvalidity={uidvalidity}")
+
+            try:
+                uids = frozenset(int(uid) for uid in client.search("ALL"))
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_search",
+                    message="UID SEARCH ALL failed",
+                    exc=exc,
+                    folder=self._folder,
+                ) from exc
+            self._emit(f"snapshot messages={len(uids)}")
         except Exception:
             try:
                 client.logout()
@@ -109,7 +280,6 @@ class ScopedMailbox:
         self._client = client
         self._snapshot = MailboxSnapshot(uidvalidity=uidvalidity, uids=uids)
         return self
-
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         client = self._client
         self._client = None
@@ -118,14 +288,108 @@ class ScopedMailbox:
         if client is not None:
             try:
                 client.logout()
-            except Exception:
+            except Exception as logout_exc:
                 if exc is None:
-                    raise
+                    raise _operation_error(
+                        operation="imap_logout",
+                        message="IMAP logout failed",
+                        exc=logout_exc,
+                        folder=self._folder,
+                    ) from logout_exc
 
     def snapshot(self) -> MailboxSnapshot:
         if self._snapshot is None:
             raise MailboxError("mailbox is not open")
         return self._snapshot
+
+
+    def probe(self) -> MailboxProbe:
+        client = self._require_client()
+        snapshot = self.snapshot()
+        ordered_uids = sorted(snapshot.uids)
+        if not ordered_uids:
+            return MailboxProbe(
+                uidvalidity=snapshot.uidvalidity,
+                message_count=0,
+                uid_min=None,
+                uid_max=None,
+                size_fetch_uid=None,
+                body_fetch_uid=None,
+                body_skip_reason="mailbox is empty",
+            )
+
+        uid = ordered_uids[0]
+        self._emit(f"doctor-size-fetch uid={uid}")
+        try:
+            sizes = client.fetch([uid], ["RFC822.SIZE"])
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_fetch_size",
+                message="FETCH failed while reading RFC822.SIZE",
+                exc=exc,
+                folder=self._folder,
+                selector="RFC822.SIZE",
+                uids=(uid,),
+            ) from exc
+        size_data = sizes.get(uid)
+        if not size_data:
+            raise ImapOperationError(
+                operation="imap_fetch_size",
+                message="server did not return RFC822.SIZE for probe UID",
+                folder=self._folder,
+                selector="RFC822.SIZE",
+                uids=(uid,),
+            )
+        try:
+            size = int(size_data.get(b"RFC822.SIZE", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise _operation_error(
+                operation="imap_fetch_size",
+                message="server returned invalid RFC822.SIZE for probe UID",
+                exc=exc,
+                folder=self._folder,
+                selector="RFC822.SIZE",
+                uids=(uid,),
+            ) from exc
+
+        body_fetch_uid = None
+        body_skip_reason = None
+        if size > self._max_message_bytes:
+            body_skip_reason = f"probe message size {size} exceeds limit {self._max_message_bytes}"
+        else:
+            self._emit(f"doctor-body-fetch uid={uid}")
+            try:
+                response = client.fetch([uid], ["BODY.PEEK[]"])
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_fetch_body",
+                    message="FETCH failed while reading BODY.PEEK[]",
+                    exc=exc,
+                    folder=self._folder,
+                    selector="BODY.PEEK[]",
+                    uids=(uid,),
+                ) from exc
+            body_data = response.get(uid)
+            raw = body_data.get(b"BODY[]") if body_data else None
+            if not isinstance(raw, bytes):
+                raise ImapOperationError(
+                    operation="imap_fetch_body",
+                    message="server did not return BODY[] bytes for probe UID",
+                    folder=self._folder,
+                    selector="BODY.PEEK[]",
+                    uids=(uid,),
+                )
+            body_fetch_uid = uid
+
+        return MailboxProbe(
+            uidvalidity=snapshot.uidvalidity,
+            message_count=len(ordered_uids),
+            uid_min=ordered_uids[0],
+            uid_max=ordered_uids[-1],
+            size_fetch_uid=uid,
+            body_fetch_uid=body_fetch_uid,
+            body_skip_reason=body_skip_reason,
+        )
 
     def iter_messages(self) -> Iterator[MailboxItem]:
         client = self._require_client()
@@ -134,72 +398,177 @@ class ScopedMailbox:
             return
 
         ordered_uids = sorted(snapshot.uids)
-        sizes = client.fetch(ordered_uids, ["RFC822.SIZE"])
-        for uid in ordered_uids:
-            size_data = sizes.get(uid)
-            if not size_data:
-                yield MailboxItem(uid=uid, skip_reason="message disappeared before size fetch")
-                continue
-            size = int(size_data.get(b"RFC822.SIZE", 0) or 0)
-            if size > self._max_message_bytes:
+        batch_count = (len(ordered_uids) + self._fetch_batch_size - 1) // self._fetch_batch_size
+        for batch_number, uid_batch in enumerate(_iter_chunks(ordered_uids, self._fetch_batch_size), start=1):
+            self._emit(
+                f"size-fetch batch={batch_number}/{batch_count} uid_count={len(uid_batch)} "
+                f"uid_min={uid_batch[0]} uid_max={uid_batch[-1]}"
+            )
+            try:
+                sizes = client.fetch(uid_batch, ["RFC822.SIZE"])
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_fetch_size",
+                    message="FETCH failed while reading RFC822.SIZE",
+                    exc=exc,
+                    folder=self._folder,
+                    selector="RFC822.SIZE",
+                    uids=uid_batch,
+                    batch=batch_number,
+                    batch_count=batch_count,
+                ) from exc
+
+            for uid in uid_batch:
+                size_data = sizes.get(uid)
+                if not size_data:
+                    yield MailboxItem(uid=uid, skip_reason="message disappeared before size fetch")
+                    continue
+                size = int(size_data.get(b"RFC822.SIZE", 0) or 0)
+                if size > self._max_message_bytes:
+                    yield MailboxItem(
+                        uid=uid,
+                        skip_reason=f"message size {size} exceeds limit {self._max_message_bytes}",
+                    )
+                    continue
+
+                self._emit(f"body-fetch uid={uid}")
+                try:
+                    response = client.fetch([uid], ["BODY.PEEK[]"])
+                except Exception as exc:
+                    raise _operation_error(
+                        operation="imap_fetch_body",
+                        message="FETCH failed while reading BODY.PEEK[]",
+                        exc=exc,
+                        folder=self._folder,
+                        selector="BODY.PEEK[]",
+                        uids=(uid,),
+                    ) from exc
+                data = response.get(uid)
+                if not data:
+                    yield MailboxItem(uid=uid, skip_reason="message disappeared before body fetch")
+                    continue
+                raw = data.get(b"BODY[]")
+                if not isinstance(raw, bytes):
+                    yield MailboxItem(uid=uid, skip_reason="server did not return BODY[] bytes")
+                    continue
                 yield MailboxItem(
                     uid=uid,
-                    skip_reason=f"message size {size} exceeds limit {self._max_message_bytes}",
+                    message=parse_message(uid, raw, max_body_chars=self._max_body_chars),
                 )
-                continue
-
-            response = client.fetch([uid], ["BODY.PEEK[]"])
-            data = response.get(uid)
-            if not data:
-                yield MailboxItem(uid=uid, skip_reason="message disappeared before body fetch")
-                continue
-            raw = data.get(b"BODY[]")
-            if not isinstance(raw, bytes):
-                yield MailboxItem(uid=uid, skip_reason="server did not return BODY[] bytes")
-                continue
-            yield MailboxItem(
-                uid=uid,
-                message=parse_message(uid, raw, max_body_chars=self._max_body_chars),
-            )
-
-    def delete_uids(self, uids: Sequence[int]) -> None:
+    def delete_uids(self, uids: Sequence[int]) -> DeleteResult:
         if not self._writable:
             raise UnsafeMailboxOperation("mailbox is read-only")
         client = self._require_client()
         snapshot = self.snapshot()
         requested = tuple(dict.fromkeys(int(uid) for uid in uids))
         if not requested:
-            return
+            return DeleteResult(deleted=())
         outside = set(requested) - snapshot.uids
         if outside:
             raise UnsafeMailboxOperation(f"refusing UIDs outside initial mailbox snapshot: {sorted(outside)}")
-        if not _has_capability(client, b"UIDPLUS"):
+        try:
+            has_uidplus = _has_capability(client, b"UIDPLUS")
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_capabilities",
+                message="could not verify UIDPLUS before deletion",
+                exc=exc,
+                folder=self._folder,
+                uids=requested,
+            ) from exc
+        if not has_uidplus:
             raise UnsafeMailboxOperation("UIDPLUS disappeared; refusing deletion")
 
-        selected = client.select_folder(self._folder, readonly=False)
+        try:
+            selected = client.select_folder(self._folder, readonly=False)
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_predelete_select",
+                message="could not reselect configured folder before deletion",
+                exc=exc,
+                folder=self._folder,
+                uids=requested,
+            ) from exc
         current_uidvalidity = _uidvalidity(selected)
         if current_uidvalidity != snapshot.uidvalidity:
             raise UnsafeMailboxOperation(
                 f"UIDVALIDITY changed from {snapshot.uidvalidity} to {current_uidvalidity}; refusing deletion"
             )
 
-        current_uids = {int(uid) for uid in client.search("ALL")}
+        try:
+            current_uids = {int(uid) for uid in client.search("ALL")}
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_predelete_search",
+                message="UID SEARCH ALL failed before deletion",
+                exc=exc,
+                folder=self._folder,
+                uids=requested,
+            ) from exc
         missing = set(requested) - current_uids
         if missing:
             raise UnsafeMailboxOperation(f"approved UIDs no longer exist in scoped mailbox: {sorted(missing)}")
 
-        try:
-            client.add_flags(requested, [DELETED_FLAG], silent=True)
-            client.uid_expunge(requested)
-        except Exception:
-            # If STORE succeeded but UID EXPUNGE did not, best-effort removal
-            # avoids leaving our approved messages marked for a later broad EXPUNGE.
+        batch_count = (len(requested) + self._delete_batch_size - 1) // self._delete_batch_size
+        completed: list[int] = []
+        for batch_number, uid_batch in enumerate(_iter_chunks(requested, self._delete_batch_size), start=1):
+            self._emit(
+                f"delete batch={batch_number}/{batch_count} uid_count={len(uid_batch)} "
+                f"uid_min={uid_batch[0]} uid_max={uid_batch[-1]}"
+            )
             try:
-                client.remove_flags(requested, [DELETED_FLAG], silent=True)
-            except Exception:
-                pass
-            raise
+                self._delete_batch(client, uid_batch)
+            except ImapOperationError as failure:
+                failure.batch = batch_number
+                failure.batch_count = batch_count
+                raise PartialDeleteError(
+                    deleted=completed,
+                    pending=requested[len(completed) :],
+                    failure=failure,
+                ) from failure
+            completed.extend(uid_batch)
+        return DeleteResult(deleted=tuple(completed))
 
+    def _delete_batch(self, client: _Client, uids: Sequence[int]) -> None:
+        try:
+            client.add_flags(uids, [DELETED_FLAG], silent=True)
+        except Exception as exc:
+            rollback_error_type = self._remove_deleted_flags(client, uids)
+            error = _operation_error(
+                operation="imap_add_deleted_flag",
+                message="STORE \\Deleted failed",
+                exc=exc,
+                folder=self._folder,
+                selector="\\Deleted",
+                uids=uids,
+            )
+            error.rollback_error_type = rollback_error_type
+            raise error from exc
+        try:
+            client.uid_expunge(uids)
+        except Exception as exc:
+            rollback_error_type = self._remove_deleted_flags(client, uids)
+            error = _operation_error(
+                operation="imap_uid_expunge",
+                message="UID EXPUNGE failed",
+                exc=exc,
+                folder=self._folder,
+                uids=uids,
+            )
+            error.rollback_error_type = rollback_error_type
+            raise error from exc
+
+    def _remove_deleted_flags(self, client: _Client, uids: Sequence[int]) -> str | None:
+        try:
+            client.remove_flags(uids, [DELETED_FLAG], silent=True)
+        except Exception as exc:
+            self._emit(f"rollback remove-deleted-flag failed error_type={type(exc).__name__}")
+            return type(exc).__name__
+        return None
+
+    def _emit(self, event: str) -> None:
+        if self._event_callback is not None:
+            self._event_callback(event)
     def _require_client(self) -> _Client:
         if self._client is None:
             raise MailboxError("mailbox is not open")
@@ -212,10 +581,50 @@ def _default_client_factory(host: str, **kwargs: Any) -> _Client:
     return IMAPClient(host, **kwargs)
 
 
+def _iter_chunks(values: Sequence[int], size: int) -> Iterator[tuple[int, ...]]:
+    for start in range(0, len(values), size):
+        yield tuple(values[start : start + size])
+
+
+def _normalize_capabilities(values: Any) -> set[bytes]:
+    return {item.upper() if isinstance(item, bytes) else str(item).upper().encode() for item in values}
+
+
+def _contains_capability(values: Any, capability: bytes) -> bool:
+    return capability.upper() in _normalize_capabilities(values)
+
+
 def _has_capability(client: _Client, capability: bytes) -> bool:
-    values = client.capabilities()
-    normalized = {item.upper() if isinstance(item, bytes) else str(item).upper().encode() for item in values}
-    return capability.upper() in normalized
+    return _contains_capability(client.capabilities(), capability)
+
+
+def _safe_server_status(exc: Exception) -> str | None:
+    match = re.search(r"\bcommand error:\s*(BAD|NO|BYE)\b", str(exc), flags=re.IGNORECASE)
+    return match.group(1).upper() if match is not None else None
+
+
+def _operation_error(
+    *,
+    operation: str,
+    message: str,
+    exc: Exception,
+    folder: str | None = None,
+    selector: str | None = None,
+    uids: Sequence[int] = (),
+    batch: int | None = None,
+    batch_count: int | None = None,
+) -> ImapOperationError:
+    return ImapOperationError(
+        operation=operation,
+        message=message,
+        folder=folder,
+        selector=selector,
+        uids=uids,
+        batch=batch,
+        batch_count=batch_count,
+        cause_type=type(exc).__name__,
+        server_status=_safe_server_status(exc),
+    )
 
 
 def _uidvalidity(selected: dict[bytes, Any]) -> int:
