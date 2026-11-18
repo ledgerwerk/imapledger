@@ -221,3 +221,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+imapledger/_version.py
+context_imapledger*.*
