@@ -2,6 +2,8 @@ import pytest
 
 from imapledger.mailbox import (
     DeleteResult,
+    FolderCatalog,
+    FolderInfo,
     ImapOperationError,
     MessageSelection,
     MessageSort,
@@ -156,7 +158,6 @@ def test_dry_run_selects_only_scoped_folder_readonly() -> None:
     assert client.expunged == []
 
 
-
 def test_missing_configured_source_is_reported_before_select_or_search() -> None:
     client = FakeClient()
     client.existing_folders.remove("Spam")
@@ -223,6 +224,7 @@ def test_source_existence_check_precedes_select_and_search() -> None:
     assert client.calls == ["login", "capabilities", "folder_exists", "select", "search", "logout"]
     assert client.folder_queries == ["INBOX.Spam"]
     assert client.selected == [("INBOX.Spam", True)]
+
 
 def test_size_limit_prevents_body_fetch() -> None:
     client = FakeClient(size=10_000)
@@ -659,3 +661,245 @@ def test_delete_requires_uidplus_but_not_move() -> None:
         result = mailbox.delete_uids([10])
     assert result.deleted == (10,)
     assert client.expunged == [(10,)]
+
+
+class FakeFolderClient:
+    def __init__(self, folders, statuses=None, *, status_failures=(), fail_login=False, fail_list=False):
+        self.folders = folders
+        self.statuses = statuses or {}
+        self.status_failures = set(status_failures)
+        self.fail_login = fail_login
+        self.fail_list = fail_list
+        self.calls = []
+        self.status_calls = []
+        self.failure_text = "command error: NO password=secret private@example.org RAW_SERVER_DATA"
+
+    def login(self, username, password):
+        self.calls.append("login")
+        self.login_args = (username, password)
+        if self.fail_login:
+            raise RuntimeError(self.failure_text)
+
+    def logout(self):
+        self.calls.append("logout")
+
+    def list_folders(self):
+        self.calls.append("list_folders")
+        if self.fail_list:
+            raise RuntimeError(self.failure_text)
+        return self.folders
+
+    def folder_status(self, folder, what):
+        self.status_calls.append((folder, what))
+        if folder in self.status_failures:
+            raise RuntimeError(self.failure_text)
+        return self.statuses[folder]
+
+    def select_folder(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not SELECT")
+
+    def search(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not SEARCH")
+
+    def fetch(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not FETCH")
+
+    def move(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not MOVE")
+
+    def add_flags(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not STORE flags")
+
+    def remove_flags(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not STORE flags")
+
+    def uid_expunge(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not EXPUNGE")
+
+    def folder_exists(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not probe folders individually")
+
+    def copy(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not COPY")
+
+    def create_folder(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not CREATE folders")
+
+    def rename_folder(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not RENAME folders")
+
+    def delete_folder(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not DELETE folders")
+
+    def subscribe_folder(self, *args, **kwargs):
+        raise AssertionError("folder discovery must not change subscriptions")
+
+
+def make_catalog(client, *, factory_options=None, event_callback=None):
+    def factory(host, **kwargs):
+        if factory_options is not None:
+            factory_options.update(host=host, **kwargs)
+        return client
+
+    return FolderCatalog(
+        host="imap.example.org",
+        port=993,
+        username="me@example.org",
+        password="secret",
+        client_factory=factory,
+        event_callback=event_callback,
+    )
+
+
+def test_folder_catalog_no_counts_uses_only_list():
+    client = FakeFolderClient([((b"\\HasChildren",), b".", "INBOX")])
+    factory_options = {}
+
+    with make_catalog(client, factory_options=factory_options) as catalog:
+        rows = catalog.list_folders(include_counts=False)
+
+    assert [row.name for row in rows] == ["INBOX"]
+    assert rows[0].total is rows[0].unread is rows[0].read is None
+    assert client.calls == ["login", "list_folders", "logout"]
+    assert client.status_calls == []
+    assert factory_options == {
+        "host": "imap.example.org",
+        "port": 993,
+        "ssl": True,
+        "timeout": 30.0,
+        "use_uid": True,
+    }
+
+
+def test_folder_catalog_statuses_only_selectable_listed_names_and_preserves_names():
+    folders = [
+        ((b"\\HasChildren",), b".", "INBOX"),
+        ((b"\\HasNoChildren", b"\\Junk"), b".", "INBOX.Junk"),
+        ((b"\\Noselect", b"\\HasChildren"), b".", "Shared"),
+        ((b"\\HasNoChildren",), b".", "Shared.Team"),
+    ]
+    statuses = {
+        "INBOX": {b"MESSAGES": 100, b"UNSEEN": 7},
+        "INBOX.Junk": {"MESSAGES": 0, "UNSEEN": 0},
+        "Shared.Team": {b"MESSAGES": 10, b"UNSEEN": 10},
+    }
+    client = FakeFolderClient(folders, statuses)
+
+    with make_catalog(client) as catalog:
+        rows = catalog.list_folders()
+
+    by_name = {row.name: row for row in rows}
+    assert client.status_calls == [
+        ("INBOX", ("MESSAGES", "UNSEEN")),
+        ("INBOX.Junk", ("MESSAGES", "UNSEEN")),
+        ("Shared.Team", ("MESSAGES", "UNSEEN")),
+    ]
+    assert by_name["INBOX"].read == 93
+    assert by_name["INBOX.Junk"].total == by_name["INBOX.Junk"].unread == by_name["INBOX.Junk"].read == 0
+    assert by_name["Shared.Team"].read == 0
+    assert by_name["Shared"].selectable is False
+    assert by_name["Shared"].total is by_name["Shared"].unread is by_name["Shared"].read is None
+    assert by_name["INBOX.Junk"].flags == frozenset({b"\\HASNOCHILDREN", b"\\JUNK"})
+    assert [(row.name, row.delimiter) for row in rows] == [
+        ("INBOX", "."),
+        ("INBOX.Junk", "."),
+        ("Shared", "."),
+        ("Shared.Team", "."),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_type"),
+    [
+        ({b"UNSEEN": 1}, "ValueError"),
+        ({b"MESSAGES": 2}, "ValueError"),
+        ({b"MESSAGES": -1, b"UNSEEN": 0}, "ValueError"),
+        ({b"MESSAGES": 1, b"UNSEEN": -1}, "ValueError"),
+        ({b"MESSAGES": 1, b"UNSEEN": 2}, "ValueError"),
+        ({b"MESSAGES": "invalid", b"UNSEEN": 0}, "ValueError"),
+    ],
+)
+def test_folder_catalog_malformed_status_counts_are_unavailable(status, expected_type):
+    client = FakeFolderClient([((b"\\HasNoChildren",), ".", "Legacy")], {"Legacy": status})
+
+    with make_catalog(client) as catalog:
+        (row,) = catalog.list_folders()
+
+    assert row.total is row.unread is row.read is None
+    assert row.status_error is not None
+    assert row.status_error.operation == "imap_folder_status"
+    assert row.status_error.cause_type == expected_type
+
+
+def test_folder_catalog_status_failure_keeps_other_rows_and_sanitizes_error():
+    folders = [
+        ((b"\\HasNoChildren",), ".", "First"),
+        ((b"\\HasNoChildren",), ".", "Broken"),
+        ((b"\\HasNoChildren",), ".", "Last"),
+    ]
+    statuses = {name: {b"MESSAGES": 4, b"UNSEEN": 1} for name in ("First", "Last")}
+    client = FakeFolderClient(folders, statuses, status_failures={"Broken"})
+
+    with make_catalog(client) as catalog:
+        rows = catalog.list_folders()
+
+    assert [row.name for row in rows] == ["Broken", "First", "Last"]
+    assert rows[0].status_error is not None
+    assert rows[0].total is rows[0].unread is rows[0].read is None
+    assert rows[1].read == rows[2].read == 3
+    assert [folder for folder, _ in client.status_calls] == ["First", "Broken", "Last"]
+    rendered = str(rows[0].status_error)
+    assert "password=secret" not in rendered
+    assert "private@example.org" not in rendered
+    assert "RAW_SERVER_DATA" not in rendered
+
+
+def test_folder_catalog_list_failure_is_fatal_and_sanitized():
+    client = FakeFolderClient([], fail_list=True)
+
+    with pytest.raises(ImapOperationError) as raised:
+        with make_catalog(client) as catalog:
+            catalog.list_folders()
+
+    assert raised.value.operation == "imap_list_folders"
+    assert "password=secret" not in str(raised.value)
+    assert "private@example.org" not in str(raised.value)
+    assert "RAW_SERVER_DATA" not in str(raised.value)
+    assert client.calls == ["login", "list_folders", "logout"]
+
+
+def test_folder_catalog_clears_password_after_login_attempt():
+    client = FakeFolderClient([], fail_login=True)
+    catalog = make_catalog(client)
+
+    with pytest.raises(ImapOperationError, match="imap_login"):
+        catalog.__enter__()
+
+    assert catalog._password == ""
+    assert client.calls == ["login", "logout"]
+
+
+def test_folder_catalog_never_calls_message_or_mutation_methods():
+    client = FakeFolderClient(
+        [((b"\\HasNoChildren",), ".", "INBOX")],
+        {"INBOX": {b"MESSAGES": 2, b"UNSEEN": 1}},
+    )
+
+    with make_catalog(client) as catalog:
+        catalog.list_folders()
+
+    assert client.calls == ["login", "list_folders", "logout"]
+
+
+def test_folder_info_is_immutable_and_derives_read_count():
+    row = FolderInfo(name="Spam", delimiter=None, flags={b"\\noselect", b"\\junk"}, total=5, unread=2)
+
+    assert row.flags == frozenset({b"\\NOSELECT", b"\\JUNK"})
+    assert row.selectable is False
+    assert row.read == 3
+
+
+@pytest.mark.parametrize(("total", "unread"), [(None, 0), (-1, 0), (1, -1), (1, 2)])
+def test_folder_info_rejects_invalid_counts(total, unread):
+    with pytest.raises(ValueError):
+        FolderInfo(name="Spam", delimiter=None, flags=frozenset(), total=total, unread=unread)

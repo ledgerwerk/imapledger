@@ -126,7 +126,7 @@ def default_config_path() -> Path:
     return base / "imapledger" / "config.toml"
 
 
-def load_settings(path: Path | None = None) -> Settings:
+def _load_config_payload(path: Path | None = None) -> tuple[Path, dict[str, object]]:
     config_path = path or default_config_path()
     try:
         payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -134,6 +134,34 @@ def load_settings(path: Path | None = None) -> Settings:
         raise ConfigError(f"config not found: {config_path}; run `imapledger init`") from exc
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"could not read config {config_path}: {exc}") from exc
+    return config_path, payload
+
+
+def _parse_imap_settings(payload: dict[str, object]) -> ImapSettings:
+    imap = payload.get("imap")
+    if not isinstance(imap, dict):
+        raise ConfigError("config requires an [imap] table")
+    try:
+        return ImapSettings(
+            host=str(imap["host"]),
+            username=str(imap["username"]),
+            port=int(imap.get("port", 993)),
+        )
+    except KeyError as exc:
+        raise ConfigError(f"missing config key: {exc.args[0]}") from exc
+    except (TypeError, ValueError) as exc:
+        if isinstance(exc, ConfigError):
+            raise
+        raise ConfigError(f"invalid config value: {exc}") from exc
+
+
+def load_imap_settings(path: Path | None = None) -> ImapSettings:
+    _, payload = _load_config_payload(path)
+    return _parse_imap_settings(payload)
+
+
+def load_settings(path: Path | None = None) -> Settings:
+    _, payload = _load_config_payload(path)
 
     imap = payload.get("imap")
     spam = payload.get("spam")
@@ -141,6 +169,7 @@ def load_settings(path: Path | None = None) -> Settings:
         raise ConfigError("config requires an [imap] table")
     if not isinstance(spam, dict):
         raise ConfigError("config requires a [spam] table")
+    imap_settings = _parse_imap_settings(payload)
     if "threshold" in spam:
         warnings.warn(
             "spam.threshold is deprecated and ignored; configure named [spam.policy] thresholds instead",
@@ -177,11 +206,7 @@ def load_settings(path: Path | None = None) -> Settings:
 
     try:
         return Settings(
-            imap=ImapSettings(
-                host=str(imap["host"]),
-                username=str(imap["username"]),
-                port=int(imap.get("port", 993)),
-            ),
+            imap=imap_settings,
             spam=SpamSettings(
                 folders=folders,
                 actions=_parse_spam_actions(spam.get("actions", {}), legacy_defaults="folder" in spam),

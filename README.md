@@ -31,6 +31,16 @@ python -m pip install -e '.[dev]'
 
 ## Configure
 
+Discover server-specific mailbox names before choosing source folders or move destinations:
+
+```bash
+imapledger folders \
+  --host imap.example.org \
+  --username me@example.org
+```
+
+Copy the exact IMAP name column into `spam.folders` or an action `destination`. The command uses IMAP `LIST` and aggregate `STATUS (MESSAGES UNSEEN)` counts. It does not select mailboxes or fetch message contents. `--no-counts` skips STATUS entirely. STATUS avoids a client-side scan through messages, although the server may do internal work to calculate mailbox counts.
+
 Create a configuration file with repeated source folders and explicit actions:
 
 ```bash
@@ -84,6 +94,7 @@ Legacy `spam.threshold` values are deprecated, warned about, and ignored. The do
 ## Dry run and apply
 
 ```bash
+imapledger folders --no-counts
 imapledger clean
 imapledger clean --limit 10
 imapledger clean --limit 10 --offset 10 --sort newest

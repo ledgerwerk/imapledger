@@ -7,6 +7,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from .classifier import PyJevSpamClassifier
 from .cleaner import CleanReport, MessageResult, SpamCleaner, SpamOutcome
@@ -19,12 +20,21 @@ from .config import (
     SpamActions,
     SpamSettings,
     default_config_path,
+    load_imap_settings,
     load_settings,
     render_settings,
     write_settings,
 )
 from .evidence import redact_urls
-from .mailbox import ImapOperationError, MailboxError, MessageSelection, MessageSort, ScopedMailbox
+from .mailbox import (
+    FolderCatalog,
+    FolderInfo,
+    ImapOperationError,
+    MailboxError,
+    MessageSelection,
+    MessageSort,
+    ScopedMailbox,
+)
 from .preflight import preflight_source
 
 app = typer.Typer(no_args_is_help=True, help="Security-scoped IMAP automation.")
@@ -90,6 +100,102 @@ def init_config(
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"Wrote {path}")
     console.print("No IMAP password was stored.")
+
+
+@app.command()
+def folders(
+    config: Path = typer.Option(default_config_path(), "--config", help="Config file, ignored in direct mode"),  # noqa: B008
+    host: str | None = typer.Option(None, "--host", help="IMAP host for direct connection mode"),
+    username: str | None = typer.Option(None, "--username", help="IMAP username for direct connection mode"),
+    port: int | None = typer.Option(None, "--port", help="IMAPS port for direct connection mode (default: 993)"),
+    counts: bool = typer.Option(True, "--counts/--no-counts", help="Read aggregate message and unread counts"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """List IMAP folders and counts without reading message contents or mutating mail."""
+    try:
+        imap = _resolve_folder_imap_settings(config, host=host, username=username, port=port)
+    except ConfigError as exc:
+        err_console.print(f"Configuration error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+
+    password = getpass.getpass("IMAP password: ")
+    if not password:
+        err_console.print("Empty password; aborting.", markup=False)
+        raise typer.Exit(2)
+
+    rows: tuple[FolderInfo, ...] = ()
+    try:
+        with FolderCatalog(
+            host=imap.host,
+            port=imap.port,
+            username=imap.username,
+            password=password,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+        ) as catalog:
+            rows = catalog.list_folders(include_counts=counts)
+    except MailboxError as exc:
+        _print_failure(exc, debug=False, command="folders")
+        raise typer.Exit(1) from exc
+    finally:
+        password = ""
+
+    _print_folder_table(rows, show_counts=counts)
+    errors = [row.status_error for row in rows if row.status_error is not None]
+    for error in errors:
+        _print_failure(error, debug=False, command="folders")
+    if errors:
+        raise typer.Exit(1)
+
+
+def _resolve_folder_imap_settings(
+    config: Path,
+    *,
+    host: str | None,
+    username: str | None,
+    port: int | None,
+) -> ImapSettings:
+    direct_mode = host is not None or username is not None or port is not None
+    if not direct_mode:
+        return load_imap_settings(config)
+    if host is None or username is None:
+        raise ConfigError("direct connection mode requires both --host and --username")
+    return ImapSettings(host=host, username=username, port=993 if port is None else port)
+
+
+def _print_folder_table(rows: tuple[FolderInfo, ...], *, show_counts: bool) -> None:
+    table = Table(title="IMAP folders")
+    table.add_column("Folder")
+    table.add_column("Exact IMAP name")
+    table.add_column("Total", justify="right")
+    table.add_column("Read", justify="right")
+    table.add_column("Unread", justify="right")
+    table.add_column("Role")
+    table.add_column("Flags")
+
+    roles = (
+        (b"\\INBOX", "Inbox"),
+        (b"\\JUNK", "Junk"),
+        (b"\\TRASH", "Trash"),
+        (b"\\SENT", "Sent"),
+        (b"\\DRAFTS", "Drafts"),
+        (b"\\ARCHIVE", "Archive"),
+        (b"\\ALL", "All"),
+    )
+    for row in rows:
+        label = row.name
+        if row.delimiter:
+            parts = row.name.split(row.delimiter)
+            label = "  " * (len(parts) - 1) + parts[-1]
+        role = ", ".join(label for flag, label in roles if flag in row.flags) or "-"
+        if not show_counts or not row.selectable:
+            total = read = unread = "-"
+        elif row.status_error is not None or row.total is None or row.unread is None or row.read is None:
+            total = read = unread = "?"
+        else:
+            total, read, unread = (f"{value:,}" for value in (row.total, row.read, row.unread))
+        flags = " ".join(flag.decode("utf-8", errors="replace") for flag in sorted(row.flags)) or "-"
+        table.add_row(Text(label), Text(row.name), total, read, unread, role, Text(flags))
+    console.print(table, markup=False)
 
 
 @app.command()
@@ -527,7 +633,7 @@ def _print_failure(exc: Exception, *, debug: bool, command: str | None = None) -
                 "hint: could not verify the exact configured source name; "
                 "check server mailbox metadata access and permissions"
             )
-        elif command != "doctor":
+        elif command not in {"doctor", "folders"}:
             err_console.print("hint: run imapledger doctor --verbose")
     elif isinstance(exc, MailboxError):
         err_console.print(f"{type(exc).__name__}: {exc}", markup=False)

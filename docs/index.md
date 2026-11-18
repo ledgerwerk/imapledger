@@ -5,6 +5,7 @@
 ## Quick start
 
 ```bash
+imapledger folders --host imap.example.org --username me@example.org
 imapledger init \
   --host imap.example.org \
   --username me@example.org \

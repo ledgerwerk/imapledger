@@ -19,6 +19,7 @@ from imapledger.config import (
     load_settings,
 )
 from imapledger.mailbox import (
+    FolderInfo,
     ImapOperationError,
     MailboxProbe,
     MessageSelection,
@@ -313,7 +314,6 @@ class DoctorFakeClient:
     def capabilities(self):
         return (b"IMAP4rev1", b"UIDPLUS")
 
-
     def folder_exists(self, folder):
         self.folder_queries.append(folder)
         return folder in self.existing_folders
@@ -414,6 +414,7 @@ def test_doctor_reports_missing_source_and_checks_later_sources(monkeypatch):
     assert "folder: INBOX.Later (read-only)" in output.getvalue()
     assert "hint: run imapledger doctor --verbose" not in result.output
     assert "Traceback" not in result.output
+
 
 def test_doctor_size_probe_failure_is_contextual_and_private(monkeypatch):
     client = DoctorFakeClient(fail_on="size")
@@ -644,9 +645,9 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
         uids = frozenset({1, 2})
         capabilities = frozenset({b"MOVE", b"UIDPLUS"})
 
-
         def destination_exists(self, destination):
             return True
+
         def __enter__(self):
             return self
 
@@ -925,7 +926,6 @@ def test_clean_apply_preflights_each_destination_before_classifying(monkeypatch)
     assert "Aggregate across 2 folders" in rendered
 
 
-
 def test_clean_apply_aborts_all_sources_before_classifier_or_mutation(monkeypatch):
     output = StringIO()
     state = _install_multi_clean(
@@ -950,6 +950,7 @@ def test_clean_apply_aborts_all_sources_before_classifier_or_mutation(monkeypatc
     assert "apply aborted before classification/mutation" in rendered
     assert "MOVED" not in rendered and "DELETED" not in rendered
     assert "Traceback" not in result.output
+
 
 def test_clean_partial_move_exits_nonzero_and_keeps_confirmed_reporting(monkeypatch):
     output = StringIO()
@@ -1107,3 +1108,227 @@ def test_doctor_reports_missing_preconditions_for_each_folder_and_continues(monk
     assert "required capability MOVE: MISSING" in output.getvalue()
     assert "destination INBOX.NotSpam: MISSING" in output.getvalue()
     assert "preflight has failures" in output.getvalue()
+
+
+def _folder_cli_rows(status_error=None):
+    return (
+        FolderInfo("INBOX", ".", {b"\\INBOX", b"\\HASCHILDREN"}, 10234, 54),
+        FolderInfo("INBOX.Junk", ".", {b"\\JUNK", b"\\HASNOCHILDREN"}, 36575, 5),
+        FolderInfo("INBOX.Trash", ".", {b"\\TRASH", b"\\HASNOCHILDREN"}, 5030, 30),
+        FolderInfo("Shared", ".", {b"\\NOSELECT", b"\\HASCHILDREN"}, None, None),
+        FolderInfo("Legacy", ".", {b"\\HASNOCHILDREN"}, None, None, status_error),
+    )
+
+
+def _configure_folders(monkeypatch, rows, output, errors, *, fatal=None, fatal_stage="enter"):
+    state = {}
+    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
+    monkeypatch.setattr(cli, "err_console", Console(file=errors, width=200))
+
+    class FakeCatalog:
+        def __init__(self, **kwargs):
+            state["kwargs"] = kwargs
+
+        def __enter__(self):
+            if fatal is not None and fatal_stage == "enter":
+                raise fatal
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def list_folders(self, *, include_counts):
+            state["include_counts"] = include_counts
+            if fatal is not None and fatal_stage == "list":
+                raise fatal
+            return rows
+
+    monkeypatch.setattr(cli, "FolderCatalog", FakeCatalog)
+    return state
+
+
+def test_folders_help_describes_read_only_command_and_options():
+    result = CliRunner().invoke(cli.app, ["folders", "--help"])
+
+    assert result.exit_code == 0
+    assert "without reading message contents" in result.output
+    assert "mutating" in result.output
+    for option in ("--config", "--host", "--username", "--port", "--counts", "--no-counts", "--verbose"):
+        assert option in result.output
+
+
+def test_folders_config_mode_loads_only_imap_settings_and_renders_metadata(monkeypatch, tmp_path):
+    output = StringIO()
+    errors = StringIO()
+    config_path = tmp_path / "imap-only.toml"
+    prompts = []
+    settings = ImapSettings(host="imap.example.org", username="me@example.org", port=1993)
+    loaded = []
+    monkeypatch.setattr(cli, "load_imap_settings", lambda path: loaded.append(path) or settings)
+    monkeypatch.setattr(cli, "load_settings", lambda path: pytest.fail("folders must not load spam settings"))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: prompts.append(prompt) or "secret")
+    state = _configure_folders(monkeypatch, _folder_cli_rows(), output, errors)
+
+    result = CliRunner().invoke(cli.app, ["folders", "--config", str(config_path)])
+
+    rendered = output.getvalue()
+    assert result.exit_code == 0, result.output
+    assert loaded == [config_path]
+    assert prompts == ["IMAP password: "]
+    assert state["kwargs"] == {
+        "host": "imap.example.org",
+        "port": 1993,
+        "username": "me@example.org",
+        "password": "secret",
+        "event_callback": None,
+    }
+    assert state["include_counts"] is True
+    assert "INBOX.Junk" in rendered
+    assert "INBOX.Trash" in rendered
+    assert "Total" in rendered and "Read" in rendered and "Unread" in rendered
+    assert "Junk" in rendered and "Trash" in rendered
+    assert "Shared" in rendered
+    assert errors.getvalue() == ""
+
+
+def test_folders_direct_mode_uses_host_user_and_default_or_requested_port(monkeypatch):
+    for extra_args, expected_port in (([], 993), (["--port", "1993"], 1993)):
+        output = StringIO()
+        errors = StringIO()
+        monkeypatch.setattr(
+            cli,
+            "load_imap_settings",
+            lambda path: pytest.fail("direct mode must not read the configuration"),
+        )
+        monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
+        state = _configure_folders(monkeypatch, (), output, errors)
+
+        result = CliRunner().invoke(
+            cli.app,
+            ["folders", "--host", "imap.example.org", "--username", "me@example.org", *extra_args],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert state["kwargs"]["host"] == "imap.example.org"
+        assert state["kwargs"]["username"] == "me@example.org"
+        assert state["kwargs"]["port"] == expected_port
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--host", "imap.example.org"],
+        ["--username", "me@example.org"],
+        ["--port", "1993"],
+    ],
+)
+def test_folders_rejects_incomplete_direct_options(arguments, monkeypatch):
+    prompts = []
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: prompts.append(prompt) or "secret")
+    monkeypatch.setattr(cli, "load_imap_settings", lambda path: pytest.fail("invalid direct mode used config"))
+
+    result = CliRunner().invoke(cli.app, ["folders", *arguments])
+
+    assert result.exit_code == 2
+    assert "requires both --host and --username" in result.output
+    assert prompts == []
+
+
+def test_folders_empty_password_exits_before_connecting(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(cli, "load_imap_settings", lambda path: ImapSettings("imap.example.org", "me@example.org"))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: prompts.append(prompt) or "")
+    monkeypatch.setattr(cli, "FolderCatalog", lambda **kwargs: pytest.fail("empty password must not connect"))
+
+    result = CliRunner().invoke(cli.app, ["folders"])
+
+    assert result.exit_code == 2
+    assert prompts == ["IMAP password: "]
+    assert "Empty password; aborting." in result.output
+
+
+def test_folders_no_counts_displays_unavailable_counts(monkeypatch):
+    output = StringIO()
+    errors = StringIO()
+    state = _configure_folders(monkeypatch, _folder_cli_rows(), output, errors)
+    monkeypatch.setattr(cli, "load_imap_settings", lambda path: ImapSettings("imap.example.org", "me@example.org"))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
+
+    result = CliRunner().invoke(cli.app, ["folders", "--no-counts"])
+
+    assert result.exit_code == 0
+    assert state["include_counts"] is False
+    assert "-" in output.getvalue()
+    assert "error [imap_folder_status]" not in result.output
+
+
+def test_folders_partial_status_failure_renders_table_and_hides_exception_payload(monkeypatch):
+    error = ImapOperationError(
+        operation="imap_folder_status",
+        message="could not read mailbox counts",
+        folder="Legacy",
+        cause_type="RuntimeError",
+        server_status="NO",
+    )
+    output = StringIO()
+    errors = StringIO()
+    _configure_folders(monkeypatch, _folder_cli_rows(error), output, errors)
+    monkeypatch.setattr(cli, "load_imap_settings", lambda path: ImapSettings("imap.example.org", "me@example.org"))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
+
+    result = CliRunner().invoke(cli.app, ["folders"])
+
+    rendered = output.getvalue()
+    diagnostic = errors.getvalue()
+    assert result.exit_code == 1
+    assert "INBOX.Junk" in rendered and "Legacy" in rendered
+    assert "?" in rendered
+    assert "error [imap_folder_status]" in diagnostic
+    assert "folder='Legacy'" in diagnostic
+    assert "password=secret" not in result.output
+    assert "private@example.org" not in result.output
+    assert "RAW_SERVER_DATA" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("fatal_stage", "operation", "message"),
+    [
+        ("enter", "imap_connect", "could not establish IMAP connection"),
+        ("list", "imap_list_folders", "could not list IMAP folders"),
+    ],
+)
+def test_folders_fatal_imap_error_is_safe_and_exits_one(monkeypatch, fatal_stage, operation, message):
+    failure = ImapOperationError(
+        operation=operation,
+        message=message,
+        cause_type="RuntimeError",
+    )
+    failure.__cause__ = RuntimeError("password=secret private@example.org RAW_SERVER_DATA")
+    output = StringIO()
+    errors = StringIO()
+    _configure_folders(monkeypatch, (), output, errors, fatal=failure, fatal_stage=fatal_stage)
+    monkeypatch.setattr(cli, "load_imap_settings", lambda path: ImapSettings("imap.example.org", "me@example.org"))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
+
+    result = CliRunner().invoke(cli.app, ["folders"])
+
+    assert result.exit_code == 1
+    assert f"error [{operation}]" in errors.getvalue()
+    assert "password=secret" not in result.output
+    assert "private@example.org" not in result.output
+    assert "RAW_SERVER_DATA" not in result.output
+
+
+def test_folders_renders_server_names_as_plain_text(monkeypatch):
+    name = "[red]INBOX.Junk[/red]"
+    row = FolderInfo(name, ".", {b"\\JUNK"}, 1, 0)
+    output = StringIO()
+    errors = StringIO()
+    _configure_folders(monkeypatch, (row,), output, errors)
+    monkeypatch.setattr(cli, "load_imap_settings", lambda path: ImapSettings("imap.example.org", "me@example.org"))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
+
+    result = CliRunner().invoke(cli.app, ["folders", "--no-counts"])
+
+    assert result.exit_code == 0
+    assert name in output.getvalue()

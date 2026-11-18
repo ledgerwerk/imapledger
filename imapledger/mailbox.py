@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
@@ -76,6 +76,37 @@ class ImapOperationError(MailboxError):
         if details:
             lines.append(" ".join(details))
         return "\n".join(lines)
+
+
+@dataclass(frozen=True, slots=True)
+class FolderInfo:
+    name: str
+    delimiter: str | None
+    flags: frozenset[bytes]
+    total: int | None
+    unread: int | None
+    status_error: ImapOperationError | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "flags", _normalize_folder_flags(self.flags))
+        if (self.total is None) != (self.unread is None):
+            raise ValueError("total and unread counts must both be available or unavailable")
+        if self.total is not None and self.total < 0:
+            raise ValueError("total must be non-negative")
+        if self.unread is not None and self.unread < 0:
+            raise ValueError("unread must be non-negative")
+        if self.total is not None and self.unread is not None and self.unread > self.total:
+            raise ValueError("unread must not exceed total")
+
+    @property
+    def selectable(self) -> bool:
+        return b"\\NOSELECT" not in self.flags
+
+    @property
+    def read(self) -> int | None:
+        if self.total is None or self.unread is None:
+            return None
+        return self.total - self.unread
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +198,15 @@ class _Client(Protocol):
     def uid_expunge(self, messages: Any) -> Any: ...
 
 
+class _FolderClient(Protocol):
+    def login(self, username: str, password: str) -> Any: ...
+    def logout(self) -> Any: ...
+    def list_folders(self, directory: str = "", pattern: str = "*") -> Any: ...
+    def folder_status(self, folder: str, what: Any = None) -> Mapping[Any, Any]: ...
+
+
+FolderClientFactory = Callable[..., _FolderClient]
+
 ClientFactory = Callable[..., _Client]
 
 
@@ -212,6 +252,149 @@ class MailboxItem:
     uid: int
     message: MailMessage | None = None
     skip_reason: str | None = None
+
+
+class FolderCatalog:
+    """A read-only account-wide view of IMAP folder metadata."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        timeout: float = 30.0,
+        client_factory: FolderClientFactory | None = None,
+        event_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        self._host = host
+        self._port = port
+        self._username = username
+        self._password = password
+        self._timeout = timeout
+        self._client_factory = client_factory or _default_folder_client_factory
+        self._event_callback = event_callback
+        self._client: _FolderClient | None = None
+
+    def __enter__(self) -> FolderCatalog:
+        self._emit(f"connect host={self._host} port={self._port} tls=true")
+        try:
+            client = self._client_factory(
+                self._host,
+                port=self._port,
+                ssl=True,
+                timeout=self._timeout,
+                use_uid=True,
+            )
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_connect",
+                message="could not establish IMAP connection",
+                exc=exc,
+            ) from exc
+        self._emit("TLS connect: OK")
+
+        try:
+            try:
+                client.login(self._username, self._password)
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_login",
+                    message="IMAP login failed",
+                    exc=exc,
+                ) from exc
+            finally:
+                self._password = ""
+            self._client = client
+            self._emit("login ok")
+        except Exception:
+            try:
+                client.logout()
+            except Exception:
+                pass
+            raise
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        client = self._client
+        self._client = None
+        self._password = ""
+        if client is None:
+            return
+        try:
+            client.logout()
+        except Exception as logout_exc:
+            if exc is None:
+                raise _operation_error(
+                    operation="imap_logout",
+                    message="IMAP logout failed",
+                    exc=logout_exc,
+                ) from logout_exc
+        else:
+            self._emit("logout: OK")
+
+    def list_folders(self, include_counts: bool = True) -> tuple[FolderInfo, ...]:
+        client = self._require_client()
+        try:
+            folders = client.list_folders()
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_list_folders",
+                message="could not list IMAP folders",
+                exc=exc,
+            ) from exc
+
+        self._emit(f"LIST folders: {len(folders)}")
+        rows = []
+        for raw_flags, raw_delimiter, raw_name in folders:
+            flags = _normalize_folder_flags(raw_flags)
+            delimiter = _normalize_folder_delimiter(raw_delimiter)
+            name = raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
+            total = None
+            unread = None
+            status_error = None
+            if include_counts and b"\\NOSELECT" not in flags:
+                try:
+                    status = client.folder_status(name, ("MESSAGES", "UNSEEN"))
+                    total = _status_int(status, "MESSAGES")
+                    unread = _status_int(status, "UNSEEN")
+                    if unread > total:
+                        raise ValueError("UNSEEN exceeds MESSAGES")
+                except Exception as exc:
+                    total = None
+                    unread = None
+                    status_error = _operation_error(
+                        operation="imap_folder_status",
+                        message="could not read mailbox counts",
+                        exc=exc,
+                        folder=name,
+                    )
+                    self._emit(f"STATUS folder={name!r}: FAILED")
+                else:
+                    self._emit(f"STATUS folder={name!r}: OK messages={total} unseen={unread}")
+            elif include_counts:
+                self._emit(f"STATUS folder={name!r}: SKIPPED (\\Noselect)")
+            rows.append(
+                FolderInfo(
+                    name=name,
+                    delimiter=delimiter,
+                    flags=flags,
+                    total=total,
+                    unread=unread,
+                    status_error=status_error,
+                )
+            )
+        return tuple(sorted(rows, key=lambda row: (row.name.casefold(), row.name)))
+
+    def _emit(self, event: str) -> None:
+        if self._event_callback is not None:
+            self._event_callback(event)
+
+    def _require_client(self) -> _FolderClient:
+        if self._client is None:
+            raise MailboxError("folder catalog is not open")
+        return self._client
 
 
 class ScopedMailbox:
@@ -767,6 +950,12 @@ class ScopedMailbox:
         return self._client
 
 
+def _default_folder_client_factory(host: str, **kwargs: Any) -> _FolderClient:
+    from imapclient import IMAPClient
+
+    return IMAPClient(host, **kwargs)
+
+
 def _default_client_factory(host: str, **kwargs: Any) -> _Client:
     from imapclient import IMAPClient
 
@@ -776,6 +965,31 @@ def _default_client_factory(host: str, **kwargs: Any) -> _Client:
 def _iter_chunks(values: Sequence[int], size: int) -> Iterator[tuple[int, ...]]:
     for start in range(0, len(values), size):
         yield tuple(values[start : start + size])
+
+
+def _normalize_folder_flags(flags: object) -> frozenset[bytes]:
+    if flags is None:
+        return frozenset()
+    values = (flags,) if isinstance(flags, (bytes, str)) else flags
+    return frozenset(
+        value.upper() if isinstance(value, bytes) else str(value).upper().encode("utf-8") for value in values
+    )
+
+
+def _normalize_folder_delimiter(delimiter: object) -> str | None:
+    if delimiter is None or delimiter == "" or delimiter == b"":
+        return None
+    return delimiter.decode("utf-8") if isinstance(delimiter, bytes) else str(delimiter)
+
+
+def _status_int(status: Mapping[object, object], key: str) -> int:
+    for candidate in (key, key.encode("ascii")):
+        if candidate in status:
+            value = int(status[candidate])
+            if value < 0:
+                raise ValueError(f"{key} must be non-negative")
+            return value
+    raise ValueError(f"{key} is missing")
 
 
 def _normalize_capabilities(values: Any) -> set[bytes]:

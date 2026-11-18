@@ -70,6 +70,30 @@ With the new plural `folders` schema, action outcomes omitted from the configura
 
 Changing actions does not change spam-policy thresholds. The policy remains fail-closed, and a less destructive action does not make classification more aggressive.
 
+## Discover server folder names
+
+Mailbox names are server-specific. Discover the exact names before writing `spam.folders` or move destinations, using either direct connection options:
+
+```bash
+imapledger folders --host imap.example.org --username me@example.org
+```
+
+or an existing configuration:
+
+```bash
+imapledger folders --config /path/to/config.toml
+```
+
+The config mode needs only a valid `[imap]` table. `folders` does not validate or use `spam.folders`, so the spam section may be absent or incomplete. The command prompts for the IMAP password and connects over TLS. It is read-only: one IMAP `LIST` discovers mailbox metadata, and optional `STATUS (MESSAGES UNSEEN)` requests provide aggregate counts without selecting mailboxes or fetching message contents. `--no-counts` skips STATUS requests entirely.
+
+| Folder | Exact IMAP name |     Total |     Read |     Unread | Role        |
+| ------ | --------------- | --------: | -------: | ---------: | ----------- |
+| INBOX  | INBOX           | `<total>` | `<read>` | `<unread>` | Inbox       |
+| Junk   | INBOX.Junk      | `<total>` | `<read>` | `<unread>` | Junk        |
+| Shared | Shared          |         - |        - |          - | `\Noselect` |
+
+The exact IMAP name column is the value to copy into configuration. Read is calculated as total minus unread. STATUS avoids an imapledger client-side scan through messages, but the server may perform internal work to calculate these counts. Use `--no-counts` when you only need names and flags.
+
 ## Create and inspect configuration
 
 `init` writes the new plural-folder schema and explicit action tables. Source options can be repeated:

@@ -15,6 +15,7 @@ from imapledger.config import (
     Settings,
     SpamActions,
     SpamSettings,
+    load_imap_settings,
     load_settings,
     render_settings,
     write_settings,
@@ -192,3 +193,55 @@ def test_legacy_scalar_threshold_is_warned_about_and_ignored(tmp_path: Path) -> 
     assert any("threshold is deprecated and ignored" in str(warning.message) for warning in caught)
     assert any("spam.folder is deprecated" in str(warning.message) for warning in caught)
     assert settings.spam.policy == SpamPolicy()
+
+
+def test_load_imap_settings_accepts_imap_only_config(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\nport = 1993\n',
+        encoding="utf-8",
+    )
+
+    assert load_imap_settings(path) == ImapSettings(host="imap.example.org", username="me@example.org", port=1993)
+
+
+def test_load_imap_settings_ignores_invalid_spam_section(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n[spam]\nfolders = 42\n',
+        encoding="utf-8",
+    )
+
+    assert load_imap_settings(path) == ImapSettings(host="imap.example.org", username="me@example.org")
+
+
+def test_load_imap_settings_requires_imap_table(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[spam]\nfolders = ["Spam"]\n', encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="requires an \\[imap\\] table"):
+        load_imap_settings(path)
+
+
+@pytest.mark.parametrize(
+    ("imap_table", "message"),
+    [
+        ('host = ""\nusername = "me@example.org"', "host must not be empty"),
+        ('host = "imap.example.org"\nusername = ""', "username must not be empty"),
+        ('host = "imap.example.org"\nusername = "me@example.org"\nport = 0', "port must be between"),
+    ],
+)
+def test_load_imap_settings_validates_imap_values(tmp_path: Path, imap_table: str, message: str) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(f"[imap]\n{imap_table}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=message):
+        load_imap_settings(path)
+
+
+def test_load_settings_still_requires_spam_table(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n', encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="requires a \\[spam\\] table"):
+        load_settings(path)
