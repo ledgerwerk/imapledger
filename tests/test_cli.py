@@ -9,7 +9,13 @@ from typer.testing import CliRunner
 from imapledger import cli
 from imapledger.cleaner import CleanReport, MessageResult
 from imapledger.config import ImapSettings, Settings, SpamSettings
-from imapledger.mailbox import ImapOperationError, PartialDeleteError, ScopedMailbox
+from imapledger.mailbox import (
+    ImapOperationError,
+    MessageSelection,
+    MessageSort,
+    PartialDeleteError,
+    ScopedMailbox,
+)
 
 
 class FailingMailbox:
@@ -57,6 +63,195 @@ def test_clean_help_exposes_verbose_and_debug_options():
     assert result.exit_code == 0
     assert "--verbose" in result.output
     assert "--debug" in result.output
+    assert "--limit" in result.output
+    assert "--offset" in result.output
+    assert "--sort" in result.output
+    assert "--progress" in result.output
+    assert "--no-progress" in result.output
+
+
+class CleanFakeMailbox:
+    folder = "Spam"
+    uids = frozenset({10, 20, 30, 40})
+
+    def __init__(self):
+        self.selection = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def snapshot(self):
+        return self
+
+    def selected_count(self, selection):
+        self.selection = selection
+        ordered = sorted(self.uids, reverse=selection.sort is MessageSort.NEWEST)
+        selected = ordered[selection.offset :]
+        if selection.limit is not None:
+            selected = selected[: selection.limit]
+        return len(selected)
+
+
+class CleanFakeClassifier:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+
+def _configure_clean(monkeypatch, report, output):
+    settings = Settings(
+        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
+        spam=SpamSettings(folder="Spam"),
+    )
+    mailbox = CleanFakeMailbox()
+    observed = {}
+    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
+    monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
+    monkeypatch.setattr(cli, "ScopedMailbox", lambda **kwargs: mailbox)
+    monkeypatch.setattr(cli, "PyJevSpamClassifier", CleanFakeClassifier)
+
+    class FakeCleaner:
+        def __init__(self, mailbox, classifier, *, threshold):
+            pass
+
+        def run(self, *, apply, selection, on_result):
+            observed["apply"] = apply
+            observed["selection"] = selection
+            observed["on_result"] = on_result
+            if on_result is not None:
+                for position, row in enumerate(report.results, start=1):
+                    on_result(row, position, len(report.results))
+            return report
+
+    monkeypatch.setattr(cli, "SpamCleaner", FakeCleaner)
+    return mailbox, observed
+
+
+def _stream_report(*, apply=False):
+    return CleanReport(
+        folder="Spam",
+        threshold=0.95,
+        apply=apply,
+        results=[
+            MessageResult(
+                uid=40,
+                subject="spam-subject",
+                sender="spam@example.org",
+                probability=0.992,
+                status="spam",
+                inclination="DELETE-APPROVED",
+                deleted=apply,
+            ),
+            MessageResult(
+                uid=30,
+                subject="keep-subject",
+                sender="keep@example.org",
+                probability=0.021,
+                status="keep",
+                inclination="KEEP",
+            ),
+            MessageResult(
+                uid=20,
+                subject="",
+                sender="",
+                probability=None,
+                status="skip",
+                inclination="SKIP",
+                detail="message too large",
+            ),
+            MessageResult(
+                uid=10,
+                subject="error-subject",
+                sender="error@example.org",
+                probability=None,
+                status="error",
+                inclination="ERROR / KEEP",
+                detail="RuntimeError: classifier evaluation failed",
+            ),
+        ],
+    )
+
+
+def test_clean_forwards_selection_arguments(monkeypatch):
+    output = StringIO()
+    report = CleanReport(folder="Spam", threshold=0.95, apply=False, results=[])
+    mailbox, observed = _configure_clean(monkeypatch, report, output)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["clean", "--limit", "10", "--offset", "10", "--sort", "newest"],
+    )
+
+    expected = MessageSelection(limit=10, offset=10, sort=MessageSort.NEWEST)
+    assert result.exit_code == 0
+    assert observed["selection"] == expected
+    assert observed["selection"] is mailbox.selection
+    assert "messages=4 selected=0 sort=newest offset=10 limit=10" in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [["clean", "--limit", "0"], ["clean", "--offset", "-1"], ["clean", "--sort", "invalid"]],
+)
+def test_clean_rejects_invalid_selection_options(arguments):
+    result = CliRunner().invoke(cli.app, arguments)
+
+    assert result.exit_code != 0
+
+
+def test_clean_streams_decisions_once_with_summary(monkeypatch):
+    output = StringIO()
+    report = _stream_report()
+    _configure_clean(monkeypatch, report, output)
+
+    result = CliRunner().invoke(cli.app, ["clean"])
+
+    rendered = output.getvalue()
+    assert result.exit_code == 0
+    assert "folder=Spam messages=4 selected=4 sort=newest offset=0 limit=all" in rendered
+    assert "[1/4] UID 40  WOULD DELETE  P(spam)=0.992" in rendered
+    assert "Inclination=DELETE-APPROVED" in rendered
+    assert "[2/4] UID 30  KEEP  P(spam)=0.021" in rendered
+    assert "[3/4] UID 20  SKIP / KEEP  P(spam)=-" in rendered
+    assert "[4/4] UID 10  ERROR / KEEP  P(spam)=-" in rendered
+    assert rendered.count("spam-subject") == 1
+    assert "Scanned 4; spam 1; kept 1; skipped 1; errors 1; deleted 0." in rendered
+    assert "Dry-run only." in rendered
+
+
+def test_no_progress_suppresses_stream_and_renders_final_report(monkeypatch):
+    output = StringIO()
+    report = _stream_report()
+    _configure_clean(monkeypatch, report, output)
+
+    result = CliRunner().invoke(cli.app, ["clean", "--no-progress"])
+
+    rendered = output.getvalue()
+    assert result.exit_code == 0
+    assert "[1/4]" not in rendered
+    assert "spam-subject" in rendered
+    assert "WOULD DELETE" in rendered
+    assert rendered.count("spam-subject") == 1
+
+
+def test_apply_progress_uses_approval_wording_not_deletion_claim(monkeypatch):
+    output = StringIO()
+    report = _stream_report(apply=True)
+    _configure_clean(monkeypatch, report, output)
+
+    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
+
+    rendered = output.getvalue()
+    assert result.exit_code == 0
+    assert "[1/4] UID 40  DELETE-APPROVED" in rendered
+    assert "[1/4] UID 40  DELETED" not in rendered
+    assert "Deletion: 1 approved; 1 confirmed deleted." in rendered
 
 
 class DoctorFakeClient:
@@ -341,17 +536,29 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
     )
 
     class Context:
+        folder = "Spam"
+        uids = frozenset({1, 2})
+
         def __enter__(self):
             return self
 
         def __exit__(self, *args):
             return None
 
+        def snapshot(self):
+            return self
+
+        def selected_count(self, selection):
+            return len(self.uids)
+
     class FakeCleaner:
         def __init__(self, mailbox, classifier, *, threshold):
             pass
 
-        def run(self, *, apply):
+        def run(self, *, apply, selection, on_result):
+            if on_result is not None:
+                for position, row in enumerate(report.results, start=1):
+                    on_result(row, position, len(report.results))
             return report
 
     output = StringIO()

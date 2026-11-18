@@ -3,6 +3,8 @@ import pytest
 from imapledger.mailbox import (
     DeleteResult,
     ImapOperationError,
+    MessageSelection,
+    MessageSort,
     PartialDeleteError,
     ScopedMailbox,
     UnsafeMailboxOperation,
@@ -190,17 +192,76 @@ def test_size_fetch_is_chunked_for_large_snapshot():
     assert len(size_fetches) == 100
     assert max(map(len, size_fetches)) == 100
     assert all(len(messages) <= 100 for messages in size_fetches)
-    assert [item.uid for item in items] == uids
+    assert [item.uid for item in items] == list(reversed(uids))
     assert all(item.message is None for item in items)
     assert len(client.fetches) == 100
 
+
+
+def test_newest_limit_fetches_only_selected_uids():
+    client = FakeClient(uids=[1, 2, 3, 4, 5])
+    selection = MessageSelection(limit=2)
+    with make_mailbox(client, writable=False) as mailbox:
+        items = list(mailbox.iter_messages(selection))
+
+    assert [item.uid for item in items] == [5, 4]
+    assert [messages for messages, selector in client.fetches if selector == ("RFC822.SIZE",)] == [(5, 4)]
+    assert [messages for messages, selector in client.fetches if selector == ("BODY.PEEK[]",)] == [(5,), (4,)]
+
+
+@pytest.mark.parametrize(
+    ("sort", "expected"),
+    [
+        (MessageSort.NEWEST, [40, 30]),
+        (MessageSort.OLDEST, [20, 30]),
+    ],
+)
+def test_offset_is_applied_after_sort(sort, expected):
+    client = FakeClient(uids=[10, 20, 30, 40, 50])
+    selection = MessageSelection(limit=2, offset=1, sort=sort)
+    with make_mailbox(client, writable=False) as mailbox:
+        items = list(mailbox.iter_messages(selection))
+
+    assert [item.uid for item in items] == expected
+
+
+def test_offset_beyond_mailbox_returns_empty_without_fetches():
+    client = FakeClient(uids=[1, 2, 3])
+    selection = MessageSelection(offset=4)
+    with make_mailbox(client, writable=False) as mailbox:
+        assert mailbox.selected_count(selection) == 0
+        assert list(mailbox.iter_messages(selection)) == []
+
+    assert client.fetches == []
+
+
+@pytest.mark.parametrize("kwargs", [{"limit": 0}, {"limit": -1}, {"offset": -1}])
+def test_selection_rejects_invalid_limit_and_offset(kwargs):
+    with pytest.raises(ValueError):
+        MessageSelection(**kwargs)
+
+
+def test_selected_size_fetches_remain_chunked_and_exclude_other_uids():
+    uids = list(range(1, 10_001))
+    client = FakeClient(size=2, uids=uids)
+    selection = MessageSelection(limit=150, offset=25)
+    with make_mailbox(client, writable=False, max_message_bytes=1, fetch_batch_size=100) as mailbox:
+        items = list(mailbox.iter_messages(selection))
+
+    size_fetches = [messages for messages, selector in client.fetches if selector == ("RFC822.SIZE",)]
+    expected = tuple(range(9_975, 9_825, -1))
+    assert tuple(uid for batch in size_fetches for uid in batch) == expected
+    assert len(size_fetches) == 2
+    assert max(map(len, size_fetches)) == 100
+    assert [item.uid for item in items] == list(expected)
+    assert all(selector == ("RFC822.SIZE",) for _, selector in client.fetches)
 
 def test_size_fetch_error_reports_phase_batch_and_uid_range_without_payload():
     client = FakeClient(size=1, uids=[9, 1, 4])
     client.fail_on = "fetch_size"
     with make_mailbox(client, writable=False, fetch_batch_size=2) as mailbox:
         with pytest.raises(ImapOperationError) as raised:
-            next(mailbox.iter_messages())
+            next(mailbox.iter_messages(MessageSelection(sort=MessageSort.OLDEST)))
 
     rendered = str(raised.value)
     assert "error [imap_fetch_size]" in rendered
@@ -218,7 +279,7 @@ def test_body_fetch_remains_single_uid_and_errors_identify_uid():
     client.fail_on = "fetch_body"
     with make_mailbox(client, writable=False) as mailbox:
         with pytest.raises(ImapOperationError) as raised:
-            next(mailbox.iter_messages())
+            next(mailbox.iter_messages(MessageSelection(sort=MessageSort.OLDEST)))
 
     rendered = str(raised.value)
     assert "error [imap_fetch_body]" in rendered
@@ -278,6 +339,23 @@ def test_delete_is_chunked_and_returns_confirmed_uids():
     assert [item[0] for item in client.added] == [(1, 2), (3, 4), (5,)]
     assert client.expunged == [(1, 2), (3, 4), (5,)]
 
+
+
+def test_delete_uids_are_sorted_and_diagnostics_use_true_ranges():
+    events = []
+    client = FakeClient(uids=[1, 2, 3, 4, 5])
+    with make_mailbox(
+        client,
+        writable=True,
+        delete_batch_size=2,
+        event_callback=events.append,
+    ) as mailbox:
+        mailbox.delete_uids([5, 4, 3, 4])
+
+    assert [item[0] for item in client.added] == [(3, 4), (5,)]
+    assert client.expunged == [(3, 4), (5,)]
+    assert "delete batch=1/2 uid_count=2 uid_min=3 uid_max=4" in events
+    assert "delete batch=2/2 uid_count=1 uid_min=5 uid_max=5" in events
 
 def test_partial_delete_reports_only_completed_chunks_and_rolls_back_failing_batch():
     class FailSecondExpunge(FakeClient):

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from .classifier import SpamClassifier
-from .mailbox import DeleteResult, MailboxItem, PartialDeleteError
+from .mailbox import DeleteResult, MailboxItem, MessageSelection, PartialDeleteError
 
 Status = Literal["spam", "keep", "skip", "error"]
 Inclination = Literal["DELETE-APPROVED", "KEEP", "SKIP", "ERROR / KEEP"]
@@ -18,8 +18,9 @@ class Mailbox(Protocol):
     @property
     def writable(self) -> bool: ...
 
-    def iter_messages(self) -> Iterator[MailboxItem]: ...
+    def selected_count(self, selection: MessageSelection) -> int: ...
 
+    def iter_messages(self, selection: MessageSelection) -> Iterator[MailboxItem]: ...
     def delete_uids(self, uids: Sequence[int]) -> DeleteResult: ...
 
 
@@ -35,6 +36,9 @@ class MessageResult:
     deleted: bool = False
     model: str | None = None
     request_id: str | None = None
+
+
+ResultCallback = Callable[[MessageResult, int, int], None]
 
 
 @dataclass(slots=True)
@@ -78,15 +82,28 @@ class SpamCleaner:
         self._classifier = classifier
         self._threshold = threshold
 
-    def run(self, *, apply: bool) -> CleanReport:
+    def run(
+        self,
+        *,
+        apply: bool,
+        selection: MessageSelection | None = None,
+        on_result: ResultCallback | None = None,
+    ) -> CleanReport:
         if apply and not self._mailbox.writable:
             raise ValueError("apply=True requires a writable scoped mailbox")
+        selection = selection or MessageSelection()
+        total = self._mailbox.selected_count(selection)
         rows: list[MessageResult] = []
         approved: list[int] = []
 
-        for item in self._mailbox.iter_messages():
+        def record(row: MessageResult) -> None:
+            rows.append(row)
+            if on_result is not None:
+                on_result(row, len(rows), total)
+
+        for item in self._mailbox.iter_messages(selection):
             if item.message is None:
-                rows.append(
+                record(
                     MessageResult(
                         uid=item.uid,
                         subject="",
@@ -103,7 +120,7 @@ class SpamCleaner:
             try:
                 assessment = self._classifier.assess(message)
             except Exception as exc:  # fail closed: classifier failures never authorize deletion
-                rows.append(
+                record(
                     MessageResult(
                         uid=message.uid,
                         subject=message.subject,
@@ -119,7 +136,7 @@ class SpamCleaner:
             is_spam = assessment.probability >= self._threshold
             if is_spam:
                 approved.append(message.uid)
-            rows.append(
+            record(
                 MessageResult(
                     uid=message.uid,
                     subject=message.subject,

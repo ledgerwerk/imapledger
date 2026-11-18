@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .classifier import PyJevSpamClassifier
-from .cleaner import CleanReport, SpamCleaner
+from .cleaner import CleanReport, MessageResult, SpamCleaner
 from .config import (
     ConfigError,
     ImapSettings,
@@ -19,7 +19,7 @@ from .config import (
     load_settings,
     write_settings,
 )
-from .mailbox import ImapOperationError, MailboxError, ScopedMailbox
+from .mailbox import ImapOperationError, MailboxError, MessageSelection, MessageSort, ScopedMailbox
 
 app = typer.Typer(no_args_is_help=True, help="Security-scoped IMAP automation.")
 console = Console()
@@ -116,11 +116,33 @@ def clean(
         "--apply",
         help="Permanently delete messages classified as spam. Without this flag, run read-only.",
     ),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        min=1,
+        help="Classify at most this many messages after sorting and applying --offset.",
+    ),
+    offset: int = typer.Option(
+        0,
+        "--offset",
+        min=0,
+        help="Skip this many messages after sorting.",
+    ),
+    sort: MessageSort = typer.Option(  # noqa: B008
+        MessageSort.NEWEST,
+        "--sort",
+        help="Order by IMAP UID arrival order, not the message Date header.",
+    ),
+    progress: bool = typer.Option(  # noqa: B008
+        True,
+        "--progress/--no-progress",
+        help="Stream each classification decision as it completes.",
+    ),
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
     debug: bool = typer.Option(False, "--debug", help="Print a traceback without exception payloads"),
 ) -> None:
-    """Classify every message in the configured folder and optionally delete spam."""
+    """Classify a selected window in the configured folder and optionally delete approved spam."""
     try:
         settings = load_settings(config)
     except ConfigError as exc:
@@ -134,6 +156,7 @@ def clean(
         err_console.print("[red]Empty password; aborting.[/red]")
         raise typer.Exit(2)
 
+    selection = MessageSelection(limit=limit, offset=offset, sort=sort)
     try:
         with ScopedMailbox(
             host=settings.imap.host,
@@ -146,18 +169,110 @@ def clean(
             max_body_chars=settings.spam.max_body_chars,
             event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
         ) as mailbox:
+            total_messages = len(mailbox.snapshot().uids)
+            selected_count = mailbox.selected_count(selection)
+            console.print(
+                _selection_summary(
+                    folder=mailbox.folder,
+                    total_messages=total_messages,
+                    selected_count=selected_count,
+                    selection=selection,
+                ),
+                markup=False,
+            )
             with PyJevSpamClassifier() as classifier:
-                report = SpamCleaner(mailbox, classifier, threshold=settings.spam.threshold).run(apply=apply)
+                report = SpamCleaner(mailbox, classifier, threshold=settings.spam.threshold).run(
+                    apply=apply,
+                    selection=selection,
+                    on_result=(
+                        lambda row, position, total: _print_result(
+                            row,
+                            position=position,
+                            total=total,
+                            apply=apply,
+                        )
+                    )
+                    if progress
+                    else None,
+                )
     except Exception as exc:
         _print_failure(exc, debug=debug)
         raise typer.Exit(1) from exc
     finally:
         password = ""
 
-    _print_report(report)
+    if progress:
+        _print_summary(report)
+        if report.partial_delete_error is not None:
+            _print_partial_delete_details(report)
+    else:
+        _print_report(report)
     if report.partial_delete_error is not None:
         _print_failure(report.partial_delete_error, debug=debug)
         raise typer.Exit(1)
+
+
+def _selection_summary(
+    *,
+    folder: str,
+    total_messages: int,
+    selected_count: int,
+    selection: MessageSelection,
+) -> str:
+    limit = "all" if selection.limit is None else str(selection.limit)
+    return (
+        f"folder={folder} messages={total_messages} selected={selected_count} "
+        f"sort={selection.sort.value} offset={selection.offset} limit={limit}"
+    )
+
+
+def _print_result(
+    row: MessageResult,
+    *,
+    position: int,
+    total: int,
+    apply: bool,
+) -> None:
+    probability = "-" if row.probability is None else f"{row.probability:.3f}"
+    if row.status == "error":
+        action = "ERROR / KEEP"
+    elif row.status == "skip":
+        action = "SKIP / KEEP"
+    elif row.status == "spam":
+        action = "DELETE-APPROVED" if apply else "WOULD DELETE"
+    else:
+        action = "KEEP"
+    detail = f"  Detail={row.detail}" if row.detail else ""
+    console.print(
+        f"[{position}/{total}] UID {row.uid}  {action}  P(spam)={probability}  "
+        f"Inclination={row.inclination}  From={row.sender}  Subject={row.subject}{detail}",
+        markup=False,
+    )
+
+
+def _print_summary(report: CleanReport) -> None:
+    console.print(
+        f"Scanned {report.scanned}; spam {report.spam}; kept {report.kept}; "
+        f"skipped {report.skipped}; errors {report.errors}; deleted {report.deleted}."
+    )
+    if report.apply:
+        console.print(f"Deletion: {report.spam} approved; {report.deleted} confirmed deleted.")
+    elif report.spam:
+        console.print("Dry-run only. Re-run with --apply to permanently delete approved spam UIDs.")
+    if report.partial_delete_error is not None:
+        console.print(
+            f"Partial deletion: {len(report.partial_delete_error.deleted)} confirmed; "
+            f"{len(report.partial_delete_error.pending)} pending."
+        )
+
+
+def _print_partial_delete_details(report: CleanReport) -> None:
+    console.print("Deletion details:")
+    for row in report.results:
+        if row.status == "spam":
+            action = "DELETED" if row.deleted else "NOT CONFIRMED"
+            detail = f"  {row.detail}" if row.detail else ""
+            console.print(f"UID {row.uid}  {action}{detail}", markup=False)
 
 
 def _print_failure(exc: Exception, *, debug: bool) -> None:
@@ -198,6 +313,8 @@ def _print_report(report: CleanReport) -> None:
             action = "DELETED"
         elif row.status == "spam" and report.partial_delete_error is not None:
             action = "NOT CONFIRMED"
+        elif row.status == "spam" and report.apply:
+            action = "DELETE-APPROVED"
         elif row.status == "spam":
             action = "WOULD DELETE"
         else:

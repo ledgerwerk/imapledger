@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Protocol
 
 from .message import MailMessage, parse_message
@@ -135,6 +136,26 @@ ClientFactory = Callable[..., _Client]
 class MailboxSnapshot:
     uidvalidity: int
     uids: frozenset[int]
+
+class MessageSort(str, Enum):
+    NEWEST = "newest"
+    OLDEST = "oldest"
+
+
+@dataclass(frozen=True, slots=True)
+class MessageSelection:
+    limit: int | None = None
+    offset: int = 0
+    sort: MessageSort = MessageSort.NEWEST
+
+    def __post_init__(self) -> None:
+        if self.limit is not None and self.limit < 1:
+            raise ValueError("limit must be positive")
+        if self.offset < 0:
+            raise ValueError("offset must be non-negative")
+        if not isinstance(self.sort, MessageSort):
+            raise ValueError("sort must be a MessageSort")
+
 
 
 
@@ -391,18 +412,36 @@ class ScopedMailbox:
             body_skip_reason=body_skip_reason,
         )
 
-    def iter_messages(self) -> Iterator[MailboxItem]:
+    def selected_count(self, selection: MessageSelection) -> int:
+        return len(self._selected_uids(selection))
+
+    def _selected_uids(self, selection: MessageSelection) -> tuple[int, ...]:
+        ordered_uids = sorted(
+            self.snapshot().uids,
+            reverse=selection.sort is MessageSort.NEWEST,
+        )
+        selected_uids = ordered_uids[selection.offset :]
+        if selection.limit is not None:
+            selected_uids = selected_uids[: selection.limit]
+        return tuple(selected_uids)
+
+    def iter_messages(
+        self,
+        selection: MessageSelection | None = None,
+    ) -> Iterator[MailboxItem]:
         client = self._require_client()
-        snapshot = self.snapshot()
-        if not snapshot.uids:
+        selected_uids = self._selected_uids(selection or MessageSelection())
+        if not selected_uids:
             return
 
-        ordered_uids = sorted(snapshot.uids)
-        batch_count = (len(ordered_uids) + self._fetch_batch_size - 1) // self._fetch_batch_size
-        for batch_number, uid_batch in enumerate(_iter_chunks(ordered_uids, self._fetch_batch_size), start=1):
+        batch_count = (len(selected_uids) + self._fetch_batch_size - 1) // self._fetch_batch_size
+        for batch_number, uid_batch in enumerate(
+            _iter_chunks(selected_uids, self._fetch_batch_size),
+            start=1,
+        ):
             self._emit(
                 f"size-fetch batch={batch_number}/{batch_count} uid_count={len(uid_batch)} "
-                f"uid_min={uid_batch[0]} uid_max={uid_batch[-1]}"
+                f"uid_min={min(uid_batch)} uid_max={max(uid_batch)}"
             )
             try:
                 sizes = client.fetch(uid_batch, ["RFC822.SIZE"])
@@ -460,7 +499,7 @@ class ScopedMailbox:
             raise UnsafeMailboxOperation("mailbox is read-only")
         client = self._require_client()
         snapshot = self.snapshot()
-        requested = tuple(dict.fromkeys(int(uid) for uid in uids))
+        requested = tuple(sorted({int(uid) for uid in uids}))
         if not requested:
             return DeleteResult(deleted=())
         outside = set(requested) - snapshot.uids
@@ -514,7 +553,7 @@ class ScopedMailbox:
         for batch_number, uid_batch in enumerate(_iter_chunks(requested, self._delete_batch_size), start=1):
             self._emit(
                 f"delete batch={batch_number}/{batch_count} uid_count={len(uid_batch)} "
-                f"uid_min={uid_batch[0]} uid_max={uid_batch[-1]}"
+                f"uid_min={min(uid_batch)} uid_max={max(uid_batch)}"
             )
             try:
                 self._delete_batch(client, uid_batch)

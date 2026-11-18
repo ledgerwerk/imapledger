@@ -1,6 +1,6 @@
 # imapledger
 
-A deliberately small, security-scoped IMAP automation tool. The MVP scans exactly one configured mailbox, asks `pyjev` whether each message is clearly spam, and can permanently delete only the exact UIDs that pass an application-owned threshold.
+A deliberately small, security-scoped IMAP automation tool. The MVP scans exactly one configured mailbox, asks `pyjev` whether each selected message is clearly spam, and can permanently delete only the exact UIDs that pass an application-owned threshold.
 
 The semantic model never receives an IMAP client and cannot select folders or issue IMAP commands.
 
@@ -69,20 +69,36 @@ There is deliberately no password setting.
 ## Dry run
 
 ```bash
-imapledger clean
-IMAP password:
+# Inspect the newest 10 messages (newest is the default sort)
+imapledger clean --limit 10
+
+# Inspect positions 11-20 among the newest messages
+imapledger clean --limit 10 --offset 10 --sort newest
+
+# Inspect the 25 oldest messages
+imapledger clean --limit 25 --sort oldest
+# Render the detailed report instead of streaming rows
+imapledger clean --limit 10 --no-progress
 ```
 
-Every invocation prompts for the IMAP password. The default run is read-only and reports `WOULD DELETE` rather than changing mail.
+Every invocation prompts for the IMAP password. The default run is read-only and reports `WOULD DELETE` rather than changing mail. With no `--limit`, the selected window extends from `--offset` to the end of the initial mailbox snapshot.
 
+`--sort newest` orders by descending IMAP UID, and `--sort oldest` orders by ascending IMAP UID. This is mailbox arrival order, not the message `Date:` header. `--offset` skips messages after sorting. The window is chosen from one stable initial UID snapshot, and only its selected UIDs are fetched for size metadata and eligible message bodies.
+
+Progress is enabled by default. It streams one decision with its position and selected total as each message is classified. Use `--no-progress` to suppress per-message rows and render the detailed report at the end. `--verbose` is separate and adds safe IMAP protocol-operation diagnostics; it does not control classification progress.
 ## Delete approved spam
 
 ```bash
 imapledger clean --apply
+# Apply deletion only within the newest 10-message window
+imapledger clean --apply --limit 10 --sort newest
 IMAP password:
 ```
 
 `--apply` refuses to run if the IMAP server does not advertise `UIDPLUS`. After classification, `imapledger` rechecks the mailbox `UIDVALIDITY`, verifies every approved UID still belongs to the same scoped mailbox, marks only those UIDs `\\Deleted`, and performs `UID EXPUNGE` only for those UIDs.
+
+
+With progress enabled, apply-mode spam rows say `DELETE-APPROVED` while classification is pending. `DELETED` is reported only after the exact UID expunge succeeds. The summary distinguishes approved UIDs from confirmed deletions; partial deletion shows confirmed and pending UIDs and exits with a failure status.
 
 ## Partial deletion results
 
@@ -98,9 +114,9 @@ imapledger doctor --verbose
 
 `doctor` checks TLS, login, capabilities, the configured folder in read-only mode, UID search, one size fetch, and an eligible single-message `BODY.PEEK[]` probe. It does not run the classifier or change mail. Probe body bytes are discarded and never printed.
 
-For a failing clean run, use `imapledger clean --verbose` to see safe operation progress, including size-fetch batch metadata. Add `--debug` for local traceback frames and exception class names. Neither option enables raw IMAP wire logging.
+For a failing clean run, use `imapledger clean --verbose` to see safe IMAP operation progress, including size-fetch batch metadata. Classification decisions stream by default; use `--no-progress` to disable those rows and `--debug` for local traceback frames and exception class names. Neither option enables raw IMAP wire logging.
 
-Errors identify the failed operation and include safe context such as the configured folder, selector, UID range, and batch. When the IMAP client exposes a recognized command rejection, diagnostics retain only its status token (`BAD`, `NO`, or `BYE`), not the raw server response. They do not print passwords, authentication payloads, exception messages, or message bytes. Verbose reports and message tables can still reveal folder names, account identifiers, UIDs, senders, and subjects; redact those details before sharing output.
+Errors identify the failed operation and include safe context such as the configured folder, selector, UID range, and batch. When the IMAP client exposes a recognized command rejection, diagnostics retain only its status token (`BAD`, `NO`, or `BYE`), not the raw server response. They do not print passwords, authentication payloads, exception messages, or message bytes. Verbose output, streamed progress rows, and message tables can still reveal folder names, account identifiers, UIDs, senders, and subjects; redact those details before sharing output.
 
 For `FETCH` failures, note whether the operation is `imap_fetch_size` or `imap_fetch_body`. A size-fetch error includes its bounded batch number and UID range; a body-fetch error identifies one UID. `doctor --verbose` can determine whether the read path and one-message probes work independently of classification. If a destructive run reports pending UIDs, check the mailbox directly before retrying because their outcome was not confirmed.
 
