@@ -26,7 +26,6 @@ attachment text\r
     assert "attachment text" not in msg.body
 
 
-
 def test_html_only_message_has_visible_text_body() -> None:
     raw = b"""From: sender@example.org\r
 Subject: HTML\r
@@ -97,7 +96,6 @@ def test_html_body_remains_bounded() -> None:
     assert message.body == "12345678"
 
 
-
 def test_message_retains_normalized_header_facts_and_repeated_authentication_results() -> None:
     raw = b"""From: Trezor <noreply@performology.com>\r
 Reply-To: Support <help@reply.example>\r
@@ -160,7 +158,6 @@ def test_malformed_and_idn_headers_are_parsed_without_losing_unicode_name() -> N
     assert message.from_address == "support@bücher.example"
     assert message.reply_to == ""
     assert message.body == "hello"
-
 
 
 def test_legacy_message_state_does_not_expose_uid() -> None:

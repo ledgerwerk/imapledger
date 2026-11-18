@@ -51,8 +51,7 @@ def _decision():
 def _result(values=None):
     values = values or {}
     answers = {
-        name: NoulResult(value=values.get(name, 0.8), model="child-model", usage={}, raw={})
-        for name in SIGNAL_NAMES
+        name: NoulResult(value=values.get(name, 0.8), model="child-model", usage={}, raw={}) for name in SIGNAL_NAMES
     }
     return BundleResult(answers=answers, model="bundle-model", usage={}, raw={}, request_id="request-test")
 

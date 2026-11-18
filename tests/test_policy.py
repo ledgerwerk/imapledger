@@ -26,7 +26,7 @@ def _evidence(
     display_name: str = "sender",
     subject: str = "subject",
     spam_flag: str = "",
-) :
+):
     message = MailMessage(
         uid=1,
         subject=subject,

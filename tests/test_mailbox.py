@@ -197,7 +197,6 @@ def test_size_fetch_is_chunked_for_large_snapshot():
     assert len(client.fetches) == 100
 
 
-
 def test_newest_limit_fetches_only_selected_uids():
     client = FakeClient(uids=[1, 2, 3, 4, 5])
     selection = MessageSelection(limit=2)
@@ -256,6 +255,7 @@ def test_selected_size_fetches_remain_chunked_and_exclude_other_uids():
     assert [item.uid for item in items] == list(expected)
     assert all(selector == ("RFC822.SIZE",) for _, selector in client.fetches)
 
+
 def test_size_fetch_error_reports_phase_batch_and_uid_range_without_payload():
     client = FakeClient(size=1, uids=[9, 1, 4])
     client.fail_on = "fetch_size"
@@ -308,7 +308,6 @@ def test_verbose_mailbox_events_contain_only_safe_metadata():
     assert all("password" not in event and RAW.decode() not in event for event in events)
 
 
-
 def test_delete_error_reports_expunge_and_rollback_failures_without_payload():
     client = FakeClient()
     client.fail_on = {"uid_expunge", "remove_flags"}
@@ -322,11 +321,8 @@ def test_delete_error_reports_expunge_and_rollback_failures_without_payload():
     assert "password=secret" not in rendered
     assert RAW.decode() not in rendered
 
-
-
     assert client.added == [((10,), ("\\Deleted",), True)]
     assert client.expunged == []
-
 
 
 def test_delete_is_chunked_and_returns_confirmed_uids():
@@ -338,7 +334,6 @@ def test_delete_is_chunked_and_returns_confirmed_uids():
     assert result.deleted == (1, 2, 3, 4, 5)
     assert [item[0] for item in client.added] == [(1, 2), (3, 4), (5,)]
     assert client.expunged == [(1, 2), (3, 4), (5,)]
-
 
 
 def test_delete_uids_are_sorted_and_diagnostics_use_true_ranges():
@@ -356,6 +351,7 @@ def test_delete_uids_are_sorted_and_diagnostics_use_true_ranges():
     assert client.expunged == [(3, 4), (5,)]
     assert "delete batch=1/2 uid_count=2 uid_min=3 uid_max=4" in events
     assert "delete batch=2/2 uid_count=1 uid_min=5 uid_max=5" in events
+
 
 def test_partial_delete_reports_only_completed_chunks_and_rolls_back_failing_batch():
     class FailSecondExpunge(FakeClient):
@@ -399,7 +395,6 @@ def test_store_failure_rolls_back_only_failing_batch():
     assert raised.value.operation == "imap_add_deleted_flag"
     assert client.removed == [((3, 4), ("\\Deleted",), True)]
     assert client.expunged == [(1, 2)]
-
 
 
 def test_uid_mode_and_password_reference_lifetime():

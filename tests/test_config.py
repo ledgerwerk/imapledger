@@ -91,8 +91,7 @@ def test_config_mode_is_0600_on_posix(tmp_path: Path) -> None:
 def test_legacy_scalar_threshold_is_warned_about_and_ignored(tmp_path: Path) -> None:
     path = tmp_path / "legacy.toml"
     path.write_text(
-        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
-        '[spam]\nfolder = "Spam"\nthreshold = 0.99\n',
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n[spam]\nfolder = "Spam"\nthreshold = 0.99\n',
         encoding="utf-8",
     )
 

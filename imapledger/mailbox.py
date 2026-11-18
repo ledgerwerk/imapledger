@@ -107,10 +107,7 @@ class PartialDeleteError(ImapOperationError):
         self.rollback_error_type = failure.rollback_error_type
 
     def __str__(self) -> str:
-        return (
-            f"{super().__str__()}\n"
-            f"confirmed_deleted_count={len(self.deleted)} pending_count={len(self.pending)}"
-        )
+        return f"{super().__str__()}\nconfirmed_deleted_count={len(self.deleted)} pending_count={len(self.pending)}"
 
 
 class UnsafeMailboxOperation(MailboxError):
@@ -137,6 +134,7 @@ class MailboxSnapshot:
     uidvalidity: int
     uids: frozenset[int]
 
+
 class MessageSort(str, Enum):
     NEWEST = "newest"
     OLDEST = "oldest"
@@ -157,8 +155,6 @@ class MessageSelection:
             raise ValueError("sort must be a MessageSort")
 
 
-
-
 @dataclass(frozen=True, slots=True)
 class MailboxProbe:
     uidvalidity: int
@@ -168,6 +164,7 @@ class MailboxProbe:
     size_fetch_uid: int | None
     body_fetch_uid: int | None
     body_skip_reason: str | None
+
 
 @dataclass(frozen=True, slots=True)
 class MailboxItem:
@@ -301,6 +298,7 @@ class ScopedMailbox:
         self._client = client
         self._snapshot = MailboxSnapshot(uidvalidity=uidvalidity, uids=uids)
         return self
+
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         client = self._client
         self._client = None
@@ -322,7 +320,6 @@ class ScopedMailbox:
         if self._snapshot is None:
             raise MailboxError("mailbox is not open")
         return self._snapshot
-
 
     def probe(self) -> MailboxProbe:
         client = self._require_client()
@@ -494,6 +491,7 @@ class ScopedMailbox:
                     uid=uid,
                     message=parse_message(uid, raw, max_body_chars=self._max_body_chars),
                 )
+
     def delete_uids(self, uids: Sequence[int]) -> DeleteResult:
         if not self._writable:
             raise UnsafeMailboxOperation("mailbox is read-only")
@@ -608,6 +606,7 @@ class ScopedMailbox:
     def _emit(self, event: str) -> None:
         if self._event_callback is not None:
             self._event_callback(event)
+
     def _require_client(self) -> _Client:
         if self._client is None:
             raise MailboxError("mailbox is not open")

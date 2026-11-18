@@ -196,9 +196,7 @@ def build_jev_state(
             "authserv_id": evidence.authentication.authserv_id,
             "spf": evidence.authentication.spf,
             "spf_domain": evidence.authentication.spf_domain,
-            "dkim": [
-                {"result": item.result, "domain": item.domain} for item in evidence.authentication.dkim
-            ],
+            "dkim": [{"result": item.result, "domain": item.domain} for item in evidence.authentication.dkim],
             "dmarc": evidence.authentication.dmarc,
             "dmarc_from_domain": evidence.authentication.dmarc_from_domain,
             "arc": evidence.authentication.arc,
@@ -303,9 +301,7 @@ def _parse_score(value: str) -> float | None:
     return score if math.isfinite(score) else None
 
 
-def _authentication_evidence(
-    message: MailMessage, trusted_authserv_ids: tuple[str, ...]
-) -> AuthenticationEvidence:
+def _authentication_evidence(message: MailMessage, trusted_authserv_ids: tuple[str, ...]) -> AuthenticationEvidence:
     trusted_ids = {value.casefold().rstrip(".") for value in trusted_authserv_ids}
     for header in message.authentication_results_raw:
         match = re.match(r"\s*([^;\s]+)", header)

@@ -75,8 +75,6 @@ trusted_authserv_ids = []
 trusted_spam_headers = []
 ```
 
-
-
 Legacy `spam.threshold` values are deprecated, warned about, and ignored. They are not mapped to the new named thresholds. The documented policy defaults apply when `[spam.policy]` is absent.
 There is deliberately no password setting.
 
@@ -102,6 +100,7 @@ Every invocation prompts for the IMAP password. The default run is read-only and
 `--sort newest` orders by descending IMAP UID, and `--sort oldest` orders by ascending IMAP UID. This is mailbox arrival order, not the message `Date:` header. `--offset` skips messages after sorting. The window is chosen from one stable initial UID snapshot, and only its selected UIDs are fetched for size metadata and eligible message bodies.
 
 Progress is enabled by default. It streams one decision with its position and selected total as each message is classified. Use `--no-progress` to suppress per-message rows and render the detailed report at the end. `--verbose` is separate and adds safe IMAP protocol-operation diagnostics; it does not control classification progress.
+
 ## Apply DELETE verdicts
 
 ```bash
@@ -112,7 +111,6 @@ IMAP password:
 ```
 
 `--apply` refuses to run if the IMAP server does not advertise `UIDPLUS`. After classification, `imapledger` rechecks the mailbox `UIDVALIDITY`, verifies every approved UID still belongs to the same scoped mailbox, marks only those UIDs `\\Deleted`, and performs `UID EXPUNGE` only for those UIDs.
-
 
 With progress enabled, apply-mode DELETE rows say `DELETE-APPROVED` while classification is pending. `DELETED` is reported only after the exact UID expunge succeeds. The summary distinguishes approved UIDs from confirmed deletions; partial deletion shows confirmed and pending UIDs and exits with a failure status.
 
@@ -147,6 +145,7 @@ Authentication results remain untrusted unless an exact receiver `authserv-id` i
 The pure deterministic policy applies named thresholds. Strong legitimate/expected evidence vetoes deletion, phishing can qualify directly, and identity or unsolicited-bulk findings need corroboration. Provider and subject spam markers alone lead to REVIEW. Both REVIEW and KEEP are non-destructive; classifier, evidence, and policy errors fail closed.
 
 The streamed row reports verdict, principal signals, and concise reasons. `--limit`, `--offset`, `--sort`, progress output, dry-run defaults, single-folder scope, UIDPLUS requirements, UIDVALIDITY checks, and exact-UID deletion remain unchanged. The small offline examples in `eval/spam_cases.jsonl` are synthetic and do not include real message bodies or recipient data.
+
 ## Tests
 
 ```bash

@@ -189,6 +189,7 @@ def _stream_report(*, apply=False):
         ],
     )
 
+
 def test_clean_forwards_selection_arguments(monkeypatch):
     output = StringIO()
     report = CleanReport(folder="Spam", apply=False, results=[])
@@ -332,7 +333,7 @@ def _configure_doctor(monkeypatch, client):
     def mailbox_factory(**kwargs):
         return ScopedMailbox(
             **kwargs,
-            client_factory=lambda *args, **options: (factory_options.update(options) or client),
+            client_factory=lambda *args, **options: factory_options.update(options) or client,
         )
 
     monkeypatch.setattr(cli, "ScopedMailbox", mailbox_factory)
@@ -398,7 +399,6 @@ def test_doctor_skips_body_probe_when_message_exceeds_size_limit(monkeypatch):
     assert [selector for _, selector in client.fetches] == [("RFC822.SIZE",)]
 
 
-
 def test_doctor_logout_failure_is_contextual_and_private(monkeypatch):
     client = DoctorFakeClient(fail_on="logout")
     _configure_doctor(monkeypatch, client)
@@ -408,7 +408,6 @@ def test_doctor_logout_failure_is_contextual_and_private(monkeypatch):
     assert result.exit_code == 1
     assert "error [imap_logout]" in result.output
     assert "password=secret" not in result.output
-
 
 
 def test_report_shows_verdict_signals_reasons_and_safe_skip_error_detail(monkeypatch):
