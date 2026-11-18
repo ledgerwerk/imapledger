@@ -343,11 +343,28 @@ class ScopedMailbox:
                 raise UnsafeMailboxOperation("configured delete action requires IMAP UIDPLUS")
 
             try:
+                source_exists = bool(client.folder_exists(self._folder))
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_source_folder_exists",
+                    message="could not verify configured source folder",
+                    exc=exc,
+                    folder=self._folder,
+                ) from exc
+            if not source_exists:
+                raise ImapOperationError(
+                    operation="imap_source_folder_missing",
+                    message="configured source folder does not exist",
+                    folder=self._folder,
+                )
+            self._emit(f"source folder exists: {self._folder!r}")
+
+            try:
                 selected = client.select_folder(self._folder, readonly=not self._writable)
             except Exception as exc:
                 raise _operation_error(
                     operation="imap_select_folder",
-                    message="could not select configured folder",
+                    message="configured source folder exists but could not be selected",
                     exc=exc,
                     folder=self._folder,
                 ) from exc

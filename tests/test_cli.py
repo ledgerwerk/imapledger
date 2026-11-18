@@ -84,6 +84,7 @@ def test_clean_help_exposes_verbose_and_debug_options():
 
 class CleanFakeMailbox:
     folder = "Spam"
+    capabilities = frozenset({b"MOVE", b"UIDPLUS"})
     uids = frozenset({10, 20, 30, 40})
 
     def __init__(self):
@@ -105,6 +106,9 @@ class CleanFakeMailbox:
         if selection.limit is not None:
             selected = selected[: selection.limit]
         return len(selected)
+
+    def destination_exists(self, destination):
+        return True
 
 
 class CleanFakeClassifier:
@@ -285,7 +289,7 @@ def test_apply_progress_uses_approval_wording_not_deletion_claim(monkeypatch):
 
 
 class DoctorFakeClient:
-    def __init__(self, *, size=1, uids=(10,), fail_on=None):
+    def __init__(self, *, size=1, uids=(10,), fail_on=None, existing_folders=("Spam",)):
         self.size = size
         self.uids = list(uids)
         self.fail_on = fail_on
@@ -295,6 +299,8 @@ class DoctorFakeClient:
         self.removed = []
         self.expunged = []
         self.logged_out = False
+        self.existing_folders = set(existing_folders)
+        self.folder_queries = []
 
     def login(self, username, password):
         pass
@@ -306,6 +312,11 @@ class DoctorFakeClient:
 
     def capabilities(self):
         return (b"IMAP4rev1", b"UIDPLUS")
+
+
+    def folder_exists(self, folder):
+        self.folder_queries.append(folder)
+        return folder in self.existing_folders
 
     def select_folder(self, folder, readonly=False):
         self.selected.append((folder, readonly))
@@ -336,11 +347,12 @@ class DoctorFakeClient:
         self.expunged.append(tuple(messages))
 
 
-def _configure_doctor(monkeypatch, client):
-    settings = Settings(
-        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-        spam=SpamSettings(folders=("Spam",)),
-    )
+def _configure_doctor(monkeypatch, client, settings=None):
+    if settings is None:
+        settings = Settings(
+            imap=ImapSettings(host="imap.example.org", username="user@example.org"),
+            spam=SpamSettings(folders=("Spam",)),
+        )
     factory_options = {}
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
@@ -365,6 +377,8 @@ def test_doctor_is_read_only_and_discards_body(monkeypatch):
     assert result.exit_code == 0
     assert "TLS connect: OK" in result.output
     assert "login: OK" in result.output
+    assert "source: EXISTS" in result.output
+    assert "select: OK" in result.output
     assert "UIDVALIDITY: 42" in result.output
     assert "FETCH RFC822.SIZE (1 UID): OK" in result.output
     assert "FETCH BODY.PEEK[] (1 UID): OK" in result.output
@@ -375,6 +389,31 @@ def test_doctor_is_read_only_and_discards_body(monkeypatch):
     assert client.logged_out
     assert factory_options["use_uid"] is True
 
+
+def test_doctor_reports_missing_source_and_checks_later_sources(monkeypatch):
+    settings = Settings(
+        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
+        spam=SpamSettings(folders=("INBOX.Junk", "INBOX.Spam", "INBOX.Later")),
+    )
+    client = DoctorFakeClient(existing_folders=("INBOX.Junk", "INBOX.Later"))
+    prompts = []
+    output = StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
+    _configure_doctor(monkeypatch, client, settings=settings)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: prompts.append(prompt) or "secret")
+
+    result = CliRunner().invoke(cli.app, ["doctor", "--verbose"])
+
+    assert result.exit_code == 1
+    assert len(prompts) == 1
+    assert client.folder_queries == ["INBOX.Junk", "INBOX.Spam", "INBOX.Later"]
+    assert client.selected == [("INBOX.Junk", True), ("INBOX.Later", True)]
+    assert "source: MISSING" in output.getvalue()
+    assert "error [imap_source_folder_missing]" in result.output
+    assert "folder='INBOX.Spam'" in result.output
+    assert "folder: INBOX.Later (read-only)" in output.getvalue()
+    assert "hint: run imapledger doctor --verbose" not in result.output
+    assert "Traceback" not in result.output
 
 def test_doctor_size_probe_failure_is_contextual_and_private(monkeypatch):
     client = DoctorFakeClient(fail_on="size")
@@ -603,7 +642,11 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
     class Context:
         folder = "Spam"
         uids = frozenset({1, 2})
+        capabilities = frozenset({b"MOVE", b"UIDPLUS"})
 
+
+        def destination_exists(self, destination):
+            return True
         def __enter__(self):
             return self
 
@@ -706,7 +749,15 @@ def test_init_writes_repeated_folders_and_configured_actions(monkeypatch, tmp_pa
     assert "password" not in config_path.read_text(encoding="utf-8").lower()
 
 
-def _install_multi_clean(monkeypatch, settings, output, *, report_factory=None, destination_exists=True):
+def _install_multi_clean(
+    monkeypatch,
+    settings,
+    output,
+    *,
+    report_factory=None,
+    destination_exists=True,
+    preflight_failure_folder=None,
+):
     state = {
         "prompts": [],
         "classifier_instances": [],
@@ -724,11 +775,18 @@ def _install_multi_clean(monkeypatch, settings, output, *, report_factory=None, 
             self.folder = kwargs["folder"]
             self.kwargs = kwargs
             self.uids = frozenset(range(1, 31))
+            self.capabilities = frozenset({b"MOVE", b"UIDPLUS"})
             self.selections = []
             state["mailboxes"].append(self)
             state["events"].append(("open", self.folder))
 
         def __enter__(self):
+            if self.folder == preflight_failure_folder and not self.kwargs["writable"]:
+                raise ImapOperationError(
+                    operation="imap_source_folder_missing",
+                    message="configured source folder does not exist",
+                    folder=self.folder,
+                )
             return self
 
         def __exit__(self, *args):
@@ -855,7 +913,9 @@ def test_clean_apply_preflights_each_destination_before_classifying(monkeypatch)
     assert result.exit_code == 0
     assert len(state["prompts"]) == 1
     assert len(state["classifier_instances"]) == 1
-    assert all(mailbox.kwargs["writable"] for mailbox in state["mailboxes"])
+    first_classify = next(index for index, event in enumerate(state["events"]) if event[0] == "classify")
+    assert state["events"].index(("close", "INBOX.Spam")) < first_classify
+    assert [mailbox.kwargs["writable"] for mailbox in state["mailboxes"]] == [False, False, True, True]
     for folder in ("INBOX.Junk", "INBOX.Spam"):
         folder_events = [event for event in state["events"] if event[1] == folder]
         assert folder_events.index(("destination", folder, "INBOX.Trash")) < folder_events.index(("classify", folder))
@@ -864,6 +924,32 @@ def test_clean_apply_preflights_each_destination_before_classifying(monkeypatch)
     assert rendered.count("MOVED -> INBOX.Trash") == 2
     assert "Aggregate across 2 folders" in rendered
 
+
+
+def test_clean_apply_aborts_all_sources_before_classifier_or_mutation(monkeypatch):
+    output = StringIO()
+    state = _install_multi_clean(
+        monkeypatch,
+        _multi_folder_settings(),
+        output,
+        preflight_failure_folder="INBOX.Spam",
+    )
+
+    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
+
+    rendered = output.getvalue()
+    assert result.exit_code == 1
+    assert len(state["prompts"]) == 1
+    assert [mailbox.folder for mailbox in state["mailboxes"]] == ["INBOX.Junk", "INBOX.Spam"]
+    assert all(mailbox.kwargs["writable"] is False for mailbox in state["mailboxes"])
+    assert state["classifier_instances"] == []
+    assert state["clean_calls"] == []
+    assert "preflight INBOX.Junk: OK" in rendered
+    assert "preflight INBOX.Spam: FAILED" in rendered
+    assert "error [imap_source_folder_missing]" in result.output
+    assert "apply aborted before classification/mutation" in rendered
+    assert "MOVED" not in rendered and "DELETED" not in rendered
+    assert "Traceback" not in result.output
 
 def test_clean_partial_move_exits_nonzero_and_keeps_confirmed_reporting(monkeypatch):
     output = StringIO()
@@ -925,7 +1011,11 @@ def test_clean_partial_move_exits_nonzero_and_keeps_confirmed_reporting(monkeypa
 
     rendered = output.getvalue()
     assert result.exit_code == 1
-    assert [mailbox.folder for mailbox in state["mailboxes"]] == ["INBOX.Junk"]
+    assert [(mailbox.folder, mailbox.kwargs["writable"]) for mailbox in state["mailboxes"]] == [
+        ("INBOX.Junk", False),
+        ("INBOX.Spam", False),
+        ("INBOX.Junk", True),
+    ]
     assert "folder=INBOX.Junk UID 10  MOVED -> INBOX.Trash" in rendered
     assert "folder=INBOX.Junk UID 20  MOVE NOT CONFIRMED -> INBOX.Trash" in rendered
     assert "Aggregate across 1 folders" in rendered

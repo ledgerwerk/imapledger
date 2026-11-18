@@ -25,6 +25,7 @@ from .config import (
 )
 from .evidence import redact_urls
 from .mailbox import ImapOperationError, MailboxError, MessageSelection, MessageSort, ScopedMailbox
+from .preflight import preflight_source
 
 app = typer.Typer(no_args_is_help=True, help="Security-scoped IMAP automation.")
 config_app = typer.Typer(help="Inspect imapledger configuration.")
@@ -116,26 +117,27 @@ def doctor(
         action.action is ActionKind.DELETE for action in (actions.spam, actions.not_spam, actions.review)
     )
     failed = False
+    failed = False
     try:
         for folder in settings.spam.folders:
             console.print(f"folder: {folder} (read-only)", markup=False)
-            try:
-                with ScopedMailbox(
-                    host=settings.imap.host,
-                    port=settings.imap.port,
-                    username=settings.imap.username,
-                    password=password,
-                    folder=folder,
-                    writable=False,
-                    allowed_destinations=destinations,
-                    allow_delete=requires_delete,
-                    max_message_bytes=settings.spam.max_message_bytes,
-                    max_body_chars=settings.spam.max_body_chars,
-                    event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
-                ) as mailbox:
-                    probe = mailbox.probe()
-                    console.print("TLS connect: OK")
-                    console.print("login: OK")
+            result = preflight_source(
+                settings,
+                folder,
+                password=password,
+                destinations=destinations,
+                requires_delete=requires_delete,
+                deep_probe=True,
+                mailbox_factory=ScopedMailbox,
+                event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+            )
+            if result.opened:
+                console.print("source: EXISTS")
+                console.print("select: OK")
+                console.print("TLS connect: OK")
+                console.print("login: OK")
+                probe = result.probe
+                if probe is not None:
                     console.print(f"UIDVALIDITY: {probe.uidvalidity}")
                     console.print(f"messages: {probe.message_count}")
                     if probe.uid_min is not None and probe.uid_max is not None:
@@ -149,28 +151,36 @@ def doctor(
                     else:
                         console.print(f"FETCH BODY.PEEK[]: SKIPPED ({probe.body_skip_reason})", markup=False)
 
-                    for capability, required in ((b"MOVE", bool(destinations)), (b"UIDPLUS", requires_delete)):
-                        if required:
-                            available = capability in mailbox.capabilities
-                            state = "OK" if available else "MISSING"
-                            console.print(f"required capability {capability.decode()}: {state}")
-                            failed = failed or not available
-                    for destination in destinations:
-                        try:
-                            exists = mailbox.destination_exists(destination)
-                        except Exception as exc:
-                            _print_failure(exc, debug=False)
-                            failed = True
-                            continue
+                for capability, required in ((b"MOVE", bool(destinations)), (b"UIDPLUS", requires_delete)):
+                    if required:
+                        state = "OK" if capability in result.capabilities else "MISSING"
+                        console.print(f"required capability {capability.decode()}: {state}")
+                for destination, exists in result.destinations:
+                    if exists is not None:
                         state = "OK" if exists else "MISSING"
                         console.print(f"destination {destination}: {state}", markup=False)
-                        failed = failed or not exists
-            except Exception as exc:
-                _print_failure(exc, debug=False)
-                failed = True
+            else:
+                error = result.errors[0] if result.errors else None
+                operation = error.operation if isinstance(error, ImapOperationError) else None
+                if operation == "imap_source_folder_missing":
+                    console.print("source: MISSING")
+                    console.print("select: SKIPPED")
+                    console.print("destination checks: SKIPPED for this source session")
+                elif operation == "imap_select_folder":
+                    console.print("source: EXISTS")
+                    console.print("select: FAILED")
+                elif operation == "imap_source_folder_exists":
+                    console.print("source: UNVERIFIED")
+                    console.print("select: SKIPPED")
+                else:
+                    console.print("source: NOT CHECKED")
+                    console.print("select: SKIPPED")
+
+            for error in result.errors:
+                _print_failure(error, debug=False, command="doctor")
+            failed = failed or not result.ok
     finally:
         password = ""
-
     if failed:
         console.print("result: IMAP read/action preflight has failures")
         raise typer.Exit(1)
@@ -228,6 +238,36 @@ def clean(
     allow_delete = any(
         action.action is ActionKind.DELETE for action in (actions.spam, actions.not_spam, actions.review)
     )
+
+    if apply:
+        preflight_failed = False
+        for folder in settings.spam.folders:
+            result = preflight_source(
+                settings,
+                folder,
+                password=password,
+                destinations=destinations,
+                requires_delete=allow_delete,
+                deep_probe=False,
+                mailbox_factory=ScopedMailbox,
+                event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+            )
+            state = "OK" if result.ok else "FAILED"
+            console.print(f"preflight {folder}: {state}", markup=False)
+            for capability in (b"MOVE", b"UIDPLUS"):
+                if capability in result.missing_capabilities:
+                    console.print(f"required capability {capability.decode()}: MISSING")
+            for destination, exists in result.destinations:
+                if exists is not None:
+                    state = "OK" if exists else "MISSING"
+                    console.print(f"destination {destination}: {state}", markup=False)
+            for error in result.errors:
+                _print_failure(error, debug=False, command="clean")
+            preflight_failed = preflight_failed or not result.ok
+        if preflight_failed:
+            console.print("apply aborted before classification/mutation")
+            password = ""
+            raise typer.Exit(1)
     reports: list[CleanReport] = []
     failure: Exception | None = None
     try:
@@ -303,7 +343,7 @@ def clean(
     if reports:
         _print_aggregate_summary(reports)
     if failure is not None:
-        _print_failure(failure, debug=debug)
+        _print_failure(failure, debug=debug, command="clean")
         raise typer.Exit(1) from failure
 
 
@@ -470,10 +510,25 @@ def _print_aggregate_summary(reports: list[CleanReport]) -> None:
     )
 
 
-def _print_failure(exc: Exception, *, debug: bool) -> None:
+def _print_failure(exc: Exception, *, debug: bool, command: str | None = None) -> None:
     if isinstance(exc, ImapOperationError):
         err_console.print(str(exc), markup=False)
-        err_console.print("hint: run imapledger doctor --verbose")
+        if exc.operation == "imap_source_folder_missing":
+            err_console.print(
+                "hint: verify the exact mailbox name in spam.folders; imapledger does not create source folders"
+            )
+        elif exc.operation == "imap_select_folder":
+            err_console.print(
+                "hint: the mailbox exists but SELECT/EXAMINE failed; "
+                "check mailbox flags, permissions, and exact server-side naming"
+            )
+        elif exc.operation == "imap_source_folder_exists":
+            err_console.print(
+                "hint: could not verify the exact configured source name; "
+                "check server mailbox metadata access and permissions"
+            )
+        elif command != "doctor":
+            err_console.print("hint: run imapledger doctor --verbose")
     elif isinstance(exc, MailboxError):
         err_console.print(f"{type(exc).__name__}: {exc}", markup=False)
     else:

@@ -45,6 +45,8 @@ trusted_spam_headers = []
 
 `folders` lists source mailboxes, not destinations. Sources are processed in listed order, one source-scoped IMAP session at a time. `--limit`, `--offset`, and `--sort` select messages independently in each source. UID values from different folders are not compared.
 
+Source mailbox names are exact and server-specific. Every configured source must exist and be selectable on the account. The example names above are not universal; imapledger does not normalize names or create source folders. `doctor` distinguishes a missing source from an existing source that cannot be selected.
+
 ## Outcome actions
 
 The existing policy verdicts are kept for compatibility. Routing maps them separately:

@@ -55,6 +55,8 @@ Per-folder summaries contain semantic counts and action counts. A final aggregat
 
 Before applying actions, imapledger checks the configured MOVE destination folders for the current source. Destinations must already exist. The program does not create folders, and MOVE is never replaced by COPY plus deletion.
 
+`clean --apply` first runs a read-only preflight for every configured source. It checks authentication, required capabilities, exact source existence, read-only SELECT, and configured move destinations before classifier construction or action work. If any source fails, the command exits before any mutation. This is a best-effort preflight, not a transaction: mailbox state or capabilities can change afterward, so mutation-time checks and partial-result reporting still apply.
+
 - A configured move action requires the IMAP MOVE capability.
 - A configured delete action requires UIDPLUS.
 - Dry-run does not require mutation capabilities.
@@ -71,6 +73,8 @@ Source folders are separate operations, not one cross-folder transaction. If a l
 ## Doctor
 
 `imapledger doctor` is read-only and checks every configured source folder. It prompts once, then verifies the secure connection, login, read-only source selection, UID/search behavior, bounded size/body probes, action-related capabilities, and every configured move destination. It reports missing capabilities or destinations and exits non-zero. It does not classify messages, create folders, or mutate mail.
+
+Missing configured sources are reported separately from sources that exist but cannot be selected. Source names are checked exactly as configured. Verify spelling and case against the server; imapledger does not create or substitute source folders.
 
 Use `imapledger doctor --verbose` to print safe operation progress. Probe message bytes are discarded and never printed.
 

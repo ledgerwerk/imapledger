@@ -9,6 +9,7 @@ A security-scoped IMAP automation tool. `imapledger` scans configured source fol
 - IMAP uses TLS and UID mode. The password is requested with hidden input and is never stored in the configuration.
 - Dry-run is the default. It selects each source read-only and performs no mutations.
 - `--apply` uses only configured actions. Every MOVE destination is allow-listed, must exist, and requires server MOVE support. imapledger does not create folders or fall back to COPY and EXPUNGE.
+- Before `--apply`, all configured sources are checked read-only for authentication, required capabilities, exact source existence, SELECT, and move destinations. A failed preflight aborts before classifier construction or mutation. It is best-effort, not transactional, and server state can change before mutation-time checks.
 - Moves and deletes use only UIDs from the initial source snapshot. Before mutation, imapledger rechecks UIDVALIDITY and confirms that the selected UIDs still exist.
 - Permanent deletion is available only as an explicit spam action. It requires UIDPLUS and uses exact-UID EXPUNGE.
 - Classification, evidence, and policy errors fail closed. Skipped and errored messages remain in their source folders.
@@ -72,6 +73,8 @@ action = "keep"
 ```
 
 The source folders are scanned in listed order. A `SpamVerdict.DELETE` maps to the spam outcome, `SpamVerdict.KEEP` maps to not-spam, and `SpamVerdict.REVIEW` maps to review. Configuration selects the action for each outcome. REVIEW defaults to keep. Skip and error results always keep. Delete is supported only for spam. Move destinations must already exist and cannot be any configured source folder.
+
+Mailbox names are exact and server-specific. Every configured source must exist and be selectable on the account. The `INBOX.Junk` and `INBOX.Spam` names above are examples, not universal names. `doctor` distinguishes missing sources from existing sources that cannot be selected.
 For the new plural `folders` schema, omitted action tables default to `keep`. Permanent deletion therefore requires an explicit `[spam.actions.spam]` entry. Legacy scalar `spam.folder` configurations retain the old spam-delete default when action tables are absent.
 
 Legacy configurations with `spam.folder` remain supported with a deprecation warning. If they have no action tables, the old behavior is preserved: spam is deleted when `--apply` is used, and not-spam and review are kept. New configurations use `folders` and explicit action tables.
@@ -91,6 +94,7 @@ imapledger config show
 ```
 
 Every `clean` and `doctor` invocation prompts once for the IMAP password. Without `--apply`, `clean` is read-only and reports planned actions such as `WOULD MOVE` or `WOULD DELETE`. With `--apply`, classification completes for one source before configured actions are executed for that source. Apply-mode progress first reports `MOVE-APPROVED` or `DELETE-APPROVED`; final output reports `MOVED` or `DELETED` only when confirmed.
+Apply mode first checks every configured source and move destination read-only; if any preflight check fails, it stops before classifier construction or mutations. This is not a transaction and does not prevent server-side changes or runtime partial failures after preflight.
 
 `--limit` and `--offset` apply independently to each source folder. With two folders, `--limit 10 --offset 10` selects positions 11 through 20 in each folder. `--sort newest` and `--sort oldest` order each folder by descending or ascending IMAP UID, which represents mailbox arrival order, not the message `Date:` header. UIDs are folder-local and are never globally ordered or merged.
 

@@ -27,9 +27,10 @@ class FakeClient:
         self.removed = []
         self.expunged = []
         self.moves = []
-        self.existing_folders = {"INBOX.Trash"}
+        self.existing_folders = {"INBOX.Trash", "Spam"}
         self.folder_queries = []
         self.logged_out = False
+        self.calls = []
         self.fail_on = None
         self.fail_move_on_call = None
         self.failure_text = "FETCH command error: BAD password=secret raw_message=" + RAW.decode()
@@ -39,27 +40,33 @@ class FakeClient:
             raise RuntimeError(self.failure_text)
 
     def login(self, username, password):
+        self.calls.append("login")
         self._maybe_fail("login")
         self.login_args = (username, password)
 
     def logout(self):
+        self.calls.append("logout")
         self.logged_out = True
 
     def capabilities(self):
+        self.calls.append("capabilities")
         self._maybe_fail("capabilities")
         return self._capabilities
 
     def select_folder(self, folder, readonly=False):
+        self.calls.append("select")
         self._maybe_fail("select")
         self.selected.append((folder, readonly))
         return {b"UIDVALIDITY": self.uidvalidity, b"EXISTS": len(self.uids), b"FLAGS": (), b"RECENT": 0}
 
     def folder_exists(self, folder):
+        self.calls.append("folder_exists")
         self._maybe_fail("folder_exists")
         self.folder_queries.append(folder)
         return folder in self.existing_folders
 
     def search(self, criteria="ALL", charset=None):
+        self.calls.append("search")
         self._maybe_fail("search")
         return self.uids
 
@@ -100,6 +107,7 @@ def make_mailbox(
     client,
     *,
     writable,
+    folder="Spam",
     max_message_bytes=1_000_000,
     fetch_batch_size=100,
     mutation_batch_size=100,
@@ -116,7 +124,7 @@ def make_mailbox(
         port=993,
         username="me@example.org",
         password="secret",
-        folder="Spam",
+        folder=folder,
         writable=writable,
         max_message_bytes=max_message_bytes,
         max_body_chars=20_000,
@@ -147,6 +155,74 @@ def test_dry_run_selects_only_scoped_folder_readonly() -> None:
     assert client.selected == [("Spam", True)]
     assert client.expunged == []
 
+
+
+def test_missing_configured_source_is_reported_before_select_or_search() -> None:
+    client = FakeClient()
+    client.existing_folders.remove("Spam")
+
+    with pytest.raises(ImapOperationError) as raised:
+        with make_mailbox(client, writable=False, folder="INBOX.Spam"):
+            pass
+
+    assert raised.value.operation == "imap_source_folder_missing"
+    assert raised.value.folder == "INBOX.Spam"
+    assert "folder='INBOX.Spam'" in str(raised.value)
+    assert client.folder_queries == ["INBOX.Spam"]
+    assert client.selected == []
+    assert "search" not in client.calls
+    assert client.fetches == []
+    assert client.moves == []
+    assert client.added == []
+    assert client.expunged == []
+    assert client.logged_out
+    assert client.calls == ["login", "capabilities", "folder_exists", "logout"]
+
+
+def test_source_existence_probe_error_is_safe_and_logs_out() -> None:
+    client = FakeClient()
+    client.fail_on = "folder_exists"
+
+    with pytest.raises(ImapOperationError) as raised:
+        with make_mailbox(client, writable=False):
+            pass
+
+    rendered = str(raised.value)
+    assert raised.value.operation == "imap_source_folder_exists"
+    assert "password=secret" not in rendered
+    assert RAW.decode() not in rendered
+    assert client.selected == []
+    assert client.logged_out
+
+
+def test_existing_source_select_failure_has_distinct_message() -> None:
+    client = FakeClient()
+    client.fail_on = "select"
+
+    with pytest.raises(ImapOperationError) as raised:
+        with make_mailbox(client, writable=False):
+            pass
+
+    rendered = str(raised.value)
+    assert raised.value.operation == "imap_select_folder"
+    assert raised.value.message == "configured source folder exists but could not be selected"
+    assert "folder='Spam'" in rendered
+    assert client.folder_queries == ["Spam"]
+    assert "password=secret" not in rendered
+    assert RAW.decode() not in rendered
+    assert client.logged_out
+
+
+def test_source_existence_check_precedes_select_and_search() -> None:
+    client = FakeClient()
+    client.existing_folders.add("INBOX.Spam")
+
+    with make_mailbox(client, writable=False, folder="INBOX.Spam"):
+        pass
+
+    assert client.calls == ["login", "capabilities", "folder_exists", "select", "search", "logout"]
+    assert client.folder_queries == ["INBOX.Spam"]
+    assert client.selected == [("INBOX.Spam", True)]
 
 def test_size_limit_prevents_body_fetch() -> None:
     client = FakeClient(size=10_000)
@@ -564,7 +640,7 @@ def test_destination_existence_is_allow_listed_and_read_only() -> None:
         with pytest.raises(UnsafeMailboxOperation, match="outside the configured allow-list"):
             mailbox.destination_exists("INBOX.Other")
 
-    assert client.folder_queries == ["INBOX.Trash", "INBOX.Missing"]
+    assert client.folder_queries == ["Spam", "INBOX.Trash", "INBOX.Missing"]
     assert client.moves == []
     assert client.expunged == []
 
