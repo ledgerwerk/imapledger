@@ -41,6 +41,14 @@ Dry-run output can look like:
 [3/10] UID 43652  KEEP  Outcome=REVIEW  Verdict=REVIEW
 ```
 
+## Routing rule precedence
+
+`clean` loads the separate `rules.toml` beside the selected config file. It checks the first enabled rule whose configured source folder and AND-combined matcher fields match the message before constructing a spam assessment. A match uses only the rule's `keep` or `move` action, bypasses spam classification for that message, and is reported as `Rule=<id>` without a spam verdict. Non-matching messages continue through the existing spam classifier and policy.
+
+Rules apply only to source folders already listed in `spam.folders`; they cannot broaden the scan. A malformed rule file or out-of-scope source fails before mailbox processing. During dry-run, rule actions remain plans and no mailbox mutation occurs. With `clean --apply`, a rule move is applied to that exact UID immediately, before the next message is processed. Enabled rule move destinations are allow-listed and included in read-only preflight. Rule counts are reported separately from spam, not-spam, and review counts.
+
+Use [`Learned routing rules`](rules.md) for the learning, storage, management, and read-only testing commands.
+
 In apply mode, each configured MOVE or DELETE is attempted as its message is processed, before the progress callback and before the next message is classified. Progress reports the final action state after the attempt, using `MOVED` or `DELETED` only when confirmed:
 
 ```text

@@ -246,6 +246,53 @@ def test_size_limit_prevents_body_fetch() -> None:
     assert client.fetches == [((10,), ("RFC822.SIZE",))]
 
 
+
+def test_fetch_uid_reads_only_requested_uid_and_uses_body_peek() -> None:
+    client = FakeClient(uids=[10, 20])
+    with make_mailbox(client, writable=False) as mailbox:
+        item = mailbox.fetch_uid(20)
+
+    assert item.uid == 20
+    assert item.message is not None and item.message.uid == 20
+    assert client.fetches == [((20,), ("RFC822.SIZE",)), ((20,), ("BODY.PEEK[]",))]
+    assert client.added == []
+    assert client.removed == []
+
+
+def test_fetch_uid_rejects_invalid_and_missing_uids() -> None:
+    client = FakeClient()
+    with make_mailbox(client, writable=False) as mailbox:
+        for uid in (0, -1, True, 10.0):
+            with pytest.raises(ValueError, match="positive integer"):
+                mailbox.fetch_uid(uid)  # type: ignore[arg-type]
+        with pytest.raises(UnsafeMailboxOperation, match="initial mailbox snapshot"):
+            mailbox.fetch_uid(11)
+
+    assert client.fetches == []
+
+
+def test_fetch_uid_skips_oversized_message_without_fetching_body() -> None:
+    client = FakeClient(size=10_000)
+    with make_mailbox(client, writable=False, max_message_bytes=100) as mailbox:
+        item = mailbox.fetch_uid(10)
+
+    assert item.message is None
+    assert "exceeds limit" in (item.skip_reason or "")
+    assert client.fetches == [((10,), ("RFC822.SIZE",))]
+
+
+def test_fetch_uid_errors_are_contextual_and_sanitized() -> None:
+    client = FakeClient()
+    client.fail_on = "fetch_size"
+    with make_mailbox(client, writable=False) as mailbox:
+        with pytest.raises(ImapOperationError) as raised:
+            mailbox.fetch_uid(10)
+
+    assert raised.value.operation == "imap_fetch_size"
+    assert "uid=10" in str(raised.value)
+    assert "secret" not in str(raised.value)
+    assert "Cheap pills" not in str(raised.value)
+
 def test_delete_uses_uid_expunge_for_exact_snapshot_uids() -> None:
     client = FakeClient()
     with make_mailbox(client, writable=True) as mailbox:

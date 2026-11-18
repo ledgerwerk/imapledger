@@ -687,6 +687,70 @@ class ScopedMailbox:
             body_skip_reason=body_skip_reason,
         )
 
+    def fetch_uid(self, uid: int) -> MailboxItem:
+        client = self._require_client()
+        if isinstance(uid, bool) or not isinstance(uid, int) or uid < 1:
+            raise ValueError("uid must be a positive integer")
+        if uid not in self.snapshot().uids:
+            raise UnsafeMailboxOperation(f"refusing UID outside initial mailbox snapshot: {uid}")
+
+        self._emit(f"size-fetch uid={uid}")
+        try:
+            sizes = client.fetch((uid,), ["RFC822.SIZE"])
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_fetch_size",
+                message="FETCH failed while reading RFC822.SIZE",
+                exc=exc,
+                folder=self._folder,
+                selector="RFC822.SIZE",
+                uids=(uid,),
+            ) from exc
+        size_data = sizes.get(uid)
+        if not size_data:
+            return MailboxItem(uid=uid, skip_reason="message disappeared before size fetch")
+        try:
+            size_value = size_data.get(b"RFC822.SIZE")
+            if size_value is None:
+                raise ValueError("missing RFC822.SIZE")
+            size = int(size_value)
+            if size < 0:
+                raise ValueError("negative RFC822.SIZE")
+        except (TypeError, ValueError) as exc:
+            raise _operation_error(
+                operation="imap_fetch_size",
+                message="server returned invalid RFC822.SIZE",
+                exc=exc,
+                folder=self._folder,
+                selector="RFC822.SIZE",
+                uids=(uid,),
+            ) from exc
+        if size > self._max_message_bytes:
+            return MailboxItem(
+                uid=uid,
+                skip_reason=f"message size {size} exceeds limit {self._max_message_bytes}",
+            )
+
+        self._emit(f"body-fetch uid={uid}")
+        try:
+            response = client.fetch((uid,), ["BODY.PEEK[]"])
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_fetch_body",
+                message="FETCH failed while reading BODY.PEEK[]",
+                exc=exc,
+                folder=self._folder,
+                selector="BODY.PEEK[]",
+                uids=(uid,),
+            ) from exc
+        body_data = response.get(uid)
+        if not body_data:
+            return MailboxItem(uid=uid, skip_reason="message disappeared before body fetch")
+        raw = body_data.get(b"BODY[]")
+        if not isinstance(raw, bytes):
+            return MailboxItem(uid=uid, skip_reason="server did not return BODY[] bytes")
+        return MailboxItem(uid=uid, message=parse_message(uid, raw, max_body_chars=self._max_body_chars))
+
     def selected_count(self, selection: MessageSelection) -> int:
         return len(self._selected_uids(selection))
 

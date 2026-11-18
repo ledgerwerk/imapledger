@@ -10,9 +10,10 @@ from .config import ActionKind, MessageAction, SpamActions
 from .evidence import MessageEvidence
 from .mailbox import DeleteResult, MailboxItem, MessageSelection, MoveResult, PartialDeleteError, PartialMoveError
 from .policy import SpamPolicy, SpamVerdict
+from .rules import RuleSet
 
-Status = Literal["delete", "keep", "review", "skip", "error"]
-Inclination = Literal["DELETE-APPROVED", "KEEP", "REVIEW / KEEP", "SKIP", "ERROR / KEEP"]
+Status = Literal["delete", "keep", "review", "rule", "skip", "error"]
+Inclination = Literal["DELETE-APPROVED", "KEEP", "REVIEW / KEEP", "RULE", "SKIP", "ERROR / KEEP"]
 
 
 class SpamOutcome(str, Enum):
@@ -63,6 +64,8 @@ class MessageResult:
     detail: str | None = None
     model: str | None = None
     request_id: str | None = None
+    decision_source: Literal["rule", "spam", "skip", "error"] = "spam"
+    matched_rule_id: str | None = None
 
     @property
     def deleted(self) -> bool:
@@ -84,6 +87,10 @@ class CleanReport:
     @property
     def scanned(self) -> int:
         return len(self.results)
+
+    @property
+    def rule_matches(self) -> int:
+        return sum(row.decision_source == "rule" for row in self.results)
 
     @property
     def spam(self) -> int:
@@ -134,11 +141,13 @@ class SpamCleaner:
         *,
         policy: SpamPolicy | None = None,
         actions: SpamActions | None = None,
+        rules: RuleSet | None = None,
     ) -> None:
         self._mailbox = mailbox
         self._classifier = classifier
         self._policy = policy or SpamPolicy()
         self._actions = actions or SpamActions()
+        self._rules = rules or RuleSet()
 
     def run(
         self,
@@ -169,12 +178,53 @@ class SpamCleaner:
                     status="skip",
                     inclination="SKIP",
                     detail=item.skip_reason or "message not available",
+                    decision_source="skip",
                 )
                 report.results.append(row)
                 notify(row)
                 continue
 
             message = item.message
+            try:
+                rule = self._rules.first_match(self._mailbox.folder, message)
+            except Exception as exc:
+                row = MessageResult(
+                    uid=message.uid,
+                    subject=message.subject,
+                    sender=message.sender,
+                    verdict=None,
+                    signals=None,
+                    reasons=(),
+                    status="error",
+                    inclination="ERROR / KEEP",
+                    detail=f"{type(exc).__name__}: rule evaluation failed",
+                    decision_source="error",
+                )
+                report.results.append(row)
+                notify(row)
+                continue
+            if rule is not None:
+                row = MessageResult(
+                    uid=message.uid,
+                    subject=message.subject,
+                    sender=message.sender,
+                    verdict=None,
+                    signals=None,
+                    reasons=(f"rule:{rule.id}",),
+                    status="rule",
+                    inclination="RULE",
+                    action=rule.action,
+                    decision_source="rule",
+                    matched_rule_id=rule.id,
+                )
+                report.results.append(row)
+                should_continue = True
+                if apply and row.action.action is not ActionKind.KEEP:
+                    should_continue = self._apply_action(report, row)
+                notify(row)
+                if not should_continue:
+                    break
+                continue
             try:
                 assessment = self._classifier.assess(message)
                 evidence: MessageEvidence = assessment.evidence
@@ -190,6 +240,7 @@ class SpamCleaner:
                     status="error",
                     inclination="ERROR / KEEP",
                     detail=f"{type(exc).__name__}: classification evaluation failed",
+                    decision_source="error",
                 )
                 report.results.append(row)
                 notify(row)

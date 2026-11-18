@@ -31,6 +31,7 @@ imapledger clean --apply
 
 configuration
 cleaning
+rules
 ```
 
 ## Safety invariant

@@ -111,7 +111,22 @@ Apply mode first checks every configured source and move destination read-only; 
 
 Moves require the IMAP MOVE capability and an existing destination. Deletes require UIDPLUS. `doctor` checks every configured source, the configured action capabilities, and all move destinations without mutating mail. Mutation batches stop on failure. Earlier confirmed actions remain applied, later action groups and source folders are not attempted, and the command exits non-zero. Inspect pending UIDs before retrying because their result was not confirmed.
 
-See [the configuration guide](docs/configuration.md) and [the cleaning guide](docs/cleaning.md) for the complete schema, safety checks, reporting, and failure behavior.
+See [the configuration guide](docs/configuration.md), [the cleaning guide](docs/cleaning.md), and [the learned routing rules guide](docs/rules.md) for the complete schema, safety checks, reporting, and failure behavior.
+
+## Learned routing rules
+
+Use a routing rule for a personal mailbox preference that should remain separate from spam classification. For example, learn a narrow rule from one explicitly scoped message UID:
+
+```bash
+imapledger rule learn 43627 --folder INBOX.Junk --move INBOX.Trash --preview
+imapledger rule learn 43627 --folder INBOX.Junk --move INBOX.Trash
+imapledger rule list
+imapledger rule test mailer-daemon-gmx-net --limit 20
+```
+
+Learning requires a configured source folder and an explicit move destination. Jev selects only from deterministic matcher candidates generated locally by imapledger; it cannot invent a matcher or destination. The message body is excluded from Jev's learning state by default. A proposal must pass local safety thresholds before it can be saved. `--preview` does not save, and the default save prompt is no. `--yes` confirms saving only. Moving the example message requires the separate `--apply-current` option.
+
+Saved rules run before spam classification and are matched locally. A matching rule bypasses classification for that message, while non-matches continue through the existing spam policy. Rules are limited to configured source folders and cannot change REVIEW behavior for other messages. `clean` remains read-only unless `--apply` is supplied. See [docs/rules.md](docs/rules.md) for the schema, precedence, and safety details.
 
 ## Evidence and policy
 

@@ -16,6 +16,7 @@ from imapledger.mailbox import (
 )
 from imapledger.message import MailMessage
 from imapledger.policy import SpamVerdict
+from imapledger.rules import MailRule, RuleMatch, RuleSet
 
 
 class FakeMailbox(AbstractContextManager):
@@ -158,6 +159,116 @@ def test_review_can_be_moved_using_review_action():
     assert mailbox.moved == [((1,), "INBOX.Review"), ((2,), "INBOX.Review")]
     assert all(row.outcome is SpamOutcome.REVIEW for row in report.results[:2])
 
+
+
+def test_rule_match_bypasses_classifier_and_moves_immediately_before_next_message():
+    events = []
+    mailbox = FakeMailbox(writable=True, events=events)
+    mailbox.items[0] = MailboxItem(
+        uid=1,
+        message=MailMessage(1, "delivery failure", "a@example.org", (), "", "body", from_address="a@example.org"),
+    )
+    rule = MailRule(
+        id="sender-route",
+        enabled=True,
+        source_folders=("Spam",),
+        action=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
+        match=RuleMatch(from_address="a@example.org"),
+    )
+    callbacks = []
+
+    report = SpamCleaner(
+        mailbox,
+        FakeClassifier(events),
+        rules=RuleSet((rule,)),
+    ).run(apply=True, on_result=lambda row, position, total: (callbacks.append(row), events.append(f"row:{row.uid}")))
+
+    assert events == ["move:1:INBOX.Trash", "row:1", "classify:2", "row:2", "row:3"]
+    assert mailbox.moved == [((1,), "INBOX.Trash")]
+    assert report.rule_matches == 1
+    assert report.spam == 0
+    assert report.results[0].matched_rule_id == "sender-route"
+    assert report.results[0].decision_source == "rule"
+    assert report.results[0].verdict is None
+    assert report.results[0].signals is None
+    assert report.results[0].outcome is None
+    assert report.results[0].action_applied
+    assert callbacks == report.results
+
+
+def test_rule_dry_run_does_not_mutate_and_nonmatches_still_use_classifier():
+    events = []
+    mailbox = FakeMailbox(writable=False, events=events)
+    mailbox.items[0] = MailboxItem(
+        uid=1,
+        message=MailMessage(1, "delivery failure", "a@example.org", (), "", "body", from_address="a@example.org"),
+    )
+    rule = MailRule(
+        id="sender-route",
+        enabled=True,
+        source_folders=("Spam",),
+        action=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
+        match=RuleMatch(from_address="a@example.org"),
+    )
+
+    report = SpamCleaner(mailbox, FakeClassifier(events), rules=RuleSet((rule,))).run(apply=False)
+
+    assert events == ["classify:2"]
+    assert mailbox.moved == []
+    assert report.rule_matches == 1
+    assert report.moved == 0
+    assert report.results[0].matched_rule_id == "sender-route"
+    assert report.results[0].action_applied is False
+    assert report.results[1].decision_source == "spam"
+
+
+def test_first_matching_rule_wins():
+    mailbox = FakeMailbox(writable=True)
+    mailbox.items[0] = MailboxItem(
+        uid=1,
+        message=MailMessage(1, "delivery failure", "a@example.org", (), "", "body", from_address="a@example.org"),
+    )
+    rules = RuleSet(
+        (
+            MailRule(
+                "first-rule",
+                True,
+                ("Spam",),
+                MessageAction(ActionKind.KEEP),
+                RuleMatch(from_address="a@example.org"),
+            ),
+            MailRule(
+                "second-rule",
+                True,
+                ("Spam",),
+                MessageAction(ActionKind.MOVE, "INBOX.Trash"),
+                RuleMatch(from_address="a@example.org"),
+            ),
+        )
+    )
+
+    report = SpamCleaner(mailbox, FakeClassifier(), rules=rules).run(apply=True)
+
+    assert report.results[0].matched_rule_id == "first-rule"
+    assert report.results[0].action.action is ActionKind.KEEP
+    assert mailbox.moved == []
+    assert report.results[0].outcome is None
+
+
+def test_rule_matcher_error_fails_closed():
+    class BrokenRules:
+        def first_match(self, folder, message):
+            raise RuntimeError("private message contents")
+
+    mailbox = FakeMailbox(writable=True)
+    report = SpamCleaner(mailbox, FakeClassifier(), rules=BrokenRules()).run(apply=True)  # type: ignore[arg-type]
+
+    assert report.results[0].status == "error"
+    assert report.results[0].decision_source == "error"
+    assert report.results[0].action.action is ActionKind.KEEP
+    assert report.results[0].detail == "RuntimeError: rule evaluation failed"
+    assert mailbox.deleted == []
+    assert mailbox.moved == []
 
 def test_result_callback_fires_after_each_action_and_forwards_selection():
     events = []

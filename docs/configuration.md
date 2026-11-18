@@ -1,6 +1,6 @@
 # Configuration
 
-The default configuration path is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset. The IMAP password is never written to the file. `clean` and `doctor` request it once per invocation using hidden input.
+The default configuration path is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset. The separate rules file is named `rules.toml` beside the selected config file. The IMAP password is never written to the file. `clean` and `doctor` request it once per invocation using hidden input.
 
 ## Multi-folder routing example
 
@@ -46,6 +46,27 @@ trusted_spam_headers = []
 `folders` lists source mailboxes, not destinations. Sources are processed in listed order, one source-scoped IMAP session at a time. `--limit`, `--offset`, and `--sort` select messages independently in each source. UID values from different folders are not compared.
 
 Source mailbox names are exact and server-specific. Every configured source must exist and be selectable on the account. The example names above are not universal; imapledger does not normalize names or create source folders. `doctor` distinguishes a missing source from an existing source that cannot be selected.
+
+## Learned routing rules
+
+Routing rules are stored separately from this configuration in `rules.toml` beside the selected config file. The default path follows the same XDG configuration directory as `config.toml`. A rule source must be one of the configured `spam.folders`; rules cannot add folders to the scan. Rule move destinations must exist and cannot be configured source folders.
+
+The versioned format is:
+
+```toml
+[rules]
+schema = 1
+
+[[rules.rule]]
+id = "mailer-daemon-gmx-net"
+enabled = true
+source_folders = ["INBOX.Junk"]
+action = "move"
+destination = "INBOX.Trash"
+match = { from_address = "mailer-daemon@gmx.net" }
+```
+
+Rules support only `keep` and `move`. Matcher fields are combined with AND, and the first enabled match in file order wins. Supported fields are `from_address`, `from_domain`, `return_path`, `return_path_domain`, `list_id`, `auto_submitted`, `subject`, and `subject_prefix`. The file is strictly validated and written atomically with restrictive permissions. See [Learned routing rules](rules.md) for matching details and the command workflow.
 
 ## Outcome actions
 

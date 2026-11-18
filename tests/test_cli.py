@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 
+import pyjev
 import pytest
 from rich.console import Console
 from typer.testing import CliRunner
@@ -21,14 +22,19 @@ from imapledger.config import (
 from imapledger.mailbox import (
     FolderInfo,
     ImapOperationError,
+    MailboxItem,
     MailboxProbe,
     MessageSelection,
     MessageSort,
+    MoveResult,
     PartialDeleteError,
     PartialMoveError,
     ScopedMailbox,
 )
+from imapledger.message import MailMessage
 from imapledger.policy import SpamVerdict
+from imapledger.rule_learning import RuleCandidate, RuleProposal
+from imapledger.rules import MailRule, RuleMatch, RuleSet
 
 
 class FailingMailbox:
@@ -55,6 +61,7 @@ def test_clean_debug_error_is_phase_aware_and_hides_exception_payload(monkeypatc
         spam=SpamSettings(folders=("Spam",)),
     )
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
     monkeypatch.setattr(cli, "ScopedMailbox", FailingMailbox)
 
@@ -134,12 +141,13 @@ def _configure_clean(monkeypatch, report, output):
     observed = {}
     monkeypatch.setattr(cli, "console", Console(file=output, width=200))
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
     monkeypatch.setattr(cli, "ScopedMailbox", lambda **kwargs: mailbox)
     monkeypatch.setattr(cli, "PyJevSpamClassifier", CleanFakeClassifier)
 
     class FakeCleaner:
-        def __init__(self, mailbox, classifier, *, policy, actions=None):
+        def __init__(self, mailbox, classifier, *, policy, actions=None, rules=None):
             pass
 
         def run(self, *, apply, selection, on_result):
@@ -237,6 +245,33 @@ def test_clean_rejects_invalid_selection_options(arguments):
     assert result.exit_code != 0
 
 
+def test_rule_clean_output_shows_action_and_rule_without_spam_signals(monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
+    row = MessageResult(
+        uid=43627,
+        subject="Delivery failed",
+        sender="mailer-daemon@gmx.net",
+        verdict=None,
+        signals=None,
+        reasons=("rule:mailer-daemon-gmx-net",),
+        status="rule",
+        inclination="RULE",
+        action=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
+        decision_source="rule",
+        matched_rule_id="mailer-daemon-gmx-net",
+    )
+
+    cli._print_result(row, position=8, total=10, apply=False)
+
+    rendered = output.getvalue()
+    assert "[8/10] UID 43627  Action=WOULD MOVE -> INBOX.Trash" in rendered
+    assert "Rule=mailer-daemon-gmx-net" in rendered
+    assert "Outcome=" not in rendered
+    assert "Verdict=" not in rendered
+    assert "Signals=" not in rendered
+
+
 def test_clean_streams_decisions_once_with_summary(monkeypatch):
     output = StringIO()
     report = _stream_report()
@@ -256,7 +291,7 @@ def test_clean_streams_decisions_once_with_summary(monkeypatch):
     assert rendered.count("spam-subject") == 1
     assert "token=secret" not in rendered
     assert "/path" not in rendered
-    assert "Scanned 4; spam 1; not-spam 1; review 0; skipped 1; errors 1." in rendered
+    assert "Scanned 4; rules 0; spam 1; not-spam 1; review 0; skipped 1; errors 1." in rendered
     assert "Actions: would delete 1; kept 3." in rendered
     assert "Dry-run only." in rendered
 
@@ -358,6 +393,7 @@ def _configure_doctor(monkeypatch, client, settings=None):
         )
     factory_options = {}
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
 
     def mailbox_factory(**kwargs):
@@ -664,7 +700,7 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
             return len(self.uids)
 
     class FakeCleaner:
-        def __init__(self, mailbox, classifier, *, policy, actions=None):
+        def __init__(self, mailbox, classifier, *, policy, actions=None, rules=None):
             pass
 
         def run(self, *, apply, selection, on_result):
@@ -676,6 +712,7 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
     output = StringIO()
     monkeypatch.setattr(cli, "console", Console(file=output, width=200))
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
     monkeypatch.setattr(cli, "ScopedMailbox", lambda **kwargs: Context())
     monkeypatch.setattr(cli, "PyJevSpamClassifier", CleanFakeClassifier)
@@ -761,6 +798,7 @@ def _install_multi_clean(
     report_factory=None,
     destination_exists=True,
     preflight_failure_folder=None,
+    rules=None,
 ):
     state = {
         "prompts": [],
@@ -772,6 +810,7 @@ def _install_multi_clean(
     }
     monkeypatch.setattr(cli, "console", Console(file=output, width=200))
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: rules if rules is not None else RuleSet())
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: state["prompts"].append(prompt) or "secret")
 
     class FakeMailbox:
@@ -828,8 +867,9 @@ def _install_multi_clean(
     monkeypatch.setattr(cli, "PyJevSpamClassifier", CountingClassifier)
 
     class FakeCleaner:
-        def __init__(self, mailbox, classifier, *, policy, actions):
+        def __init__(self, mailbox, classifier, *, policy, actions, rules=None):
             self.mailbox = mailbox
+            self.rules = rules
             self.classifier = classifier
             self.actions = actions
 
@@ -904,7 +944,30 @@ def test_clean_visits_multiple_folders_in_order_with_one_password_and_classifier
     assert "folder=INBOX.Junk messages=30 selected=10 sort=newest offset=10 limit=10" in rendered
     assert "folder=INBOX.Spam messages=30 selected=10 sort=newest offset=10 limit=10" in rendered
     assert rendered.count("WOULD MOVE -> INBOX.Trash") == 2
-    assert "Aggregate across 2 folders (UIDs remain folder-scoped): scanned 2; spam 2;" in rendered
+    assert "Aggregate across 2 folders (UIDs remain folder-scoped): scanned 2; rules 0; spam 2;" in rendered
+
+
+def test_clean_apply_preflights_and_allows_rule_destinations(monkeypatch):
+    output = StringIO()
+    rules = RuleSet(
+        (
+            MailRule(
+                "learned-route",
+                True,
+                ("INBOX.Junk",),
+                MessageAction(ActionKind.MOVE, "INBOX.RuleTrash"),
+                RuleMatch(from_address="mailer@example.org"),
+            ),
+        )
+    )
+    state = _install_multi_clean(monkeypatch, _multi_folder_settings(), output, rules=rules)
+
+    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
+
+    assert result.exit_code == 0, result.output
+    assert all("INBOX.RuleTrash" in mailbox.kwargs["allowed_destinations"] for mailbox in state["mailboxes"])
+    for folder in ("INBOX.Junk", "INBOX.Spam"):
+        assert ("destination", folder, "INBOX.RuleTrash") in state["events"]
 
 
 def test_clean_apply_preflights_each_destination_before_classifying(monkeypatch):
@@ -1038,6 +1101,7 @@ def test_doctor_checks_all_source_folders_capabilities_and_destinations(monkeypa
     output = StringIO()
     monkeypatch.setattr(cli, "console", Console(file=output, width=200))
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: prompts.append(prompt) or "secret")
     monkeypatch.setattr(cli, "PyJevSpamClassifier", lambda **kwargs: pytest.fail("doctor constructed classifier"))
 
@@ -1083,6 +1147,7 @@ def test_doctor_reports_missing_preconditions_for_each_folder_and_continues(monk
     output = StringIO()
     monkeypatch.setattr(cli, "console", Console(file=output, width=200))
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: prompts.append(prompt) or "secret")
 
     class DoctorScope:
@@ -1339,3 +1404,265 @@ def test_folders_renders_server_names_as_plain_text(monkeypatch):
 
     assert result.exit_code == 0
     assert name in output.getvalue()
+
+
+
+def _routing_settings() -> Settings:
+    return Settings(
+        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
+        spam=SpamSettings(folders=("INBOX.Junk",)),
+    )
+
+
+def _routing_rule() -> MailRule:
+    return MailRule(
+        id="mailer-daemon-gmx-net",
+        enabled=True,
+        source_folders=("INBOX.Junk",),
+        action=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
+        match=RuleMatch(from_address="mailer-daemon@gmx.net"),
+    )
+
+
+def _routing_message(uid: int = 43627, *, address: str = "mailer-daemon@gmx.net") -> MailMessage:
+    return MailMessage(
+        uid=uid,
+        subject="Ihre E-Mail konnte nicht zugestellt werden",
+        sender=f"Mailer Daemon <{address}>",
+        recipients=(),
+        date="",
+        body="private message body",
+        from_display_name="Mailer Daemon",
+        from_address=address,
+    )
+
+
+def _install_rule_learn(monkeypatch, tmp_path, *, destination_exists=True):
+    state = {"prompts": [], "writes": [], "events": [], "fetches": [], "moves": []}
+    settings = _routing_settings()
+    candidate = RuleCandidate(
+        "from_address_exact",
+        RuleMatch(from_address="mailer-daemon@gmx.net"),
+        'from=mailer-daemon@gmx.net',
+        True,
+        100,
+    )
+    proposal = RuleProposal(candidate, "auto", 0.96, 0.98, "model-test", "request-test")
+    message = _routing_message()
+
+    class FakeJev:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    class FakeMailbox:
+        def __init__(self, **kwargs):
+            state["mailbox_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def destination_exists(self, destination):
+            state["destination"] = destination
+            return destination_exists
+
+        def fetch_uid(self, uid):
+            state["fetches"].append(uid)
+            return MailboxItem(uid, message)
+
+        def move_uid(self, uid, destination):
+            state["events"].append("move")
+            state["moves"].append((uid, destination))
+            return MoveResult((uid,), destination)
+
+        def selected_count(self, selection):
+            return 2
+
+        def iter_messages(self, selection):
+            yield MailboxItem(43627, message)
+            yield MailboxItem(43628, _routing_message(43628, address="other@example.org"))
+
+    output = StringIO()
+    state["output"] = output
+    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
+    monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: state["prompts"].append(prompt) or "secret")
+    monkeypatch.setattr(cli, "ScopedMailbox", FakeMailbox)
+    monkeypatch.setattr(cli, "learn_rule_proposal", lambda jev, **kwargs: proposal)
+    monkeypatch.setattr(pyjev, "Jev", FakeJev)
+
+    def write(rules, path):
+        state["events"].append("save")
+        state["writes"].append((rules, path))
+        return path
+
+    monkeypatch.setattr(cli, "write_rules", write)
+    return state, proposal
+
+
+def _learn_args(tmp_path, *extra):
+    return [
+        "rule",
+        "learn",
+        "43627",
+        "--folder",
+        "INBOX.Junk",
+        "--move",
+        "INBOX.Trash",
+        "--config",
+        str(tmp_path / "config.toml"),
+        *extra,
+    ]
+
+
+def test_rule_help_and_learn_require_folder():
+    runner = CliRunner()
+    help_result = runner.invoke(cli.app, ["rule", "--help"])
+    missing_folder = runner.invoke(cli.app, ["rule", "learn", "43627", "--move", "INBOX.Trash"])
+
+    assert help_result.exit_code == 0
+    assert all(name in help_result.output for name in ("learn", "list", "show", "remove", "test"))
+    assert missing_folder.exit_code == 2
+    assert "--folder" in missing_folder.output
+
+
+def test_rule_learn_validates_uid_and_configured_source_before_password(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "load_settings", lambda path: _routing_settings())
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: pytest.fail("validation prompted for a password"))
+    runner = CliRunner()
+    invalid_uid = runner.invoke(
+        cli.app,
+        ["rule", "learn", "0", "--folder", "INBOX.Junk", "--move", "INBOX.Trash"],
+    )
+    unconfigured_folder = runner.invoke(
+        cli.app,
+        ["rule", "learn", "43627", "--folder", "INBOX", "--move", "INBOX.Trash"],
+    )
+
+    assert invalid_uid.exit_code == 2
+    assert "positive integer" in invalid_uid.output
+    assert unconfigured_folder.exit_code == 2
+    assert "not configured in spam.folders" in unconfigured_folder.output
+
+
+def test_rule_learn_destination_preflight_failure_does_not_fetch_or_save(monkeypatch, tmp_path):
+    state, _ = _install_rule_learn(monkeypatch, tmp_path, destination_exists=False)
+
+    result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--yes"))
+
+    assert result.exit_code == 1
+    assert state["destination"] == "INBOX.Trash"
+    assert state["fetches"] == []
+    assert state["writes"] == []
+
+
+def test_rule_learn_yes_saves_read_only_without_moving_current_uid(monkeypatch, tmp_path):
+    state, _ = _install_rule_learn(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--yes"))
+
+    assert result.exit_code == 0, result.output
+    assert state["mailbox_kwargs"]["writable"] is False
+    assert state["fetches"] == [43627]
+    assert state["moves"] == []
+    assert len(state["writes"]) == 1
+    assert state["writes"][0][0].rules[0].id == "mailer-daemon-gmx-net"
+    assert "Jev confidence: 0.96" in state["output"].getvalue()
+    assert "Generalization safety: 0.98" in state["output"].getvalue()
+    assert "Saved rule mailer-daemon-gmx-net" in state["output"].getvalue()
+
+
+def test_rule_learn_preview_does_not_save_even_with_yes(monkeypatch, tmp_path):
+    state, _ = _install_rule_learn(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--preview", "--yes"))
+
+    assert result.exit_code == 0, result.output
+    assert state["writes"] == []
+    assert state["moves"] == []
+    assert "Preview only. No rule was saved." in state["output"].getvalue()
+
+
+def test_rule_learn_preview_and_apply_current_are_rejected_before_password(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: pytest.fail("contradictory options prompted"))
+
+    result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--preview", "--apply-current"))
+
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.output
+
+
+def test_rule_learn_confirmation_defaults_to_no(monkeypatch, tmp_path):
+    state, _ = _install_rule_learn(monkeypatch, tmp_path)
+    confirmations = []
+    monkeypatch.setattr(cli.typer, "confirm", lambda prompt, *, default: confirmations.append(default) or False)
+
+    result = CliRunner().invoke(cli.app, _learn_args(tmp_path))
+
+    assert result.exit_code == 0
+    assert confirmations == [False]
+    assert state["writes"] == []
+    assert state["moves"] == []
+    assert "No rule was saved." in state["output"].getvalue()
+
+
+def test_rule_learn_apply_current_saves_before_exact_uid_move(monkeypatch, tmp_path):
+    state, _ = _install_rule_learn(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--yes", "--apply-current"))
+
+    assert result.exit_code == 0, result.output
+    assert state["mailbox_kwargs"]["writable"] is True
+    assert state["events"] == ["save", "move"]
+    assert state["moves"] == [(43627, "INBOX.Trash")]
+    assert "MOVED current UID 43627 -> INBOX.Trash" in state["output"].getvalue()
+
+
+def test_rule_list_show_remove_do_not_prompt_for_password(monkeypatch, tmp_path):
+    rule = _routing_rule()
+    monkeypatch.setattr(cli, "load_rules", lambda path: RuleSet((rule,)))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: pytest.fail("management command prompted"))
+    removed = []
+    monkeypatch.setattr(cli, "write_rules", lambda rules, path: removed.append(rules))
+    output = StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
+
+    listed = CliRunner().invoke(cli.app, ["rule", "list", "--config", str(tmp_path / "config.toml")])
+    shown = CliRunner().invoke(
+        cli.app,
+        ["rule", "show", rule.id, "--config", str(tmp_path / "config.toml")],
+    )
+    deleted = CliRunner().invoke(
+        cli.app,
+        ["rule", "remove", rule.id, "--yes", "--config", str(tmp_path / "config.toml")],
+    )
+
+    assert listed.exit_code == 0 and rule.id in output.getvalue()
+    assert shown.exit_code == 0 and "from_address: mailer-daemon@gmx.net" in output.getvalue()
+    assert deleted.exit_code == 0 and f"Removed rule {rule.id}" in output.getvalue()
+    assert len(removed) == 1 and removed[0].rules == ()
+
+
+def test_rule_test_is_bounded_read_only_and_never_constructs_classifier(monkeypatch, tmp_path):
+    rule = _routing_rule()
+    state, _ = _install_rule_learn(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet((rule,)))
+    monkeypatch.setattr(cli, "PyJevSpamClassifier", lambda **kwargs: pytest.fail("rule test ran spam classifier"))
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["rule", "test", rule.id, "--limit", "2", "--config", str(tmp_path / "config.toml")],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert state["mailbox_kwargs"]["writable"] is False
+    assert "allowed_destinations" not in state["mailbox_kwargs"]
+    assert "UID 43627 MATCH" in state["output"].getvalue()
+    assert "UID 43628 MATCH" not in state["output"].getvalue()
+    assert "Read-only; no actions were executed." in state["output"].getvalue()

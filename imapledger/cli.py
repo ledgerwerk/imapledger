@@ -10,7 +10,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .classifier import PyJevSpamClassifier
-from .cleaner import CleanReport, MessageResult, SpamCleaner, SpamOutcome
+from .cleaner import CleanReport, MessageResult, SpamCleaner
 from .config import (
     ActionKind,
     ConfigError,
@@ -36,10 +36,23 @@ from .mailbox import (
     ScopedMailbox,
 )
 from .preflight import preflight_source
+from .rule_learning import RuleProposal, build_rule_candidates, learn_rule_proposal
+from .rules import (
+    RuleError,
+    RuleSet,
+    describe_match,
+    generate_rule_id,
+    load_rules,
+    rules_path_for_config,
+    validate_rule_id,
+    write_rules,
+)
 
 app = typer.Typer(no_args_is_help=True, help="Security-scoped IMAP automation.")
 config_app = typer.Typer(help="Inspect imapledger configuration.")
 app.add_typer(config_app, name="config")
+rule_app = typer.Typer(help="Learn and manage deterministic message routing rules.")
+app.add_typer(rule_app, name="rule")
 console = Console()
 err_console = Console(stderr=True)
 
@@ -100,6 +113,320 @@ def init_config(
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"Wrote {path}")
     console.print("No IMAP password was stored.")
+
+
+@rule_app.command("list")
+def rule_list(
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """List locally stored routing rules without connecting to IMAP."""
+    try:
+        rules = load_rules(rules_path_for_config(config))
+    except RuleError as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    if not rules.rules:
+        console.print("No routing rules.", markup=False)
+        return
+
+    table = Table(title="Routing rules")
+    table.add_column("ID")
+    table.add_column("Enabled")
+    table.add_column("Sources")
+    table.add_column("Match")
+    table.add_column("Action")
+    for rule in rules.rules:
+        action = "keep" if rule.action.action is ActionKind.KEEP else f"move -> {rule.action.destination}"
+        table.add_row(
+            rule.id,
+            "yes" if rule.enabled else "no",
+            ", ".join(rule.source_folders),
+            describe_match(rule.match),
+            action,
+        )
+    console.print(table, markup=False)
+
+
+@rule_app.command("show")
+def rule_show(
+    rule_id: str = typer.Argument(..., help="Rule ID"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """Show one locally stored routing rule without connecting to IMAP."""
+    try:
+        rules = load_rules(rules_path_for_config(config))
+    except RuleError as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    rule = next((item for item in rules.rules if item.id == rule_id), None)
+    if rule is None:
+        err_console.print(f"Rule not found: {rule_id}", markup=False)
+        raise typer.Exit(2)
+    console.print(f"id: {rule.id}", markup=False)
+    console.print(f"enabled: {str(rule.enabled).lower()}", markup=False)
+    console.print("sources:", markup=False)
+    for folder in rule.source_folders:
+        console.print(f"  - {folder}", markup=False)
+    console.print("match:", markup=False)
+    for key, value in rule.match.as_dict().items():
+        console.print(f"  {key}: {_safe_text(value)}", markup=False)
+    if rule.action.action is ActionKind.KEEP:
+        console.print("action: keep", markup=False)
+    else:
+        console.print(f"action: move -> {rule.action.destination}", markup=False)
+
+
+@rule_app.command("remove")
+def rule_remove(
+    rule_id: str = typer.Argument(..., help="Rule ID"),
+    yes: bool = typer.Option(False, "--yes", help="Remove without confirmation"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """Remove a locally stored routing rule without connecting to IMAP."""
+    path = rules_path_for_config(config)
+    try:
+        rules = load_rules(path)
+    except RuleError as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    if not any(rule.id == rule_id for rule in rules.rules):
+        err_console.print(f"Rule not found: {rule_id}", markup=False)
+        raise typer.Exit(2)
+    if not yes and not typer.confirm(f"Remove rule {rule_id}?", default=False):
+        console.print("No rule was removed.", markup=False)
+        return
+    try:
+        write_rules(RuleSet(tuple(rule for rule in rules.rules if rule.id != rule_id)), path)
+    except RuleError as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(1) from exc
+    console.print(f"Removed rule {rule_id}", markup=False)
+
+
+@rule_app.command("learn")
+def rule_learn(
+    uid: int = typer.Argument(..., help="Folder-scoped message UID to learn from"),
+    folder: str = typer.Option(..., "--folder", help="Configured source folder containing the UID"),
+    move: str = typer.Option(..., "--move", help="Explicit move destination for the learned rule"),
+    name: str | None = typer.Option(None, "--name", help="Optional safe rule ID"),
+    preview: bool = typer.Option(False, "--preview", help="Show a proposal without saving it"),
+    yes: bool = typer.Option(False, "--yes", help="Accept the proposed rule without prompting"),
+    apply_current: bool = typer.Option(
+        False,
+        "--apply-current",
+        help="Move the referenced UID after the rule is successfully saved",
+    ),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """Learn a narrow routing rule from one explicitly scoped message UID."""
+    if uid < 1:
+        raise typer.BadParameter("UID must be a positive integer")
+    if preview and apply_current:
+        raise typer.BadParameter("--preview cannot be combined with --apply-current")
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    if folder not in settings.spam.folders:
+        err_console.print(f"Source folder is not configured in spam.folders: {folder}", markup=False)
+        raise typer.Exit(2)
+    if move in settings.spam.folders:
+        err_console.print("Move destination must not be a configured spam source folder.", markup=False)
+        raise typer.Exit(2)
+    rules_path = rules_path_for_config(config)
+    try:
+        existing = load_rules(rules_path, source_folders=settings.spam.folders)
+        if name is not None:
+            validate_rule_id(name)
+    except RuleError as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+
+    password = getpass.getpass("IMAP password: ")
+    if not password:
+        err_console.print("Empty password; aborting.", markup=False)
+        raise typer.Exit(2)
+    rule_saved = False
+    try:
+        with ScopedMailbox(
+            host=settings.imap.host,
+            port=settings.imap.port,
+            username=settings.imap.username,
+            password=password,
+            folder=folder,
+            writable=apply_current,
+            max_message_bytes=settings.spam.max_message_bytes,
+            max_body_chars=settings.spam.max_body_chars,
+            allowed_destinations=(move,),
+            allow_delete=False,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+        ) as mailbox:
+            if not mailbox.destination_exists(move):
+                err_console.print(f"Move destination does not exist: {move}", markup=False)
+                raise typer.Exit(1)
+            item = mailbox.fetch_uid(uid)
+            if item.message is None:
+                err_console.print(
+                    f"Could not read UID {uid}: {item.skip_reason or 'message unavailable'}",
+                    markup=False,
+                )
+                raise typer.Exit(1)
+            message = item.message
+            candidates = build_rule_candidates(message)
+            from pyjev import Jev
+
+            with Jev() as jev:
+                proposal = learn_rule_proposal(
+                    jev,
+                    message=message,
+                    candidates=candidates,
+                    requested_action=MessageAction(ActionKind.MOVE, move),
+                )
+
+            console.print(f"example {folder} UID {uid}", markup=False)
+            console.print(f"From: {_safe_text(message.sender)}", markup=False)
+            console.print(f"Subject: {_safe_text(message.subject)}", markup=False)
+            _print_rule_proposal(proposal)
+            if proposal.status != "auto" or proposal.candidate is None:
+                console.print("No rule was saved.", markup=False)
+                raise typer.Exit(2)
+
+            rule_id = name or generate_rule_id(proposal.candidate.match, [rule.id for rule in existing.rules])
+            proposed = proposal.to_rule(
+                id=rule_id,
+                source_folders=(folder,),
+                action=MessageAction(ActionKind.MOVE, move),
+            )
+            console.print(f"Proposed rule: {proposed.id}", markup=False)
+            console.print(f"  source: {folder}", markup=False)
+            console.print(f"  match: {describe_match(proposed.match)}", markup=False)
+            console.print(f"  action: move -> {move}", markup=False)
+            if preview:
+                console.print("Preview only. No rule was saved.", markup=False)
+                return
+
+            for current in existing.rules:
+                if current.source_folders != proposed.source_folders or current.match != proposed.match:
+                    continue
+                if current.action == proposed.action:
+                    console.print(f"Equivalent rule already exists: {current.id}", markup=False)
+                    console.print("No rule was added.", markup=False)
+                    return
+                err_console.print(
+                    "A rule with the same matcher and scope already exists with a different action:",
+                    markup=False,
+                )
+                existing_action = (
+                    "keep"
+                    if current.action.action is ActionKind.KEEP
+                    else f"move -> {current.action.destination}"
+                )
+                err_console.print(f"  existing: {existing_action}", markup=False)
+                err_console.print(f"  proposed: move -> {move}", markup=False)
+                err_console.print("No rule was changed.", markup=False)
+                raise typer.Exit(2)
+            if any(rule.id == proposed.id for rule in existing.rules):
+                err_console.print(f"Rule ID already exists: {proposed.id}", markup=False)
+                raise typer.Exit(2)
+            if not yes and not typer.confirm("Save rule?", default=False):
+                console.print("No rule was saved.", markup=False)
+                return
+            write_rules(RuleSet((*existing.rules, proposed)), rules_path)
+            rule_saved = True
+            console.print(f"Saved rule {proposed.id}", markup=False)
+            console.print(f"rules: {rules_path}", markup=False)
+            if apply_current:
+                result = mailbox.move_uid(uid, move)
+                if uid not in result.moved:
+                    raise MailboxError("current UID move was not confirmed")
+                console.print(f"MOVED current UID {uid} -> {move}", markup=False)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        if apply_current and rule_saved:
+            err_console.print("The rule was saved, but applying it to the current UID failed.", markup=False)
+        _print_failure(exc, debug=False, command="rule learn")
+        raise typer.Exit(1) from exc
+    finally:
+        password = ""
+
+
+def _print_rule_proposal(proposal: RuleProposal) -> None:
+    if proposal.candidate is not None:
+        console.print("Candidate selected:", markup=False)
+        console.print(f"  {proposal.candidate.description}", markup=False)
+    if proposal.candidate_confidence is not None:
+        console.print(f"Jev confidence: {proposal.candidate_confidence:.2f}", markup=False)
+    if proposal.safe_probability is not None:
+        console.print(f"Generalization safety: {proposal.safe_probability:.2f}", markup=False)
+    if proposal.status == "none":
+        console.print("Could not derive a sufficiently safe rule.", markup=False)
+    elif proposal.status == "review":
+        console.print("The candidate did not meet the automatic acceptance thresholds.", markup=False)
+
+
+@rule_app.command("test")
+def rule_test(
+    rule_id: str = typer.Argument(..., help="Rule ID to test"),
+    limit: int = typer.Option(20, min=1, help="Maximum messages inspected per source folder"),
+    offset: int = typer.Option(0, min=0, help="Skip this many messages in each source folder"),
+    sort: MessageSort = typer.Option(MessageSort.NEWEST, "--sort", help="Mailbox-local UID ordering"),  # noqa: B008
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """Inspect a bounded read-only window for messages matching one routing rule."""
+    try:
+        settings = load_settings(config)
+        rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    except RuleError as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    rule = next((item for item in rules.rules if item.id == rule_id), None)
+    if rule is None:
+        err_console.print(f"Rule not found: {rule_id}", markup=False)
+        raise typer.Exit(2)
+    selection = MessageSelection(limit=limit, offset=offset, sort=sort)
+    password = getpass.getpass("IMAP password: ")
+    if not password:
+        err_console.print("Empty password; aborting.", markup=False)
+        raise typer.Exit(2)
+    try:
+        for folder in rule.source_folders:
+            with ScopedMailbox(
+                host=settings.imap.host,
+                port=settings.imap.port,
+                username=settings.imap.username,
+                password=password,
+                folder=folder,
+                writable=False,
+                max_message_bytes=settings.spam.max_message_bytes,
+                max_body_chars=settings.spam.max_body_chars,
+                event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+            ) as mailbox:
+                inspected = mailbox.selected_count(selection)
+                console.print(f"rule={rule.id} source={folder} inspected={inspected}", markup=False)
+                matched = 0
+                for item in mailbox.iter_messages(selection):
+                    if item.message is None or not rule.match.matches(item.message):
+                        continue
+                    matched += 1
+                    console.print(
+                        f"[{matched}] UID {item.uid} MATCH From={_safe_text(item.message.sender)} "
+                        f"Subject={_safe_text(item.message.subject)}",
+                        markup=False,
+                    )
+                console.print(f"Matched {matched} in inspected window.", markup=False)
+    except Exception as exc:
+        _print_failure(exc, debug=False, command="rule test")
+        raise typer.Exit(1) from exc
+    finally:
+        password = ""
+    console.print("Read-only; no actions were executed.", markup=False)
 
 
 @app.command()
@@ -212,13 +539,18 @@ def doctor(
         raise typer.Exit(2) from exc
     console.print("config: OK")
 
+    try:
+        rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
+    except RuleError as exc:
+        err_console.print(f"[red]Rules error:[/red] {exc}")
+        raise typer.Exit(2) from exc
     password = getpass.getpass("IMAP password: ")
     if not password:
         err_console.print("[red]Empty password; aborting.[/red]")
         raise typer.Exit(2)
 
     actions = settings.spam.actions
-    destinations = _move_destinations(actions)
+    destinations = _move_destinations(actions, rules)
     requires_delete = any(
         action.action is ActionKind.DELETE for action in (actions.spam, actions.not_spam, actions.review)
     )
@@ -333,6 +665,11 @@ def clean(
         err_console.print(f"[red]Configuration error:[/red] {exc}")
         raise typer.Exit(2) from exc
 
+    try:
+        rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
+    except RuleError as exc:
+        err_console.print(f"[red]Rules error:[/red] {exc}")
+        raise typer.Exit(2) from exc
     password = getpass.getpass("IMAP password: ")
     if not password:
         err_console.print("[red]Empty password; aborting.[/red]")
@@ -340,7 +677,7 @@ def clean(
 
     selection = MessageSelection(limit=limit, offset=offset, sort=sort)
     actions = settings.spam.actions
-    destinations = _move_destinations(actions)
+    destinations = _move_destinations(actions, rules)
     allow_delete = any(
         action.action is ActionKind.DELETE for action in (actions.spam, actions.not_spam, actions.review)
     )
@@ -415,6 +752,7 @@ def clean(
                             classifier,
                             policy=settings.spam.policy,
                             actions=actions,
+                            rules=rules,
                         ).run(
                             apply=apply,
                             selection=selection,
@@ -466,13 +804,15 @@ def _selection_summary(
     )
 
 
-def _move_destinations(actions: SpamActions) -> tuple[str, ...]:
-    destinations = []
-    for action in (actions.spam, actions.not_spam, actions.review):
-        if action.action is ActionKind.MOVE and action.destination is not None:
-            if action.destination not in destinations:
-                destinations.append(action.destination)
-    return tuple(destinations)
+def _move_destinations(actions: SpamActions, rules: RuleSet | None = None) -> tuple[str, ...]:
+    destinations = [
+        action.destination
+        for action in (actions.spam, actions.not_spam, actions.review)
+        if action.action is ActionKind.MOVE and action.destination is not None
+    ]
+    if rules is not None:
+        destinations.extend(rules.move_destinations())
+    return tuple(dict.fromkeys(destinations))
 
 
 def _signal_summary(row: MessageResult) -> str:
@@ -498,6 +838,14 @@ def _print_result(
     apply: bool,
 ) -> None:
     action = _final_action_label(row, apply=apply)
+    if row.matched_rule_id is not None:
+        details = f"  Detail={row.detail}" if row.detail else ""
+        console.print(
+            f"[{position}/{total}] UID {row.uid}  Action={action}  Rule={row.matched_rule_id}  "
+            f"From={_safe_text(row.sender)}  Subject={_safe_text(row.subject)}{details}",
+            markup=False,
+        )
+        return
     reasons = ",".join(row.reasons) or (row.detail or "-")
     verdict = row.verdict.name if row.verdict else "-"
     outcome = row.outcome.value.upper() if row.outcome else "-"
@@ -546,14 +894,15 @@ def _final_action_label(row: MessageResult, *, apply: bool) -> str:
 
 def _action_summary(report: CleanReport) -> str:
     counts: dict[tuple[ActionKind, str | None], int] = {}
-    for outcome in (SpamOutcome.SPAM, SpamOutcome.NOT_SPAM, SpamOutcome.REVIEW):
-        for row in report.results:
-            if row.outcome is not outcome or row.action.action is ActionKind.KEEP:
-                continue
-            if report.apply and not row.action_applied:
-                continue
-            key = (row.action.action, row.action.destination)
-            counts[key] = counts.get(key, 0) + 1
+    for row in report.results:
+        if row.action.action is ActionKind.KEEP:
+            continue
+        if row.decision_source != "rule" and row.outcome is None:
+            continue
+        if report.apply and not row.action_applied:
+            continue
+        key = (row.action.action, row.action.destination)
+        counts[key] = counts.get(key, 0) + 1
 
     actions = []
     for (kind, destination), count in counts.items():
@@ -569,7 +918,8 @@ def _action_summary(report: CleanReport) -> str:
 
 def _print_summary(report: CleanReport) -> None:
     console.print(
-        f"Scanned {report.scanned}; spam {report.spam}; not-spam {report.not_spam}; review {report.review}; "
+        f"Scanned {report.scanned}; rules {report.rule_matches}; spam {report.spam}; "
+        f"not-spam {report.not_spam}; review {report.review}; "
         f"skipped {report.skipped}; errors {report.errors}."
     )
     console.print(_action_summary(report))
@@ -592,6 +942,7 @@ def _print_aggregate_summary(reports: list[CleanReport]) -> None:
     console.print(
         f"Aggregate across {len(reports)} folders (UIDs remain folder-scoped): "
         f"scanned {sum(report.scanned for report in reports)}; "
+        f"rules {sum(report.rule_matches for report in reports)}; "
         f"spam {sum(report.spam for report in reports)}; "
         f"not-spam {sum(report.not_spam for report in reports)}; "
         f"review {sum(report.review for report in reports)}; "
@@ -646,6 +997,7 @@ def _print_report(report: CleanReport) -> None:
     table.add_column("Signals")
     table.add_column("Reasons")
     table.add_column("Action")
+    table.add_column("Rule")
     table.add_column("From")
     table.add_column("Subject")
     table.add_column("Detail")
@@ -658,6 +1010,7 @@ def _print_report(report: CleanReport) -> None:
             _signal_summary(row),
             ",".join(row.reasons) or "-",
             _final_action_label(row, apply=report.apply),
+            row.matched_rule_id or "-",
             _safe_text(row.sender),
             _safe_text(row.subject),
             row.detail or "",
