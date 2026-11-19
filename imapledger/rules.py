@@ -300,8 +300,8 @@ def write_rules(rules: RuleSet, path: Path | None = None) -> Path:
 
 
 def generate_rule_id(match: RuleMatch, existing_ids: tuple[str, ...] | list[str] = ()) -> str:
-    identity = match.from_address or match.list_id or match.return_path or next(
-        value for value in match.as_dict().values()
+    identity = (
+        match.from_address or match.list_id or match.return_path or next(value for value in match.as_dict().values())
     )
     base = re.sub(r"[^a-z0-9]+", "-", identity.casefold()).strip("-") or "rule"
     base = base[:64].rstrip("-") or "rule"

@@ -99,6 +99,6 @@ Use `rule test` to inspect a bounded window from the rule's source folders:
 imapledger rule test mailer-daemon-gmx-net --limit 20 --offset 0 --sort newest
 ```
 
-The default limit is 20 messages per source folder. `--offset` and `--sort` are also applied independently to each source. The command connects read-only, reports matching UIDs with sender and subject, and does not classify, move, delete, or otherwise mutate messages. It prompts for the IMAP password because it reads messages from the server.
+The default limit is 20 messages per source folder. `--offset` and `--sort` are also applied independently to each source. The command connects read-only, reports matching UIDs with sender and subject, and does not classify, move, delete, or otherwise mutate messages. It resolves the configured credential source once; the default `prompt` source asks for the IMAP password.
 
 See [Cleaning and diagnostics](cleaning.md) for rule precedence during `clean`, and [Configuration](configuration.md) for the full configuration and routing model.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import getpass
 import traceback
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 
 import typer
@@ -13,7 +14,9 @@ from .classifier import PyJevSpamClassifier
 from .cleaner import CleanReport, MessageResult, SpamCleaner
 from .config import (
     ActionKind,
+    AuthSource,
     ConfigError,
+    ImapAuthSettings,
     ImapSettings,
     MessageAction,
     Settings,
@@ -24,6 +27,15 @@ from .config import (
     load_settings,
     render_settings,
     write_settings,
+)
+from .credentials import (
+    CredentialError,
+    change_credential_vault_passphrase,
+    credential_status,
+    default_credential_vault_path,
+    delete_imap_credential,
+    resolve_credential,
+    store_imap_credential,
 )
 from .evidence import redact_urls
 from .mailbox import (
@@ -51,6 +63,8 @@ from .rules import (
 app = typer.Typer(no_args_is_help=True, help="Security-scoped IMAP automation.")
 config_app = typer.Typer(help="Inspect imapledger configuration.")
 app.add_typer(config_app, name="config")
+auth_app = typer.Typer(help="Store and inspect IMAP credentials.")
+app.add_typer(auth_app, name="auth")
 rule_app = typer.Typer(help="Learn and manage deterministic message routing rules.")
 app.add_typer(rule_app, name="rule")
 console = Console()
@@ -113,6 +127,220 @@ def init_config(
         raise typer.BadParameter(str(exc)) from exc
     console.print(f"Wrote {path}")
     console.print("No IMAP password was stored.")
+
+
+def _load_auth_settings(config: Path) -> Settings:
+    try:
+        return load_settings(config)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+
+def _write_auth_source(config: Path, settings: Settings, source: AuthSource) -> None:
+    updated = dataclass_replace(
+        settings,
+        imap=dataclass_replace(settings.imap, auth=ImapAuthSettings(source)),
+    )
+    try:
+        write_settings(updated, config, overwrite=True)
+    except ConfigError:
+        raise CredentialError("could not update config credential source") from None
+
+
+def _resolve_password(imap: ImapSettings) -> str:
+    try:
+        return resolve_credential(imap).password
+    except CredentialError as exc:
+        err_console.print(f"Credential error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+
+
+@auth_app.command("set")
+def auth_set(
+    storage: str = typer.Option(
+        "keyring",
+        "--storage",
+        help="Credential storage: keyring or vault (encrypted-file alias)",
+    ),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """Store an IMAP password in the selected secure backend and update its source."""
+    if storage == "keyring":
+        source = AuthSource.KEYRING
+    elif storage in {"vault", "encrypted-file"}:
+        source = AuthSource.VAULT
+    else:
+        raise typer.BadParameter("storage must be keyring or vault")
+
+    settings = _load_auth_settings(config)
+    password = getpass.getpass("IMAP password: ")
+    if not password:
+        err_console.print("Credential error: empty IMAP password", markup=False)
+        raise typer.Exit(2)
+
+    vault_path = default_credential_vault_path() if source is AuthSource.VAULT else None
+    master_passphrase: str | None = None
+    confirmation = ""
+    if source is AuthSource.VAULT:
+        master_passphrase = getpass.getpass("Master passphrase: ")
+        if not master_passphrase:
+            password = ""
+            err_console.print("Credential error: empty credential vault passphrase", markup=False)
+            raise typer.Exit(2)
+        if vault_path is not None and not vault_path.exists():
+            confirmation = getpass.getpass("Confirm master passphrase: ")
+            if master_passphrase != confirmation:
+                password = ""
+                master_passphrase = ""
+                confirmation = ""
+                err_console.print("Credential error: credential vault passphrases did not match", markup=False)
+                raise typer.Exit(2)
+
+    try:
+        store_imap_credential(
+            settings.imap,
+            password,
+            source,
+            master_passphrase=master_passphrase,
+            vault_path=vault_path,
+        )
+    except CredentialError as exc:
+        err_console.print(f"Credential error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    finally:
+        password = ""
+        master_passphrase = ""
+        confirmation = ""
+
+    try:
+        _write_auth_source(config, settings, source)
+    except CredentialError as exc:
+        err_console.print(
+            f"Credential error: {exc}. Credential may already be stored in secure storage.",
+            markup=False,
+        )
+        raise typer.Exit(2) from exc
+
+    if source is AuthSource.KEYRING:
+        console.print("Stored IMAP credential in OS keyring.", markup=False)
+    else:
+        console.print(f"Stored encrypted IMAP credential in {vault_path}", markup=False)
+
+
+@auth_app.command("status")
+def auth_status(
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """Show the configured credential source and whether it contains this account."""
+    settings = _load_auth_settings(config)
+    imap = settings.imap
+    source = imap.auth.source
+    vault_path = default_credential_vault_path()
+    console.print(f"account: {imap.username} @ {imap.host}:{imap.port}", markup=False)
+    console.print(f"configured source: {source.value}", markup=False)
+
+    if source is AuthSource.VAULT and not vault_path.exists():
+        console.print("available credential: no", markup=False)
+        console.print(f"credential vault: {vault_path}", markup=False)
+        return
+
+    master_passphrase = None
+    if source is AuthSource.VAULT:
+        master_passphrase = getpass.getpass("Master passphrase: ")
+    try:
+        status = credential_status(
+            imap,
+            master_passphrase=master_passphrase,
+            vault_path=vault_path,
+        )
+    except CredentialError as exc:
+        err_console.print(f"Credential error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    finally:
+        master_passphrase = ""
+
+    if source is AuthSource.PROMPT:
+        console.print("available credential: prompt required", markup=False)
+    else:
+        console.print(f"available credential: {'yes' if status.available else 'no'}", markup=False)
+    if status.backend_name is not None:
+        console.print(f"keyring backend: {status.backend_name}", markup=False)
+    if source is AuthSource.VAULT:
+        console.print(f"credential vault: {vault_path}", markup=False)
+
+
+@auth_app.command("delete")
+def auth_delete(
+    yes: bool = typer.Option(False, "--yes", help="Delete without confirmation"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """Delete this account's stored credential and return configuration to prompt mode."""
+    settings = _load_auth_settings(config)
+    source = settings.imap.auth.source
+    if source is AuthSource.PROMPT:
+        console.print("No stored IMAP credential is configured.", markup=False)
+        return
+    if not yes and not typer.confirm(
+        f"Delete the {source.value} credential for this IMAP account?",
+        default=False,
+    ):
+        console.print("No credential was deleted.", markup=False)
+        return
+
+    vault_path = default_credential_vault_path() if source is AuthSource.VAULT else None
+    master_passphrase = None
+    if source is AuthSource.VAULT:
+        master_passphrase = getpass.getpass("Master passphrase: ")
+
+    try:
+        deleted = delete_imap_credential(
+            settings.imap,
+            master_passphrase=master_passphrase,
+            vault_path=vault_path,
+        )
+        _write_auth_source(config, settings, AuthSource.PROMPT)
+    except CredentialError as exc:
+        err_console.print(f"Credential error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    finally:
+        master_passphrase = ""
+
+    if deleted:
+        console.print(f"Deleted IMAP credential from {source.value} storage.", markup=False)
+    else:
+        console.print("No stored IMAP credential was found; prompt mode is now active.", markup=False)
+
+
+@auth_app.command("change-passphrase")
+def auth_change_passphrase(
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """Change the passphrase protecting the encrypted credential vault."""
+    settings = _load_auth_settings(config)
+    if settings.imap.auth.source is not AuthSource.VAULT:
+        err_console.print("Credential error: configured source is not vault", markup=False)
+        raise typer.Exit(2)
+
+    old_passphrase = getpass.getpass("Current master passphrase: ")
+    new_passphrase = getpass.getpass("New master passphrase: ")
+    confirmation = getpass.getpass("Confirm new master passphrase: ")
+    if new_passphrase != confirmation:
+        old_passphrase = ""
+        new_passphrase = ""
+        confirmation = ""
+        err_console.print("Credential error: new passphrases did not match", markup=False)
+        raise typer.Exit(2)
+    try:
+        change_credential_vault_passphrase(old_passphrase, new_passphrase)
+    except CredentialError as exc:
+        err_console.print(f"Credential error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    finally:
+        old_passphrase = ""
+        new_passphrase = ""
+        confirmation = ""
+    console.print("Changed encrypted credential vault passphrase.", markup=False)
 
 
 @rule_app.command("list")
@@ -244,10 +472,7 @@ def rule_learn(
         err_console.print(f"Rules error: {exc}", markup=False)
         raise typer.Exit(2) from exc
 
-    password = getpass.getpass("IMAP password: ")
-    if not password:
-        err_console.print("Empty password; aborting.", markup=False)
-        raise typer.Exit(2)
+    password = _resolve_password(settings.imap)
     rule_saved = False
     try:
         with ScopedMailbox(
@@ -319,9 +544,7 @@ def rule_learn(
                     markup=False,
                 )
                 existing_action = (
-                    "keep"
-                    if current.action.action is ActionKind.KEEP
-                    else f"move -> {current.action.destination}"
+                    "keep" if current.action.action is ActionKind.KEEP else f"move -> {current.action.destination}"
                 )
                 err_console.print(f"  existing: {existing_action}", markup=False)
                 err_console.print(f"  proposed: move -> {move}", markup=False)
@@ -391,10 +614,7 @@ def rule_test(
         err_console.print(f"Rule not found: {rule_id}", markup=False)
         raise typer.Exit(2)
     selection = MessageSelection(limit=limit, offset=offset, sort=sort)
-    password = getpass.getpass("IMAP password: ")
-    if not password:
-        err_console.print("Empty password; aborting.", markup=False)
-        raise typer.Exit(2)
+    password = _resolve_password(settings.imap)
     try:
         for folder in rule.source_folders:
             with ScopedMailbox(
@@ -445,10 +665,7 @@ def folders(
         err_console.print(f"Configuration error: {exc}", markup=False)
         raise typer.Exit(2) from exc
 
-    password = getpass.getpass("IMAP password: ")
-    if not password:
-        err_console.print("Empty password; aborting.", markup=False)
-        raise typer.Exit(2)
+    password = _resolve_password(imap)
 
     rows: tuple[FolderInfo, ...] = ()
     try:
@@ -544,10 +761,7 @@ def doctor(
     except RuleError as exc:
         err_console.print(f"[red]Rules error:[/red] {exc}")
         raise typer.Exit(2) from exc
-    password = getpass.getpass("IMAP password: ")
-    if not password:
-        err_console.print("[red]Empty password; aborting.[/red]")
-        raise typer.Exit(2)
+    password = _resolve_password(settings.imap)
 
     actions = settings.spam.actions
     destinations = _move_destinations(actions, rules)
@@ -670,10 +884,7 @@ def clean(
     except RuleError as exc:
         err_console.print(f"[red]Rules error:[/red] {exc}")
         raise typer.Exit(2) from exc
-    password = getpass.getpass("IMAP password: ")
-    if not password:
-        err_console.print("[red]Empty password; aborting.[/red]")
-        raise typer.Exit(2)
+    password = _resolve_password(settings.imap)
 
     selection = MessageSelection(limit=limit, offset=offset, sort=sort)
     actions = settings.spam.actions

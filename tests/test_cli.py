@@ -12,6 +12,8 @@ from imapledger.classifier import SemanticSpamSignals
 from imapledger.cleaner import CleanReport, MessageResult, SpamOutcome
 from imapledger.config import (
     ActionKind,
+    AuthSource,
+    ImapAuthSettings,
     ImapSettings,
     MessageAction,
     Settings,
@@ -19,6 +21,7 @@ from imapledger.config import (
     SpamSettings,
     load_settings,
 )
+from imapledger.credentials import CredentialStatus
 from imapledger.mailbox import (
     FolderInfo,
     ImapOperationError,
@@ -1316,7 +1319,7 @@ def test_folders_empty_password_exits_before_connecting(monkeypatch):
 
     assert result.exit_code == 2
     assert prompts == ["IMAP password: "]
-    assert "Empty password; aborting." in result.output
+    assert "Credential error: empty IMAP password" in result.output
 
 
 def test_folders_no_counts_displays_unavailable_counts(monkeypatch):
@@ -1406,7 +1409,6 @@ def test_folders_renders_server_names_as_plain_text(monkeypatch):
     assert name in output.getvalue()
 
 
-
 def _routing_settings() -> Settings:
     return Settings(
         imap=ImapSettings(host="imap.example.org", username="user@example.org"),
@@ -1443,7 +1445,7 @@ def _install_rule_learn(monkeypatch, tmp_path, *, destination_exists=True):
     candidate = RuleCandidate(
         "from_address_exact",
         RuleMatch(from_address="mailer-daemon@gmx.net"),
-        'from=mailer-daemon@gmx.net',
+        "from=mailer-daemon@gmx.net",
         True,
         100,
     )
@@ -1666,3 +1668,207 @@ def test_rule_test_is_bounded_read_only_and_never_constructs_classifier(monkeypa
     assert "UID 43627 MATCH" in state["output"].getvalue()
     assert "UID 43628 MATCH" not in state["output"].getvalue()
     assert "Read-only; no actions were executed." in state["output"].getvalue()
+
+
+def _write_auth_config(path, source=AuthSource.PROMPT):
+    settings = Settings(
+        imap=ImapSettings(
+            host="imap.example.org",
+            username="me@example.org",
+            auth=ImapAuthSettings(source),
+        ),
+        spam=SpamSettings(folders=("Spam",)),
+    )
+    cli.write_settings(settings, path)
+    return settings
+
+
+@pytest.mark.parametrize(
+    ("storage_args", "source", "expected_prompts"),
+    [
+        ([], AuthSource.KEYRING, ["IMAP password: "]),
+        (
+            ["--storage", "encrypted-file"],
+            AuthSource.VAULT,
+            ["IMAP password: ", "Master passphrase: ", "Confirm master passphrase: "],
+        ),
+    ],
+)
+def test_auth_set_selects_storage_and_keeps_secrets_out_of_config_and_output(
+    monkeypatch,
+    tmp_path,
+    storage_args,
+    source,
+    expected_prompts,
+):
+    config_path = tmp_path / "config.toml"
+    _write_auth_config(config_path)
+    vault_path = tmp_path / "credentials.enc"
+    if source is AuthSource.VAULT:
+        monkeypatch.setattr(cli, "default_credential_vault_path", lambda: vault_path)
+
+    entered = iter(
+        ("do-not-print-this", "vault passphrase that is long enough", "vault passphrase that is long enough")
+    )
+    prompts = []
+    stored = []
+    monkeypatch.setattr(
+        cli.getpass,
+        "getpass",
+        lambda prompt: prompts.append(prompt) or next(entered),
+    )
+    monkeypatch.setattr(
+        cli,
+        "store_imap_credential",
+        lambda imap, password, selected_source, **kwargs: stored.append((imap, password, selected_source, kwargs)),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["auth", "set", *storage_args, "--config", str(config_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert prompts == expected_prompts
+    assert stored[0][1] == "do-not-print-this"
+    assert stored[0][2] is source
+    assert load_settings(config_path).imap.auth.source is source
+    config_text = config_path.read_text(encoding="utf-8").lower()
+    assert "do-not-print-this" not in config_text
+    assert "vault passphrase" not in config_text
+    assert "do-not-print-this" not in result.output
+    assert "vault passphrase" not in result.output
+    assert "password" not in config_text
+
+
+def test_auth_vault_cli_roundtrips_a_secret_without_serializing_it(
+    monkeypatch,
+    tmp_path,
+):
+    config_path = tmp_path / "config.toml"
+    vault_path = tmp_path / "data" / "credentials.enc"
+    _write_auth_config(config_path)
+    monkeypatch.setattr(cli, "default_credential_vault_path", lambda: vault_path)
+
+    password = "unique-imap-password-value"
+    passphrase = "long integration vault passphrase for imapledger"
+    inputs = iter((password, passphrase, passphrase))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: next(inputs))
+    result = CliRunner().invoke(
+        cli.app,
+        ["auth", "set", "--storage", "vault", "--config", str(config_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert password not in result.output
+    assert passphrase not in result.output
+    assert password not in config_path.read_text(encoding="utf-8")
+    assert passphrase not in config_path.read_text(encoding="utf-8")
+    encrypted = vault_path.read_bytes()
+    assert password.encode() not in encrypted
+    assert passphrase.encode() not in encrypted
+
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: passphrase)
+    resolved = cli.resolve_credential(load_settings(config_path).imap, vault_path=vault_path)
+    assert resolved.password == password
+    assert password not in repr(resolved)
+
+
+def test_auth_set_refuses_overwrite_without_changing_source_or_leaking_password(
+    monkeypatch,
+    tmp_path,
+):
+    config_path = tmp_path / "config.toml"
+    _write_auth_config(config_path)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "do-not-print-this")
+    monkeypatch.setattr(
+        cli,
+        "store_imap_credential",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            cli.CredentialError("an IMAP credential already exists in the OS keyring")
+        ),
+    )
+
+    result = CliRunner().invoke(cli.app, ["auth", "set", "--config", str(config_path)])
+
+    assert result.exit_code == 2
+    assert "already exists" in result.output
+    assert "do-not-print-this" not in result.output
+    assert load_settings(config_path).imap.auth.source is AuthSource.PROMPT
+
+
+def test_auth_status_displays_only_source_availability_and_backend(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.toml"
+    _write_auth_config(config_path, AuthSource.KEYRING)
+    monkeypatch.setattr(
+        cli,
+        "credential_status",
+        lambda imap, **kwargs: CredentialStatus(AuthSource.KEYRING, True, "SecretService"),
+    )
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: pytest.fail("keyring status must not prompt"))
+
+    result = CliRunner().invoke(cli.app, ["auth", "status", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "configured source: keyring" in result.output
+    assert "available credential: yes" in result.output
+    assert "keyring backend: SecretService" in result.output
+    assert "password" not in result.output.lower()
+
+
+def test_auth_delete_requires_yes_and_returns_source_to_prompt(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.toml"
+    _write_auth_config(config_path, AuthSource.KEYRING)
+    deleted = []
+    monkeypatch.setattr(
+        cli,
+        "delete_imap_credential",
+        lambda imap, **kwargs: deleted.append(imap.username) or True,
+    )
+
+    declined = CliRunner().invoke(
+        cli.app,
+        ["auth", "delete", "--config", str(config_path)],
+        input="n\n",
+    )
+    assert declined.exit_code == 0, declined.output
+    assert deleted == []
+    assert load_settings(config_path).imap.auth.source is AuthSource.KEYRING
+
+    result = CliRunner().invoke(cli.app, ["auth", "delete", "--yes", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    assert deleted == ["me@example.org"]
+    assert load_settings(config_path).imap.auth.source is AuthSource.PROMPT
+    assert "Deleted IMAP credential from keyring storage." in result.output
+
+
+def test_auth_change_passphrase_prompts_and_redacts_values(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.toml"
+    _write_auth_config(config_path, AuthSource.VAULT)
+    values = iter(
+        ("old private passphrase", "new private passphrase long enough", "new private passphrase long enough")
+    )
+    prompts = []
+    changed = []
+    monkeypatch.setattr(
+        cli.getpass,
+        "getpass",
+        lambda prompt: prompts.append(prompt) or next(values),
+    )
+    monkeypatch.setattr(
+        cli,
+        "change_credential_vault_passphrase",
+        lambda old, new: changed.append((old, new)),
+    )
+
+    result = CliRunner().invoke(cli.app, ["auth", "change-passphrase", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    assert prompts == [
+        "Current master passphrase: ",
+        "New master passphrase: ",
+        "Confirm new master passphrase: ",
+    ]
+    assert changed == [("old private passphrase", "new private passphrase long enough")]
+    assert "private passphrase" not in result.output

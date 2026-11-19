@@ -246,7 +246,6 @@ def test_size_limit_prevents_body_fetch() -> None:
     assert client.fetches == [((10,), ("RFC822.SIZE",))]
 
 
-
 def test_fetch_uid_reads_only_requested_uid_and_uses_body_peek() -> None:
     client = FakeClient(uids=[10, 20])
     with make_mailbox(client, writable=False) as mailbox:
@@ -292,6 +291,7 @@ def test_fetch_uid_errors_are_contextual_and_sanitized() -> None:
     assert "uid=10" in str(raised.value)
     assert "secret" not in str(raised.value)
     assert "Cheap pills" not in str(raised.value)
+
 
 def test_delete_uses_uid_expunge_for_exact_snapshot_uids() -> None:
     client = FakeClient()

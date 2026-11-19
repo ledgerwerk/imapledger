@@ -9,7 +9,9 @@ from ledgercore import AtomicWriteError
 import imapledger.config as config_module
 from imapledger.config import (
     ActionKind,
+    AuthSource,
     ConfigError,
+    ImapAuthSettings,
     ImapSettings,
     MessageAction,
     Settings,
@@ -203,6 +205,7 @@ def test_load_imap_settings_accepts_imap_only_config(tmp_path: Path) -> None:
     )
 
     assert load_imap_settings(path) == ImapSettings(host="imap.example.org", username="me@example.org", port=1993)
+    assert load_imap_settings(path).auth.source is AuthSource.PROMPT
 
 
 def test_load_imap_settings_ignores_invalid_spam_section(tmp_path: Path) -> None:
@@ -245,3 +248,69 @@ def test_load_settings_still_requires_spam_table(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="requires a \\[spam\\] table"):
         load_settings(path)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [AuthSource.PROMPT, AuthSource.KEYRING, AuthSource.VAULT],
+)
+def test_imap_auth_source_roundtrips_without_credentials(
+    tmp_path: Path,
+    source: AuthSource,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f'[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n[imap.auth]\nsource = "{source.value}"\n',
+        encoding="utf-8",
+    )
+    imap = load_imap_settings(path)
+    assert imap.auth.source is source
+
+    settings = Settings(
+        imap=ImapSettings(
+            host=imap.host,
+            username=imap.username,
+            port=imap.port,
+            auth=ImapAuthSettings(source),
+        ),
+        spam=SpamSettings(folders=("Spam",)),
+    )
+    rendered = render_settings(settings)
+    assert f'source = "{source.value}"' in rendered
+    assert "password" not in rendered.lower()
+    path.write_text(rendered, encoding="utf-8")
+    assert load_settings(path) == settings
+
+
+@pytest.mark.parametrize(
+    ("auth_line", "message"),
+    [
+        ('source = "invalid"', "source must be one of"),
+        ("source = 42", "source must be one of"),
+        ('other = "keyring"', "unknown key in imap.auth"),
+    ],
+)
+def test_invalid_imap_auth_configuration_is_rejected(
+    tmp_path: Path,
+    auth_line: str,
+    message: str,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        f'[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n[imap.auth]\n{auth_line}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match=message):
+        load_imap_settings(path)
+
+
+def test_imap_auth_configuration_requires_a_table(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\nauth = "keyring"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="imap.auth must be a table"):
+        load_imap_settings(path)

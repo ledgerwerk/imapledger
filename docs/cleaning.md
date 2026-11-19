@@ -13,7 +13,7 @@ imapledger config show
 
 `clean` is a dry run by default. It connects read-only to each configured source folder, classifies the selected messages, and reports planned actions such as `WOULD MOVE` or `WOULD DELETE`. It performs no mutations. Supply `--apply` to execute the actions configured for spam, not-spam, and review outcomes.
 
-The password is requested once per `clean` or `doctor` invocation with hidden input. It is not stored. One classifier context is reused across all source folders in a `clean` invocation.
+Credential-consuming commands resolve the configured source once per invocation. The default `prompt` source uses hidden input once, and the resolved password is reused across source folders. Keyring and vault sources retrieve stored credentials without prompting for the IMAP password.
 
 ## Source ordering and message selection
 

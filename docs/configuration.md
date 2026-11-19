@@ -1,6 +1,31 @@
 # Configuration
 
-The default configuration path is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset. The separate rules file is named `rules.toml` beside the selected config file. The IMAP password is never written to the file. `clean` and `doctor` request it once per invocation using hidden input.
+The default configuration path is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset. The separate rules file is named `rules.toml` beside the selected config file. The IMAP password is never written to configuration. If `[imap.auth]` is omitted, credential resolution uses hidden prompt authentication, preserving existing behavior. Credential-consuming commands resolve once per invocation and reuse the credential across source folders.
+
+## IMAP credential sources
+
+`[imap.auth].source` accepts `prompt`, `keyring`, or `vault`. It selects where imapledger obtains the IMAP password, not where it is written in TOML. `imapledger config show` displays the selected source but never a password, vault passphrase, or ciphertext, and does not connect to IMAP.
+
+```toml
+[imap.auth]
+source = "prompt"
+```
+
+Prompt mode is the compatibility default. Stored credentials are opt-in through `auth set`, which reads the IMAP password using hidden input and never accepts it as a command-line argument:
+
+```bash
+imapledger auth set
+imapledger auth set --storage encrypted-file
+imapledger auth status
+imapledger auth delete
+imapledger auth change-passphrase
+```
+
+`auth set` defaults to the OS keyring. `--storage vault` and its `--storage encrypted-file` alias select the encrypted VaultConfig file. A new encrypted file is stored at `$XDG_DATA_HOME/imapledger/credentials.enc`, or `~/.local/share/imapledger/credentials.enc` when `XDG_DATA_HOME` is unset. Creating it prompts for a hidden master passphrase twice. Install `imapledger[keyring]` to enable the optional keyring backend. Only supported native OS keyrings are accepted; an unavailable backend fails closed and never falls back to plaintext or prompt authentication.
+
+An existing credential is not overwritten. Delete the configured credential first, then set a replacement with `--storage vault` when needed. `auth delete` asks for confirmation unless `--yes` is supplied; vault mode also asks for the master passphrase. It removes only the current account's entry and returns the configured source to `prompt`, leaving other entries in a shared encrypted vault intact. `auth status` reports only source availability and, for keyring storage, the backend name; vault status prompts for the master passphrase to check the account entry. `auth change-passphrase` is available when the configured source is `vault` and prompts for the old and confirmed new values. Forgetting the vault passphrase makes its contents unrecoverable.
+
+A missing or unavailable credential in an explicitly selected keyring or vault is an error. imapledger does not silently fall back to a password prompt. `clean`, `doctor`, `rule learn`, `rule test`, and `folders` resolve credentials once per invocation. Direct `folders --host ... --username ...` mode has no configured storage source and continues to use hidden prompt authentication.
 
 ## Multi-folder routing example
 
@@ -11,6 +36,9 @@ This configuration scans two source folders and routes spam and not-spam outcome
 host = "imap.example.org"
 port = 993
 username = "me@example.org"
+
+[imap.auth]
+source = "prompt"
 
 [spam]
 folders = ["INBOX.Junk", "INBOX.Spam"]
@@ -106,7 +134,7 @@ or an existing configuration:
 imapledger folders --config /path/to/config.toml
 ```
 
-The config mode needs only a valid `[imap]` table. `folders` does not validate or use `spam.folders`, so the spam section may be absent or incomplete. The command prompts for the IMAP password and connects over TLS. It is read-only: one IMAP `LIST` discovers mailbox metadata, and optional `STATUS (MESSAGES UNSEEN)` requests provide aggregate counts without selecting mailboxes or fetching message contents. `--no-counts` skips STATUS requests entirely.
+The config mode needs only a valid `[imap]` table. `folders` does not validate or use `spam.folders`, so the spam section may be absent or incomplete. It resolves the configured credential source in config mode; direct mode continues to use hidden prompt authentication. The command connects over TLS and is read-only: one IMAP `LIST` discovers mailbox metadata, and optional `STATUS (MESSAGES UNSEEN)` requests provide aggregate counts without selecting mailboxes or fetching message contents. `--no-counts` skips STATUS requests entirely.
 
 | Folder | Exact IMAP name |     Total |     Read |     Unread | Role        |
 | ------ | --------------- | --------: | -------: | ---------: | ----------- |

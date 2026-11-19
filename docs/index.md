@@ -22,7 +22,7 @@ imapledger clean
 imapledger clean --apply
 ```
 
-`clean` is read-only unless `--apply` is supplied. The password is requested interactively and is never stored.
+Credential resolution defaults to hidden prompt authentication, and no password is stored in configuration. Use `imapledger auth set` to opt into OS keyring or encrypted-vault storage; see the configuration guide for setup and deletion behavior.
 
 ## Guides
 

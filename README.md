@@ -6,7 +6,7 @@ A security-scoped IMAP automation tool. `imapledger` scans configured source fol
 
 - Each `ScopedMailbox` session is bound to one source folder.
 - Source folders are processed in configured order, one connection at a time.
-- IMAP uses TLS and UID mode. The password is requested with hidden input and is never stored in the configuration.
+- IMAP uses TLS and UID mode. The default credential source is hidden prompt authentication; optional OS keyring and encrypted-vault sources keep passwords out of configuration.
 - Dry-run is the default. It selects each source read-only and performs no mutations.
 - `--apply` uses only configured actions. Every MOVE destination is allow-listed, must exist, and requires server MOVE support. imapledger does not create folders or fall back to COPY and EXPUNGE.
 - Before `--apply`, all configured sources are checked read-only for authentication, required capabilities, exact source existence, SELECT, and move destinations. A failed preflight aborts before classifier construction or mutation. It is best-effort, not transactional, and server state can change before mutation-time checks.
@@ -57,6 +57,17 @@ imapledger init \
 
 The default file is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset. `init` never stores a password. `imapledger config show` prints the configuration path and normalized effective TOML without prompting or connecting to IMAP.
 
+Select stored credentials without placing them in TOML or command arguments:
+
+```bash
+python -m pip install 'imapledger[keyring]'  # optional keyring support
+imapledger auth set
+imapledger auth set --storage encrypted-file
+imapledger auth status
+```
+
+See the [configuration guide](docs/configuration.md) for credential-source behavior, vault recovery limits, and deletion semantics.
+
 Example configuration:
 
 ```toml
@@ -64,6 +75,9 @@ Example configuration:
 host = "imap.example.org"
 port = 993
 username = "me@example.org"
+
+[imap.auth]
+source = "prompt"
 
 [spam]
 folders = ["INBOX.Junk", "INBOX.Spam"]
@@ -104,7 +118,7 @@ imapledger doctor
 imapledger config show
 ```
 
-Every `clean` and `doctor` invocation prompts once for the IMAP password. Without `--apply`, `clean` is read-only and reports planned actions such as `WOULD MOVE` or `WOULD DELETE`. With `--apply`, classification completes for one source before configured actions are executed for that source. Apply-mode progress first reports `MOVE-APPROVED` or `DELETE-APPROVED`; final output reports `MOVED` or `DELETED` only when confirmed.
+Each `clean` and `doctor` invocation resolves one IMAP credential and reuses it across configured source folders. The default prompt source asks once; keyring and vault sources use their configured secure backend.
 Apply mode first checks every configured source and move destination read-only; if any preflight check fails, it stops before classifier construction or mutations. This is not a transaction and does not prevent server-side changes or runtime partial failures after preflight.
 
 `--limit` and `--offset` apply independently to each source folder. With two folders, `--limit 10 --offset 10` selects positions 11 through 20 in each folder. `--sort newest` and `--sort oldest` order each folder by descending or ascending IMAP UID, which represents mailbox arrival order, not the message `Date:` header. UIDs are folder-local and are never globally ordered or merged.

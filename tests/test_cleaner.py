@@ -160,7 +160,6 @@ def test_review_can_be_moved_using_review_action():
     assert all(row.outcome is SpamOutcome.REVIEW for row in report.results[:2])
 
 
-
 def test_rule_match_bypasses_classifier_and_moves_immediately_before_next_message():
     events = []
     mailbox = FakeMailbox(writable=True, events=events)
@@ -269,6 +268,7 @@ def test_rule_matcher_error_fails_closed():
     assert report.results[0].detail == "RuntimeError: rule evaluation failed"
     assert mailbox.deleted == []
     assert mailbox.moved == []
+
 
 def test_result_callback_fires_after_each_action_and_forwards_selection():
     events = []

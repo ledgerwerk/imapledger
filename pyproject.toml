@@ -27,6 +27,7 @@ dependencies = [
   "imapclient>=4.3,<5",
   "ledgercore>=0.6,<0.7",
   "pyjev>=0.1.2,<1",
+  "vaultconfig>=0.3.0,<0.4",
   "typer>=0.16,<1",
   "rich>=13,<16",
   "tomli>=2; python_version < '3.11'",
@@ -40,6 +41,7 @@ dev = [
   "build>=1,<2",
   "twine>=6,<7",
 ]
+keyring = ["vaultconfig[keyring]>=0.3.0,<0.4"]
 
 [project.scripts]
 imapledger = "imapledger.cli:app"

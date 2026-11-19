@@ -29,6 +29,24 @@ class ActionKind(str, Enum):
     DELETE = "delete"
 
 
+class AuthSource(str, Enum):
+    PROMPT = "prompt"
+    KEYRING = "keyring"
+    VAULT = "vault"
+
+
+@dataclass(frozen=True, slots=True)
+class ImapAuthSettings:
+    source: AuthSource = AuthSource.PROMPT
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, AuthSource):
+            try:
+                object.__setattr__(self, "source", AuthSource(self.source))
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"unknown IMAP credential source: {self.source!r}") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class MessageAction:
     action: ActionKind
@@ -70,8 +88,11 @@ class ImapSettings:
     host: str
     username: str
     port: int = 993
+    auth: ImapAuthSettings = field(default_factory=ImapAuthSettings)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.auth, ImapAuthSettings):
+            raise ConfigError("imap.auth must be an auth settings table")
         if not self.host.strip():
             raise ConfigError("host must not be empty")
         if not self.username.strip():
@@ -137,6 +158,20 @@ def _load_config_payload(path: Path | None = None) -> tuple[Path, dict[str, obje
     return config_path, payload
 
 
+def _parse_imap_auth_settings(value: object) -> ImapAuthSettings:
+    if not isinstance(value, dict):
+        raise ConfigError("imap.auth must be a table")
+    unknown = set(value) - {"source"}
+    if unknown:
+        raise ConfigError(f"unknown key in imap.auth: {sorted(unknown)[0]}")
+    try:
+        source = AuthSource(value.get("source", AuthSource.PROMPT.value))
+    except (TypeError, ValueError) as exc:
+        allowed = ", ".join(source.value for source in AuthSource)
+        raise ConfigError(f"imap.auth.source must be one of: {allowed}") from exc
+    return ImapAuthSettings(source)
+
+
 def _parse_imap_settings(payload: dict[str, object]) -> ImapSettings:
     imap = payload.get("imap")
     if not isinstance(imap, dict):
@@ -146,6 +181,7 @@ def _parse_imap_settings(payload: dict[str, object]) -> ImapSettings:
             host=str(imap["host"]),
             username=str(imap["username"]),
             port=int(imap.get("port", 993)),
+            auth=_parse_imap_auth_settings(imap.get("auth", {})),
         )
     except KeyError as exc:
         raise ConfigError(f"missing config key: {exc.args[0]}") from exc
@@ -292,6 +328,9 @@ def render_settings(settings: Settings) -> str:
         f'host = "{_toml_string(settings.imap.host)}"',
         f"port = {settings.imap.port}",
         f'username = "{_toml_string(settings.imap.username)}"',
+        "",
+        "[imap.auth]",
+        f'source = "{settings.imap.auth.source.value}"',
         "",
         "[spam]",
         f"folders = {_toml_string_array(settings.spam.folders)}",
