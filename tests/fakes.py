@@ -1,3 +1,7 @@
+from email import policy
+from email.parser import BytesHeaderParser
+
+
 def raw_message(subject, sender):
     return f"From: {sender}\r\nTo: me@example.org\r\nSubject: {subject}\r\n\r\n{subject}".encode()
 
@@ -5,9 +9,19 @@ def raw_message(subject, sender):
 class FolderAwareFakeClient:
     """IMAP fake whose folder-local operations follow selected-folder state."""
 
-    def __init__(self, folders, uidvalidities=None):
+    def __init__(self, folders, uidvalidities=None, permanent_flags=None, flags=None):
         self.folders = {name: dict(messages) for name, messages in folders.items()}
         self.uidvalidities = uidvalidities or {name: 42 for name in folders}
+        self.permanent_flags = (
+            permanent_flags
+            if permanent_flags is not None
+            else {name: (b"\\Answered", b"\\Flagged", b"\\Draft", b"\\Deleted", b"\\Seen", b"\\*") for name in folders}
+        )
+        initial_flags = flags or {}
+        self.flags = {
+            name: {uid: set(message_flags) for uid, message_flags in initial_flags.get(name, {}).items()}
+            for name in folders
+        }
         self.selected_folder = None
         self.selected = []
         self.existing_folders = set(folders)
@@ -52,6 +66,7 @@ class FolderAwareFakeClient:
             b"UIDVALIDITY": self.uidvalidities[folder],
             b"EXISTS": len(self.folders[folder]),
             b"FLAGS": (),
+            b"PERMANENTFLAGS": self.permanent_flags.get(folder),
             b"RECENT": 0,
         }
 
@@ -69,12 +84,33 @@ class FolderAwareFakeClient:
         self._maybe_fail("search")
         if self.selected_folder is None:
             raise AssertionError("SEARCH requires a selected folder")
-        uids = self.folders[self.selected_folder]
+        folder_uids = self.folders[self.selected_folder]
         if criteria == "ALL":
-            return list(uids)
-        if isinstance(criteria, (list, tuple)) and len(criteria) == 2 and str(criteria[0]).upper() == "UID":
-            requested = int(criteria[1])
-            return [uid for uid in uids if uid == requested]
+            return list(folder_uids)
+        if isinstance(criteria, (list, tuple)):
+            if len(criteria) == 2 and str(criteria[0]).upper() == "UID":
+                requested = int(criteria[1])
+                return [uid for uid in folder_uids if uid == requested]
+            if len(criteria) % 2:
+                raise AssertionError(f"unsupported search criteria: {criteria!r}")
+            found = set(folder_uids)
+            current_flags = self.flags[self.selected_folder]
+            for operation, argument in zip(criteria[::2], criteria[1::2], strict=True):
+                operation = str(operation).upper()
+                keyword = argument.decode("ascii") if isinstance(argument, bytes) else str(argument)
+                if operation not in {"KEYWORD", "UNKEYWORD"}:
+                    raise AssertionError(f"unsupported search criteria: {criteria!r}")
+                matching = {
+                    uid
+                    for uid in folder_uids
+                    if any(
+                        (flag.decode("ascii", errors="replace") if isinstance(flag, bytes) else str(flag)).casefold()
+                        == keyword.casefold()
+                        for flag in current_flags.get(uid, set())
+                    )
+                }
+                found &= matching if operation == "KEYWORD" else set(folder_uids) - matching
+            return sorted(found)
         raise AssertionError(f"unsupported search criteria: {criteria!r}")
 
     def fetch(self, messages, data, modifiers=None):
@@ -87,6 +123,25 @@ class FolderAwareFakeClient:
         if data == ("RFC822.SIZE",):
             self._maybe_fail("fetch_size")
             return {uid: {b"RFC822.SIZE": len(folder[uid])} for uid in messages if uid in folder}
+        if data == ("FLAGS",):
+            self._maybe_fail("fetch_flags")
+            current_flags = self.flags[self.selected_folder]
+            return {uid: {b"FLAGS": tuple(current_flags.get(uid, set()))} for uid in messages if uid in folder}
+        if len(data) == 1 and str(data[0]).startswith("BODY.PEEK[HEADER.FIELDS"):
+            self._maybe_fail("fetch_headers")
+            names = ("From", "Subject", "Date", "Message-ID")
+            result = {}
+            for uid in messages:
+                if uid not in folder:
+                    continue
+                raw_headers = folder[uid].split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
+                parsed = BytesHeaderParser(policy=policy.default).parsebytes(raw_headers)
+                selected_headers = (
+                    b"".join(f"{name}: {value}\r\n".encode() for name in names for value in parsed.get_all(name, []))
+                    + b"\r\n"
+                )
+                result[uid] = {b"BODY[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]": selected_headers}
+            return result
         self._maybe_fail("fetch_body")
         return {uid: {b"BODY[]": folder[uid]} for uid in messages if uid in folder}
 
@@ -96,21 +151,37 @@ class FolderAwareFakeClient:
         self.moves.append((messages, folder))
         source = self.folders[self.selected_folder]
         destination = self.folders.setdefault(folder, {})
+        source_flags = self.flags[self.selected_folder]
+        destination_flags = self.flags.setdefault(folder, {})
+        self.permanent_flags.setdefault(folder, ())
         for uid in messages:
             destination[uid] = source.pop(uid)
+            destination_flags[uid] = source_flags.pop(uid, set())
         self.selected_folder = folder
 
     def add_flags(self, messages, flags, silent=False):
         self._maybe_fail("add_flags")
         messages = tuple(messages)
-        self.added.append((messages, tuple(flags), silent))
-        self.deleted_flags.setdefault(self.selected_folder, set()).update(messages)
+        flags = tuple(flags)
+        self.added.append((messages, flags, silent))
+        folder_flags = self.flags[self.selected_folder]
+        for uid in messages:
+            if uid in self.folders[self.selected_folder]:
+                folder_flags.setdefault(uid, set()).update(_flag_bytes(flag).lower() for flag in flags)
+        if any(_flag_bytes(flag).lower() == b"\\deleted" for flag in flags):
+            self.deleted_flags.setdefault(self.selected_folder, set()).update(messages)
 
     def remove_flags(self, messages, flags, silent=False):
         self._maybe_fail("remove_flags")
         messages = tuple(messages)
-        self.removed.append((messages, tuple(flags), silent))
-        self.deleted_flags.setdefault(self.selected_folder, set()).difference_update(messages)
+        flags = tuple(flags)
+        self.removed.append((messages, flags, silent))
+        folder_flags = self.flags[self.selected_folder]
+        remove = {_flag_bytes(flag).lower() for flag in flags}
+        for uid in messages:
+            folder_flags.setdefault(uid, set()).difference_update(remove)
+        if b"\\deleted" in remove:
+            self.deleted_flags.setdefault(self.selected_folder, set()).difference_update(messages)
 
     def uid_expunge(self, messages):
         self._maybe_fail("uid_expunge")
@@ -119,3 +190,8 @@ class FolderAwareFakeClient:
         source = self.folders[self.selected_folder]
         for uid in messages:
             source.pop(uid, None)
+            self.flags[self.selected_folder].pop(uid, None)
+
+
+def _flag_bytes(flag):
+    return flag if isinstance(flag, bytes) else str(flag).encode("ascii")

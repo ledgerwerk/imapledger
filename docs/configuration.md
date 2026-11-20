@@ -140,6 +140,9 @@ folders = ["INBOX.Junk", "INBOX.Spam"]
 max_message_bytes = 2000000
 max_body_chars = 20000
 
+[spam.state]
+backend = "imap-keywords"
+
 [spam.actions.spam]
 action = "move"
 destination = "INBOX.Trash"
@@ -169,6 +172,19 @@ trusted_spam_headers = []
 `folders` lists source mailboxes, not destinations. Sources are processed in listed order, one source-scoped IMAP session at a time. `--limit`, `--offset`, and `--sort` select messages independently in each source. UID values from different folders are not compared.
 
 Source mailbox names are exact and server-specific. Every configured source must exist and be selectable on the account. The example names above are not universal; imapledger does not normalize names or create source folders. `doctor` distinguishes a missing source from an existing source that cannot be selected.
+
+## Classification state backend
+
+The optional state backend is configured with `[spam.state].backend`:
+
+```toml
+[spam.state]
+backend = "imap-keywords"
+```
+
+Supported values are `none` and `imap-keywords`. `imapledger init` selects `imap-keywords` for new configurations. Existing configurations that omit `[spam.state]` use `none` for backward compatibility. `imapledger config show` displays the effective setting. The application owns the marker names; they are not configurable.
+
+The selected mailbox must advertise persistent custom keywords through `PERMANENTFLAGS` (`\\*` or the exact keyword). `doctor` reports persistence support, and `clean --apply` checks it before classification whenever a configured outcome may be kept. See [Persistent classification state](state.md) for marker semantics, command usage, privacy, and failure behavior.
 
 ## Learned routing rules
 

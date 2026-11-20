@@ -1,5 +1,6 @@
 from contextlib import AbstractContextManager
 
+from imapledger.classification_state import ClassificationStateBackend
 from imapledger.classifier import SemanticSpamSignals, SpamAssessment
 from imapledger.cleaner import VERDICT_OUTCOME, SpamCleaner, SpamOutcome
 from imapledger.config import ActionKind, MessageAction, SpamActions
@@ -29,6 +30,8 @@ class FakeMailbox(AbstractContextManager):
         self.events = events
         self.count_selections = []
         self.iter_selections = []
+        self.state_flags: dict[int, set[str]] = {}
+        self.state_writes = []
         self.items = [
             MailboxItem(uid=1, message=MailMessage(1, "phish", "a@example.org", (), "", "buy now")),
             MailboxItem(uid=2, message=MailMessage(2, "real", "b@example.org", (), "", "hello")),
@@ -37,11 +40,17 @@ class FakeMailbox(AbstractContextManager):
 
     def selected_count(self, selection):
         self.count_selections.append(selection)
-        return len(self.items)
+        return len(self._filtered_items(selection))
+
+    def _filtered_items(self, selection):
+        if not selection.excluded_keywords:
+            return self.items
+        excluded = set(selection.excluded_keywords)
+        return [item for item in self.items if not excluded.intersection(self.state_flags.get(item.uid, set()))]
 
     def iter_messages(self, selection=None):
         self.iter_selections.append(selection)
-        yield from self.items
+        yield from self._filtered_items(selection or MessageSelection())
 
     def move_uid(self, uid, destination):
         return self.move_uids((uid,), destination)
@@ -58,6 +67,14 @@ class FakeMailbox(AbstractContextManager):
     def delete_uids(self, uids):
         self.deleted.extend(uids)
         return DeleteResult(deleted=tuple(uids))
+
+    def set_classification_keyword(self, uid: int, *, keyword: str, peer_keywords):
+        flags = self.state_flags.setdefault(uid, set())
+        flags.difference_update(peer_keywords)
+        flags.add(keyword)
+        self.state_writes.append((uid, keyword))
+        if self.events is not None:
+            self.events.append(f"state:{uid}:{keyword}")
 
     def __exit__(self, *args):
         return None
@@ -133,13 +150,123 @@ def test_apply_routes_spam_and_not_spam_during_iteration():
         not_spam=MessageAction(ActionKind.MOVE, "INBOX.NotSpam"),
     )
 
-    report = SpamCleaner(mailbox, FakeClassifier(), actions=actions).run(apply=True)
+    report = SpamCleaner(
+        mailbox,
+        FakeClassifier(),
+        actions=actions,
+        state_backend=ClassificationStateBackend.IMAP_KEYWORDS,
+    ).run(apply=True)
 
     assert mailbox.moved == [((1,), "INBOX.Trash"), ((2,), "INBOX.NotSpam")]
     assert mailbox.deleted == []
     assert report.moved == 2
     assert report.deleted == 0
     assert [row.action_applied for row in report.results] == [True, True, False]
+    assert mailbox.state_flags == {}
+
+
+def test_apply_persists_spam_not_spam_and_review_when_final_action_is_keep() -> None:
+    class OutcomeClassifier:
+        def assess(self, message):
+            if message.uid == 4:
+                signals = SemanticSpamSignals(0.1, 0.1, 0.1, 0.1, 0.99)
+                return SpamAssessment(signals=signals, evidence=build_message_evidence(message))
+            return _assessment(message)
+
+    mailbox = FakeMailbox(writable=True)
+    mailbox.items.append(MailboxItem(uid=4, message=MailMessage(4, "review", "c@example.org", (), "", "body")))
+    actions = SpamActions(
+        spam=MessageAction(ActionKind.KEEP),
+        not_spam=MessageAction(ActionKind.KEEP),
+        review=MessageAction(ActionKind.KEEP),
+    )
+    report = SpamCleaner(
+        mailbox,
+        OutcomeClassifier(),
+        actions=actions,
+        state_backend=ClassificationStateBackend.IMAP_KEYWORDS,
+    ).run(apply=True)
+
+    assert report.state_stored == 3
+    assert mailbox.state_flags == {
+        1: {"imapledger-v1-spam"},
+        2: {"imapledger-v1-notspam"},
+        4: {"imapledger-v1-review"},
+    }
+    assert {row.uid for row in report.results if row.state_persisted} == {1, 2, 4}
+    assert all(row.action_applied is False for row in report.results if row.state_persisted)
+
+
+def test_dry_run_records_planned_state_without_writing_keywords() -> None:
+    mailbox = FakeMailbox(writable=False)
+    actions = SpamActions(
+        spam=MessageAction(ActionKind.KEEP),
+        not_spam=MessageAction(ActionKind.KEEP),
+        review=MessageAction(ActionKind.KEEP),
+    )
+    report = SpamCleaner(
+        mailbox,
+        FakeClassifier(),
+        actions=actions,
+        state_backend=ClassificationStateBackend.IMAP_KEYWORDS,
+    ).run(apply=False)
+
+    assert mailbox.state_writes == []
+    assert mailbox.state_flags == {}
+    assert report.state_stored == 0
+    assert all(row.state_source == "imap-keyword" for row in report.results if row.outcome is not None)
+    assert all(not row.state_persisted for row in report.results)
+
+
+def test_state_filtering_precedes_classification_and_reclassify_bypasses_it() -> None:
+    actions = SpamActions(
+        spam=MessageAction(ActionKind.KEEP),
+        not_spam=MessageAction(ActionKind.KEEP),
+        review=MessageAction(ActionKind.KEEP),
+    )
+    mailbox = FakeMailbox(writable=False)
+    mailbox.state_flags[2] = {"imapledger-v1-notspam"}
+    events = []
+    cleaner = SpamCleaner(
+        mailbox,
+        FakeClassifier(events),
+        actions=actions,
+        state_backend=ClassificationStateBackend.IMAP_KEYWORDS,
+    )
+
+    normal_report = cleaner.run(apply=False)
+    assert [row.uid for row in normal_report.results] == [1, 3]
+    assert events == ["classify:1"]
+    events.clear()
+
+    reclassified_report = cleaner.run(apply=False, reclassify=True)
+    assert [row.uid for row in reclassified_report.results] == [1, 2, 3]
+    assert events == ["classify:1", "classify:2"]
+
+
+def test_state_persistence_failure_stops_later_classification() -> None:
+    class FailingStateMailbox(FakeMailbox):
+        def set_classification_keyword(self, uid: int, *, keyword: str, peer_keywords):
+            raise RuntimeError("state store failed")
+
+    mailbox = FailingStateMailbox(writable=True)
+    actions = SpamActions(
+        spam=MessageAction(ActionKind.KEEP),
+        not_spam=MessageAction(ActionKind.KEEP),
+        review=MessageAction(ActionKind.KEEP),
+    )
+    events = []
+    report = SpamCleaner(
+        mailbox,
+        FakeClassifier(events),
+        actions=actions,
+        state_backend=ClassificationStateBackend.IMAP_KEYWORDS,
+    ).run(apply=True)
+
+    assert report.scanned == 1
+    assert isinstance(report.action_error, RuntimeError)
+    assert events == ["classify:1"]
+    assert report.results[0].detail == "Classification state was not confirmed; see the operation error."
 
 
 def test_review_can_be_moved_using_review_action():
@@ -175,14 +302,23 @@ def test_rule_match_bypasses_classifier_and_moves_immediately_before_next_messag
         match=RuleMatch(from_address="a@example.org"),
     )
     callbacks = []
-
     report = SpamCleaner(
         mailbox,
         FakeClassifier(events),
         rules=RuleSet((rule,)),
-    ).run(apply=True, on_result=lambda row, position, total: (callbacks.append(row), events.append(f"row:{row.uid}")))
-
-    assert events == ["move:1:INBOX.Trash", "row:1", "classify:2", "row:2", "row:3"]
+        state_backend=ClassificationStateBackend.IMAP_KEYWORDS,
+    ).run(
+        apply=True,
+        on_result=lambda row, position, total: (callbacks.append(row), events.append(f"row:{row.uid}")),
+    )
+    assert events == [
+        "move:1:INBOX.Trash",
+        "row:1",
+        "classify:2",
+        "state:2:imapledger-v1-notspam",
+        "row:2",
+        "row:3",
+    ]
     assert mailbox.moved == [((1,), "INBOX.Trash")]
     assert report.rule_matches == 1
     assert report.spam == 0
@@ -193,6 +329,7 @@ def test_rule_match_bypasses_classifier_and_moves_immediately_before_next_messag
     assert report.results[0].outcome is None
     assert report.results[0].action_applied
     assert callbacks == report.results
+    assert mailbox.state_flags == {2: {"imapledger-v1-notspam"}}
 
 
 def test_rule_dry_run_does_not_mutate_and_nonmatches_still_use_classifier():
@@ -319,7 +456,11 @@ def test_result_callback_fires_after_each_action_and_forwards_selection():
 def test_apply_deletes_only_configured_spam_action_uids():
     mailbox = FakeMailbox(writable=True)
 
-    report = SpamCleaner(mailbox, FakeClassifier()).run(apply=True)
+    report = SpamCleaner(
+        mailbox,
+        FakeClassifier(),
+        state_backend=ClassificationStateBackend.IMAP_KEYWORDS,
+    ).run(apply=True)
 
     assert mailbox.deleted == [1]
     assert report.deleted == 1
@@ -327,6 +468,7 @@ def test_apply_deletes_only_configured_spam_action_uids():
     assert report.skipped == 1
     assert report.results[0].action_applied is True
     assert report.results[0].deleted is True
+    assert mailbox.state_flags == {2: {"imapledger-v1-notspam"}}
 
 
 class FailingClassifier:
@@ -336,7 +478,11 @@ class FailingClassifier:
 
 def test_classifier_error_fails_closed_and_skip_error_never_mutate():
     mailbox = FakeMailbox(writable=True)
-    report = SpamCleaner(mailbox, FailingClassifier()).run(apply=True)
+    report = SpamCleaner(
+        mailbox,
+        FailingClassifier(),
+        state_backend=ClassificationStateBackend.IMAP_KEYWORDS,
+    ).run(apply=True)
 
     error_row = report.results[0]
     assert error_row.status == "error"
@@ -345,6 +491,7 @@ def test_classifier_error_fails_closed_and_skip_error_never_mutate():
     assert error_row.detail == "RuntimeError: classification evaluation failed"
     assert mailbox.deleted == []
     assert mailbox.moved == []
+    assert mailbox.state_flags == {}
     assert report.results[2].action.action is ActionKind.KEEP
 
 

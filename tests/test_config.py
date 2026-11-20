@@ -11,6 +11,8 @@ import imapledger.config as config_module
 from imapledger.config import (
     ActionKind,
     AuthSource,
+    ClassificationStateBackend,
+    ClassificationStateSettings,
     ConfigError,
     ImapAuthSettings,
     ImapSettings,
@@ -398,8 +400,7 @@ def test_distinct_configs_preserve_distinct_vault_paths(tmp_path: Path) -> None:
 def test_vault_min_passphrase_length_defaults_and_custom_value_round_trips(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
-        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
-        '[imap.auth]\nsource = "vault"\n',
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n[imap.auth]\nsource = "vault"\n',
         encoding="utf-8",
     )
     assert load_imap_settings(path).auth.vault_min_passphrase_length == DEFAULT_MIN_PASSPHRASE_LENGTH
@@ -424,7 +425,7 @@ def test_invalid_vault_min_passphrase_length_is_rejected(tmp_path: Path, raw_val
     path = tmp_path / "config.toml"
     path.write_text(
         '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
-        f'[imap.auth]\nvault_min_passphrase_length = {raw_value}\n',
+        f"[imap.auth]\nvault_min_passphrase_length = {raw_value}\n",
         encoding="utf-8",
     )
 
@@ -451,3 +452,39 @@ def test_write_auth_config_preserves_custom_vault_minimum_across_source_updates(
     settings = load_imap_settings(path)
     assert settings.auth.source is AuthSource.PROMPT
     assert settings.auth.vault_min_passphrase_length == 10
+
+
+@pytest.mark.parametrize("backend", ["none", "imap-keywords"])
+def test_classification_state_backend_round_trips(tmp_path: Path, backend: str) -> None:
+    settings = _load_spam(tmp_path, f'folders = ["Spam"]\n\n[spam.state]\nbackend = "{backend}"\n')
+
+    assert settings.spam.state == ClassificationStateSettings(ClassificationStateBackend(backend))
+    rendered = render_settings(settings)
+    assert f'[spam.state]\nbackend = "{backend}"' in rendered
+    path = tmp_path / "roundtrip.toml"
+    path.write_text(rendered, encoding="utf-8")
+    assert load_settings(path) == settings
+
+
+def test_legacy_config_defaults_state_backend_to_none(tmp_path: Path) -> None:
+    settings = _load_spam(tmp_path, 'folders = ["Spam"]\n')
+
+    assert settings.spam.state.backend is ClassificationStateBackend.NONE
+    assert '[spam.state]\nbackend = "none"' in render_settings(settings)
+
+
+@pytest.mark.parametrize(
+    ("state_table", "message"),
+    [
+        ('[spam.state]\nbackend = "headers"\n', "spam.state.backend must be one of"),
+        ('[spam.state]\nmarker = "custom"\n', "unknown key in spam.state"),
+        ('state = "imap-keywords"\n', "spam.state must be a table"),
+    ],
+)
+def test_invalid_classification_state_config_is_rejected(
+    tmp_path: Path,
+    state_table: str,
+    message: str,
+) -> None:
+    with pytest.raises(ConfigError, match=message):
+        _load_spam(tmp_path, f'folders = ["Spam"]\n\n{state_table}')

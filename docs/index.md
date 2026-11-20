@@ -31,6 +31,7 @@ Credential resolution defaults to hidden prompt authentication, and no password 
 
 configuration
 cleaning
+state
 rules
 ```
 

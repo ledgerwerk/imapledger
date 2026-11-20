@@ -502,6 +502,7 @@ def test_short_vault_passphrases_get_configured_minimum_guidance_during_setup_an
         )
     assert "123456789" not in str(change_error.value)
 
+
 def test_empty_password_is_rejected_before_secure_storage() -> None:
     with pytest.raises(CredentialError, match="IMAP password must not be empty"):
         store_imap_credential(_imap(AuthSource.KEYRING), "", AuthSource.KEYRING)
@@ -583,7 +584,6 @@ def test_keyring_constructor_errors_are_translated_without_payload(monkeypatch: 
         )
 
     assert "UNIQUE_IMAP_PASSWORD_SENTINEL" not in str(error.value)
-
 
 
 def test_vault_passphrase_policy_translation_uses_structured_fields() -> None:

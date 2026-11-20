@@ -156,6 +156,17 @@ Moves require the IMAP MOVE capability and an existing destination. Deletes requ
 
 See [the configuration guide](docs/configuration.md), [the cleaning guide](docs/cleaning.md), and [the learned routing rules guide](docs/rules.md) for the complete schema, safety checks, reporting, and failure behavior.
 
+## Persistent classification state
+
+New configurations created by `imapledger init` use server-side IMAP keywords to remember spam, not-spam, or review outcomes after an applied `keep` action. Existing configurations without `[spam.state]` remain on the `none` backend. The markers are coarse recipient-mailbox state, not message headers or model history. See the [persistent state guide](docs/state.md) for server requirements, privacy details, and safe inspection and reset commands.
+
+```bash
+imapledger state status
+imapledger review list --limit 20
+imapledger explain 43652 --folder INBOX.Junk
+imapledger state reset --folder INBOX.Junk --uid 43652 --apply
+```
+
 ## Learned routing rules
 
 Use a routing rule for a personal mailbox preference that should remain separate from spam classification. For example, learn a narrow rule from one explicitly scoped message UID:

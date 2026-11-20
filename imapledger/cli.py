@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import getpass
 import traceback
+from collections.abc import Iterable
 from pathlib import Path
 
 import typer
@@ -9,11 +10,14 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from .classification_state import all_state_keywords
 from .classifier import PyJevSpamClassifier
-from .cleaner import CleanReport, MessageResult, SpamCleaner
+from .cleaner import VERDICT_OUTCOME, CleanReport, MessageResult, SpamCleaner
 from .config import (
     ActionKind,
     AuthSource,
+    ClassificationStateBackend,
+    ClassificationStateSettings,
     ConfigError,
     ImapSettings,
     MessageAction,
@@ -37,12 +41,13 @@ from .credentials import (
     default_credential_vault_path,
     resolve_credential,
 )
-from .evidence import redact_urls
+from .evidence import build_message_evidence, redact_urls
 from .mailbox import (
     FolderCatalog,
     FolderInfo,
     ImapOperationError,
     MailboxError,
+    MailboxSnapshot,
     MessageSelection,
     MessageSort,
     ScopedMailbox,
@@ -67,6 +72,10 @@ auth_app = typer.Typer(help="Store and inspect IMAP credentials.")
 app.add_typer(auth_app, name="auth")
 rule_app = typer.Typer(help="Learn and manage deterministic message routing rules.")
 app.add_typer(rule_app, name="rule")
+state_app = typer.Typer(help="Inspect and reset persisted classification state.")
+app.add_typer(state_app, name="state")
+review_app = typer.Typer(help="Inspect the persisted review queue.")
+app.add_typer(review_app, name="review")
 console = Console()
 err_console = Console(stderr=True)
 
@@ -114,6 +123,7 @@ def init_config(
                 imap=ImapSettings(host=host, port=port, username=username),
                 spam=SpamSettings(
                     folders=tuple(source_folders),
+                    state=ClassificationStateSettings(ClassificationStateBackend.IMAP_KEYWORDS),
                     actions=SpamActions(
                         spam=MessageAction(spam_action, spam_destination),
                         not_spam=MessageAction(not_spam_action, not_spam_destination),
@@ -184,10 +194,7 @@ def auth_set(
     if source is AuthSource.VAULT:
         new_vault = not backend.vault_path.exists()
         if new_vault:
-            prompt = (
-                "Choose master passphrase "
-                f"(minimum {settings.imap.auth.vault_min_passphrase_length} characters): "
-            )
+            prompt = f"Choose master passphrase (minimum {settings.imap.auth.vault_min_passphrase_length} characters): "
         else:
             prompt = "Credential vault passphrase: "
         master_passphrase = getpass.getpass(prompt)
@@ -785,10 +792,12 @@ def doctor(
                 password=password,
                 destinations=destinations,
                 requires_delete=requires_delete,
+                require_state_persistence=(settings.spam.state.backend is ClassificationStateBackend.IMAP_KEYWORDS),
                 deep_probe=True,
                 mailbox_factory=ScopedMailbox,
                 event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
             )
+            _print_state_preflight(result, clean_apply=False)
             if result.opened:
                 console.print("source: EXISTS")
                 console.print("select: OK")
@@ -853,6 +862,11 @@ def clean(
         "--apply",
         help="Execute the configured actions. Without this flag, run read-only.",
     ),
+    reclassify: bool = typer.Option(
+        False,
+        "--reclassify",
+        help="Ignore stored classification state and classify selected messages again.",
+    ),
     limit: int | None = typer.Option(
         None,
         "--limit",
@@ -893,11 +907,19 @@ def clean(
         raise typer.Exit(2) from exc
     password = _resolve_password(settings.imap)
 
-    selection = MessageSelection(limit=limit, offset=offset, sort=sort)
+    excluded_keywords = (
+        all_state_keywords()
+        if settings.spam.state.backend is ClassificationStateBackend.IMAP_KEYWORDS and not reclassify
+        else ()
+    )
+    selection = MessageSelection(limit=limit, offset=offset, sort=sort, excluded_keywords=excluded_keywords)
     actions = settings.spam.actions
     destinations = _move_destinations(actions, rules)
     allow_delete = any(
         action.action is ActionKind.DELETE for action in (actions.spam, actions.not_spam, actions.review)
+    )
+    requires_state_persistence = settings.spam.state.backend is ClassificationStateBackend.IMAP_KEYWORDS and any(
+        action.action is ActionKind.KEEP for action in (actions.spam, actions.not_spam, actions.review)
     )
 
     if apply:
@@ -909,11 +931,13 @@ def clean(
                 password=password,
                 destinations=destinations,
                 requires_delete=allow_delete,
+                require_state_persistence=requires_state_persistence,
                 deep_probe=False,
                 mailbox_factory=ScopedMailbox,
                 event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
             )
             state = "OK" if result.ok else "FAILED"
+            _print_state_preflight(result, clean_apply=True)
             console.print(f"preflight {folder}: {state}", markup=False)
             for capability in (b"MOVE", b"UIDPLUS"):
                 if capability in result.missing_capabilities:
@@ -951,6 +975,8 @@ def clean(
                         max_body_chars=settings.spam.max_body_chars,
                         event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
                     ) as mailbox:
+                        if apply and requires_state_persistence:
+                            mailbox.require_persistent_classification_state()
                         if apply:
                             for destination in destinations:
                                 if not mailbox.destination_exists(destination):
@@ -960,6 +986,11 @@ def clean(
                                 folder=mailbox.folder,
                                 total_messages=len(mailbox.snapshot().uids),
                                 selected_count=mailbox.selected_count(selection),
+                                unclassified_count=(
+                                    len(mailbox.candidate_uids(excluded_keywords=selection.excluded_keywords))
+                                    if selection.excluded_keywords
+                                    else None
+                                ),
                                 selection=selection,
                             ),
                             markup=False,
@@ -970,8 +1001,14 @@ def clean(
                             policy=settings.spam.policy,
                             actions=actions,
                             rules=rules,
+                            **(
+                                {"state_backend": settings.spam.state.backend}
+                                if settings.spam.state.backend is not ClassificationStateBackend.NONE
+                                else {}
+                            ),
                         ).run(
                             apply=apply,
+                            **({"reclassify": True} if reclassify else {}),
                             selection=selection,
                             on_result=(
                                 lambda row, position, total, source_folder=mailbox.folder: _print_result(
@@ -1006,18 +1043,411 @@ def clean(
         raise typer.Exit(1) from failure
 
 
+@state_app.command("status")
+def state_status(
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """Show persisted state counts for configured sources without fetching message bodies."""
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    password = _resolve_password(settings.imap)
+    console.print("Classification state", markup=False)
+    failed = False
+    try:
+        for folder in settings.spam.folders:
+            try:
+                with ScopedMailbox(
+                    host=settings.imap.host,
+                    port=settings.imap.port,
+                    username=settings.imap.username,
+                    password=password,
+                    folder=folder,
+                    writable=False,
+                    max_message_bytes=settings.spam.max_message_bytes,
+                    max_body_chars=settings.spam.max_body_chars,
+                    event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+                ) as mailbox:
+                    snapshot = mailbox.snapshot()
+                    keywords = all_state_keywords()
+                    matches = {keyword: mailbox.search_keyword(keyword) for keyword in keywords}
+                    unclassified = mailbox.candidate_uids(excluded_keywords=keywords)
+                    marked_uids = set().union(*matches.values())
+                    conflicts = sum(
+                        sum(uid in matching_uids for matching_uids in matches.values()) > 1 for uid in marked_uids
+                    )
+                    console.print(
+                        f"folder={folder} uidvalidity={snapshot.uidvalidity} "
+                        f"backend={settings.spam.state.backend.value} "
+                        f"keyword_persistence={_keyword_persistence_label(settings.spam.state.backend, snapshot)} "
+                        f"total={len(snapshot.uids)} spam={len(matches[keywords[0]])} "
+                        f"notspam={len(matches[keywords[1]])} review={len(matches[keywords[2]])} "
+                        f"unclassified={len(unclassified)} conflicts={conflicts}",
+                        markup=False,
+                    )
+            except Exception as exc:
+                failed = True
+                console.print(f"folder={folder} backend={settings.spam.state.backend.value} status=ERROR", markup=False)
+                _print_failure(exc, debug=False, command="state")
+    finally:
+        password = ""
+    if failed:
+        raise typer.Exit(1)
+
+
+@state_app.command("reset")
+def state_reset(
+    folder: str | None = typer.Option(None, "--folder", help="Configured source folder to reset"),
+    uid: int | None = typer.Option(None, "--uid", min=1, help="Reset one exact folder-scoped UID"),
+    reset_all: bool = typer.Option(False, "--all", help="Reset all marked UIDs in the selected folder scope"),
+    all_folders: bool = typer.Option(False, "--all-folders", help="Include every configured source folder"),
+    apply: bool = typer.Option(False, "--apply", help="Remove the selected state keywords"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """Dry-run by default. Remove only imapledger state keywords from configured sources."""
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    if uid is not None and reset_all:
+        err_console.print("Usage error: --uid and --all cannot be combined.")
+        raise typer.Exit(2)
+    if all_folders and folder is not None:
+        err_console.print("Usage error: --all-folders cannot be combined with --folder.")
+        raise typer.Exit(2)
+    if all_folders and not reset_all:
+        err_console.print("Usage error: --all-folders requires --all.")
+        raise typer.Exit(2)
+    if not all_folders and folder is None:
+        err_console.print("Usage error: specify --folder, or use --all-folders --all.")
+        raise typer.Exit(2)
+    if folder is not None and folder not in settings.spam.folders:
+        err_console.print(f"Usage error: source folder is not configured: {folder}", markup=False)
+        raise typer.Exit(2)
+    if uid is None and not reset_all:
+        err_console.print("Usage error: an unbounded reset requires --all.")
+        raise typer.Exit(2)
+
+    folders = settings.spam.folders if all_folders else (folder,)
+    password = _resolve_password(settings.imap)
+    failed = False
+    try:
+        for source_folder in folders:
+            try:
+                with ScopedMailbox(
+                    host=settings.imap.host,
+                    port=settings.imap.port,
+                    username=settings.imap.username,
+                    password=password,
+                    folder=source_folder,
+                    writable=apply,
+                    max_message_bytes=settings.spam.max_message_bytes,
+                    max_body_chars=settings.spam.max_body_chars,
+                    event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+                ) as mailbox:
+                    uid_keywords: dict[int, list[str]] = {}
+                    if uid is not None:
+                        flags = mailbox.get_flags(uid)
+                        uid_keywords[uid] = list(_present_state_keywords(flags))
+                    else:
+                        for keyword in all_state_keywords():
+                            for matched_uid in mailbox.search_keyword(keyword):
+                                uid_keywords.setdefault(matched_uid, []).append(keyword)
+                    marker_count = sum(len(keywords) for keywords in uid_keywords.values())
+                    operation = "remove" if apply else "would remove"
+                    if uid is not None:
+                        markers = ",".join(uid_keywords[uid]) or "none"
+                        console.print(
+                            f"folder={source_folder} uid={uid} markers={markers} action={operation}",
+                            markup=False,
+                        )
+                    else:
+                        console.print(
+                            f"folder={source_folder} targeted_uids={len(uid_keywords)} "
+                            f"markers={marker_count} action={operation}",
+                            markup=False,
+                        )
+                    if apply:
+                        for target_uid in sorted(uid_keywords):
+                            for keyword in uid_keywords[target_uid]:
+                                mailbox.remove_keyword(target_uid, keyword)
+                            remaining = _present_state_keywords(mailbox.get_flags(target_uid))
+                            if remaining:
+                                raise ImapOperationError(
+                                    operation="imap_verify_keyword",
+                                    message="classification state remains after reset",
+                                    folder=source_folder,
+                                    selector=", ".join(remaining),
+                                    uids=(target_uid,),
+                                )
+            except Exception as exc:
+                failed = True
+                _print_failure(exc, debug=False, command="state")
+    finally:
+        password = ""
+    if failed:
+        raise typer.Exit(1)
+    if not apply:
+        console.print("Dry-run only. Re-run with --apply to remove the listed classification keywords.")
+
+
+@app.command()
+def explain(
+    uid: int = typer.Argument(..., help="Folder-scoped message UID"),
+    folder: str = typer.Option(..., "--folder", help="Configured source folder"),
+    reclassify: bool = typer.Option(False, "--reclassify", help="Run current classification even if state is stored"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """Explain persisted state or the current read-only classification of one message."""
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    if folder not in settings.spam.folders:
+        err_console.print(f"Usage error: source folder is not configured: {folder}", markup=False)
+        raise typer.Exit(2)
+    try:
+        rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
+    except RuleError as exc:
+        err_console.print(f"[red]Rules error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    password = _resolve_password(settings.imap)
+    try:
+        with ScopedMailbox(
+            host=settings.imap.host,
+            port=settings.imap.port,
+            username=settings.imap.username,
+            password=password,
+            folder=folder,
+            writable=False,
+            max_message_bytes=settings.spam.max_message_bytes,
+            max_body_chars=settings.spam.max_body_chars,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+        ) as mailbox:
+            state = mailbox.classification_state(uid)
+            state_label = state.outcome.value.upper() if state.outcome is not None else "UNCLASSIFIED"
+            cached_state = state.outcome is not None and not reclassify
+            if cached_state:
+                message = mailbox.fetch_headers(uid)
+                if message is None:
+                    raise MailboxError("message headers are not available for explanation")
+            else:
+                item = mailbox.fetch_uid(uid)
+                if item.message is None:
+                    raise MailboxError(item.skip_reason or "message is not available for explanation")
+                message = item.message
+            evidence = build_message_evidence(
+                message,
+                trusted_authserv_ids=settings.spam.trusted_authserv_ids,
+                trusted_provider_headers=settings.spam.trusted_provider_headers,
+            )
+            console.print(f"Folder={folder} UID={uid} persisted_state={state_label}", markup=False)
+            console.print(
+                f"From={_safe_text(message.sender)} Subject={_safe_text(message.subject)} "
+                f"Date={_safe_text(message.date)} Message-ID={_safe_text(message.message_id)}",
+                markup=False,
+            )
+            console.print(
+                f"Normalized sender={_safe_text(evidence.from_address.address)} "
+                f"domain={evidence.from_address.domain or '-'} "
+                f"organizational_domain={evidence.from_address.organizational_domain or '-'}",
+                markup=False,
+            )
+            if cached_state:
+                console.print(
+                    "Authentication evidence=not fetched (stored state contains only the outcome)",
+                    markup=False,
+                )
+                console.print(
+                    "Provider spam evidence=not fetched (stored state contains only the outcome)",
+                    markup=False,
+                )
+                action = getattr(settings.spam.actions, state.outcome.value)
+                console.print("Classifier: NOT RUN (pass --reclassify to evaluate current policy)", markup=False)
+                console.print(f"Configured action={_action_description(action)}", markup=False)
+                return
+            authentication = evidence.authentication
+            console.print(
+                f"Authentication trusted={authentication.trusted} authserv_id={authentication.authserv_id or '-'} "
+                f"spf={authentication.spf or '-'} dkim={','.join(item.result for item in authentication.dkim) or '-'} "
+                f"dmarc={authentication.dmarc or '-'} arc={authentication.arc or '-'}",
+                markup=False,
+            )
+            provider = evidence.provider
+            console.print(
+                f"Provider spam_flag={provider.spam_flag} spam_status={_safe_text(provider.spam_status or '-')} "
+                f"spam_score={provider.spam_score} trusted_spam={provider.trusted_spam} "
+                f"spam_marker={provider.spam_marker}",
+                markup=False,
+            )
+            rule = rules.first_match(folder, message)
+            if rule is not None:
+                console.print(f"Rule={rule.id} action={_action_description(rule.action)}", markup=False)
+                console.print("Classifier: NOT RUN (a deterministic rule matches)", markup=False)
+                return
+            with PyJevSpamClassifier(
+                trusted_authserv_ids=settings.spam.trusted_authserv_ids,
+                trusted_provider_headers=settings.spam.trusted_provider_headers,
+            ) as classifier:
+                assessment = classifier.assess(message)
+            decision = settings.spam.policy.decide(assessment.signals, assessment.evidence)
+            outcome = VERDICT_OUTCOME[decision.verdict]
+            action = getattr(settings.spam.actions, outcome.value)
+            signals = assessment.signals
+            console.print(
+                "Signals "
+                f"bulk={signals.unsolicited_bulk:.2f} phishing={signals.phishing_or_scam:.2f} "
+                f"identity={signals.identity_deception:.2f} legitimate={signals.legitimate_expected:.2f} "
+                f"delete_safe={signals.delete_safe:.2f}",
+                markup=False,
+            )
+            console.print(
+                f"Policy verdict={decision.verdict.name} reasons={','.join(decision.reasons)}",
+                markup=False,
+            )
+            console.print(f"Configured action={_action_description(action)}", markup=False)
+    except Exception as exc:
+        _print_failure(exc, debug=False, command="explain")
+        raise typer.Exit(1) from exc
+    finally:
+        password = ""
+
+
+@review_app.command("list")
+def review_list(
+    folder: str | None = typer.Option(None, "--folder", help="Configured source folder; default is all sources"),
+    limit: int | None = typer.Option(None, "--limit", min=1, help="Maximum review rows per source"),
+    offset: int = typer.Option(0, "--offset", min=0, help="Skip review rows per source"),
+    sort: MessageSort = typer.Option(MessageSort.NEWEST, "--sort", help="Order by mailbox UID"),  # noqa: B008
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """List review-marked messages using a bounded header-only fetch."""
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    if folder is not None and folder not in settings.spam.folders:
+        err_console.print(f"Usage error: source folder is not configured: {folder}", markup=False)
+        raise typer.Exit(2)
+    folders = (folder,) if folder is not None else settings.spam.folders
+    password = _resolve_password(settings.imap)
+    table = Table(title="Review queue")
+    for column in ("Folder", "UID", "From", "Subject", "Date", "Message-ID"):
+        table.add_column(column)
+    failed = False
+    try:
+        for source_folder in folders:
+            try:
+                with ScopedMailbox(
+                    host=settings.imap.host,
+                    port=settings.imap.port,
+                    username=settings.imap.username,
+                    password=password,
+                    folder=source_folder,
+                    writable=False,
+                    max_message_bytes=settings.spam.max_message_bytes,
+                    max_body_chars=settings.spam.max_body_chars,
+                    event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+                ) as mailbox:
+                    uids = sorted(
+                        mailbox.search_keyword("imapledger-v1-review"),
+                        reverse=sort is MessageSort.NEWEST,
+                    )
+                    selected = uids[offset:]
+                    if limit is not None:
+                        selected = selected[:limit]
+                    for review_uid in selected:
+                        message = mailbox.fetch_headers(review_uid)
+                        if message is None:
+                            continue
+                        table.add_row(
+                            source_folder,
+                            str(review_uid),
+                            _safe_text(message.sender),
+                            _safe_text(message.subject),
+                            _safe_text(message.date),
+                            _safe_text(message.message_id),
+                        )
+            except Exception as exc:
+                failed = True
+                _print_failure(exc, debug=False, command="review")
+    finally:
+        password = ""
+    console.print(table, markup=False)
+    if failed:
+        raise typer.Exit(1)
+
+
+def _present_state_keywords(flags: Iterable[bytes | str]) -> tuple[str, ...]:
+    normalized = {
+        flag.decode("ascii", errors="replace").casefold() if isinstance(flag, bytes) else flag.casefold()
+        for flag in flags
+    }
+    return tuple(keyword for keyword in all_state_keywords() if keyword.casefold() in normalized)
+
+
+def _keyword_persistence_label(backend: ClassificationStateBackend, snapshot: MailboxSnapshot) -> str:
+    if backend is ClassificationStateBackend.NONE:
+        return "NOT CONFIGURED"
+    if not snapshot.permanent_flags_known:
+        return "UNKNOWN"
+    if all(snapshot.supports_persistent_keyword(keyword) for keyword in all_state_keywords()):
+        return "OK"
+    return "UNSUPPORTED"
+
+
+def _action_description(action: MessageAction) -> str:
+    if action.action is ActionKind.KEEP:
+        return "keep"
+    if action.action is ActionKind.MOVE:
+        return f"move -> {action.destination}"
+    return "delete"
+
+
 def _selection_summary(
     *,
     folder: str,
     total_messages: int,
     selected_count: int,
     selection: MessageSelection,
+    unclassified_count: int | None = None,
 ) -> str:
     limit = "all" if selection.limit is None else str(selection.limit)
+    unclassified = f" unclassified={unclassified_count}" if unclassified_count is not None else ""
     return (
-        f"folder={folder} messages={total_messages} selected={selected_count} "
+        f"folder={folder} messages={total_messages}{unclassified} selected={selected_count} "
         f"sort={selection.sort.value} offset={selection.offset} limit={limit}"
     )
+
+
+def _print_state_preflight(result, *, clean_apply: bool) -> None:
+    console.print(f"classification state backend: {result.state_backend.value}")
+    if result.permanent_flags_known:
+        flags = " ".join(flag.decode("utf-8", errors="replace") for flag in sorted(result.permanent_flags)) or "-"
+        console.print(f"PERMANENTFLAGS: {flags}", markup=False)
+    else:
+        console.print("PERMANENTFLAGS: UNKNOWN")
+    if result.keyword_persistence == "supported":
+        console.print("custom keyword persistence: OK")
+    elif result.keyword_persistence == "unsupported":
+        missing = ", ".join(result.unsupported_keywords)
+        console.print(f"custom keyword persistence: UNSUPPORTED ({missing})", markup=False)
+    elif result.keyword_persistence == "unknown":
+        message = "custom keyword persistence: UNKNOWN in read-only probe"
+        if clean_apply:
+            message += "; writable source session will verify before classification"
+        console.print(message, markup=False)
+    else:
+        console.print("custom keyword persistence: NOT CONFIGURED")
 
 
 def _move_destinations(actions: SpamActions, rules: RuleSet | None = None) -> tuple[str, ...]:
@@ -1046,6 +1476,14 @@ def _safe_text(value: str) -> str:
     return redact_urls(value)[:200]
 
 
+def _state_display(row: MessageResult, *, apply: bool) -> str:
+    if row.state_source != "imap-keyword":
+        return "-"
+    if row.state_persisted:
+        return "STORED"
+    return "NOT CONFIRMED" if apply else "NOT STORED"
+
+
 def _print_result(
     row: MessageResult,
     *,
@@ -1066,10 +1504,13 @@ def _print_result(
     reasons = ",".join(row.reasons) or (row.detail or "-")
     verdict = row.verdict.name if row.verdict else "-"
     outcome = row.outcome.value.upper() if row.outcome else "-"
+    state = _state_display(row, apply=apply)
+    state_text = f"  State={state}" if state != "-" else ""
+    details = f"  Detail={row.detail}" if row.detail else ""
     console.print(
-        f"[{position}/{total}] Folder={folder} UID {row.uid}  {action}  Outcome={outcome}  Verdict={verdict}  "
-        f"Signals={_signal_summary(row)}  Reasons={reasons}  "
-        f"From={_safe_text(row.sender)}  Subject={_safe_text(row.subject)}",
+        f"[{position}/{total}] Folder={folder} UID {row.uid}  {action}  Outcome={outcome}  Verdict={verdict}"
+        f"{state_text}  Signals={_signal_summary(row)}  Reasons={reasons}  "
+        f"From={_safe_text(row.sender)}  Subject={_safe_text(row.subject)}{details}",
         markup=False,
     )
 
@@ -1134,10 +1575,15 @@ def _action_summary(report: CleanReport) -> str:
 
 
 def _print_summary(report: CleanReport) -> None:
+    state_summary = (
+        f"; state_stored={report.state_stored}"
+        if any(row.state_source == "imap-keyword" for row in report.results)
+        else ""
+    )
     console.print(
         f"Scanned {report.scanned}; rules {report.rule_matches}; spam {report.spam}; "
         f"not-spam {report.not_spam}; review {report.review}; "
-        f"skipped {report.skipped}; errors {report.errors}."
+        f"skipped {report.skipped}; errors {report.errors}{state_summary}."
     )
     console.print(_action_summary(report))
     if not report.apply:
@@ -1156,6 +1602,11 @@ def _print_summary(report: CleanReport) -> None:
 
 
 def _print_aggregate_summary(reports: list[CleanReport]) -> None:
+    state_summary = (
+        f"; state_stored={sum(report.state_stored for report in reports)}"
+        if any(row.state_source == "imap-keyword" for report in reports for row in report.results)
+        else ""
+    )
     console.print(
         f"Aggregate across {len(reports)} folders (UIDs remain folder-scoped): "
         f"scanned {sum(report.scanned for report in reports)}; "
@@ -1167,7 +1618,7 @@ def _print_aggregate_summary(reports: list[CleanReport]) -> None:
         f"errors {sum(report.errors for report in reports)}; "
         f"moved {sum(report.moved for report in reports)}; "
         f"deleted {sum(report.deleted for report in reports)}; "
-        f"kept {sum(report.kept_in_place for report in reports)}."
+        f"kept {sum(report.kept_in_place for report in reports)}{state_summary}."
     )
 
 
@@ -1214,6 +1665,7 @@ def _print_report(report: CleanReport) -> None:
     table.add_column("Signals")
     table.add_column("Reasons")
     table.add_column("Action")
+    table.add_column("State")
     table.add_column("Rule")
     table.add_column("From")
     table.add_column("Subject")
@@ -1227,6 +1679,7 @@ def _print_report(report: CleanReport) -> None:
             _signal_summary(row),
             ",".join(row.reasons) or "-",
             _final_action_label(row, apply=report.apply),
+            _state_display(row, apply=report.apply),
             row.matched_rule_id or "-",
             _safe_text(row.sender),
             _safe_text(row.subject),

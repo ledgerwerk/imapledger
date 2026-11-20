@@ -14,6 +14,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib
 
+from .classification_state import ClassificationStateBackend
 from .policy import SpamPolicy
 
 DEFAULT_MAX_MESSAGE_BYTES = 2_000_000
@@ -37,6 +38,19 @@ class AuthSource(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ClassificationStateSettings:
+    backend: ClassificationStateBackend = ClassificationStateBackend.NONE
+
+    def __post_init__(self) -> None:
+        try:
+            backend = ClassificationStateBackend(self.backend)
+        except (TypeError, ValueError) as exc:
+            allowed = ", ".join(item.value for item in ClassificationStateBackend)
+            raise ConfigError(f"spam.state.backend must be one of: {allowed}") from exc
+        object.__setattr__(self, "backend", backend)
+
+
+@dataclass(frozen=True, slots=True)
 class ImapAuthSettings:
     source: AuthSource = AuthSource.PROMPT
     vault_path: Path | None = None
@@ -55,6 +69,7 @@ class ImapAuthSettings:
             if not isinstance(self.vault_path, str) or not self.vault_path.strip():
                 raise ConfigError("imap.auth.vault_path must be a non-empty path")
             object.__setattr__(self, "vault_path", Path(self.vault_path))
+
 
 @dataclass(frozen=True, slots=True)
 class MessageAction:
@@ -114,6 +129,7 @@ class ImapSettings:
 class SpamSettings:
     folders: tuple[str, ...]
     actions: SpamActions = field(default_factory=SpamActions)
+    state: ClassificationStateSettings = field(default_factory=ClassificationStateSettings)
     max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES
     max_body_chars: int = DEFAULT_MAX_BODY_CHARS
     policy: SpamPolicy = field(default_factory=SpamPolicy)
@@ -135,6 +151,8 @@ class SpamSettings:
             raise ConfigError("spam.folders entries must not have leading or trailing whitespace")
         if len(set(folders)) != len(folders):
             raise ConfigError("spam.folders must not contain duplicates")
+        if not isinstance(self.state, ClassificationStateSettings):
+            raise ConfigError("spam.state must be classification state settings")
         if self.max_message_bytes < 1:
             raise ConfigError("spam.max_message_bytes must be positive")
         if self.max_body_chars < 1:
@@ -186,6 +204,19 @@ def _parse_imap_auth_settings(value: object) -> ImapAuthSettings:
         Path(vault_path) if vault_path is not None else None,
         value.get("vault_min_passphrase_length", DEFAULT_MIN_PASSPHRASE_LENGTH),
     )
+
+
+def _parse_classification_state_settings(value: object) -> ClassificationStateSettings:
+    if not isinstance(value, dict):
+        raise ConfigError("spam.state must be a table")
+    unknown = set(value) - {"backend"}
+    if unknown:
+        raise ConfigError(f"unknown key in spam.state: {sorted(unknown)[0]}")
+    try:
+        return ClassificationStateSettings(ClassificationStateBackend(value.get("backend", "none")))
+    except (TypeError, ValueError) as exc:
+        allowed = ", ".join(item.value for item in ClassificationStateBackend)
+        raise ConfigError(f"spam.state.backend must be one of: {allowed}") from exc
 
 
 def _parse_imap_settings(payload: dict[str, object]) -> ImapSettings:
@@ -255,12 +286,14 @@ def load_settings(path: Path | None = None) -> Settings:
         raise ConfigError("spam.authentication must be a table")
     if not isinstance(provider, dict):
         raise ConfigError("spam.provider must be a table")
+    state_settings = _parse_classification_state_settings(spam.get("state", {}))
 
     try:
         return Settings(
             imap=imap_settings,
             spam=SpamSettings(
                 folders=folders,
+                state=state_settings,
                 actions=_parse_spam_actions(spam.get("actions", {}), legacy_defaults="folder" in spam),
                 max_message_bytes=int(spam.get("max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES)),
                 max_body_chars=int(spam.get("max_body_chars", DEFAULT_MAX_BODY_CHARS)),
@@ -353,6 +386,9 @@ def render_settings(settings: Settings) -> str:
         f"folders = {_toml_string_array(settings.spam.folders)}",
         f"max_message_bytes = {settings.spam.max_message_bytes}",
         f"max_body_chars = {settings.spam.max_body_chars}",
+        "",
+        "[spam.state]",
+        f'backend = "{settings.spam.state.backend.value}"',
     ]
     if settings.imap.auth.vault_path is not None:
         source_line = f'source = "{settings.imap.auth.source.value}"'

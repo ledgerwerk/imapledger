@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Literal, Protocol
 
+from .classification_state import (
+    ClassificationStateBackend,
+    SpamOutcome,
+    all_state_keywords,
+    keyword_for_outcome,
+)
 from .classifier import SemanticSpamSignals, SpamClassifier
 from .config import ActionKind, MessageAction, SpamActions
 from .evidence import MessageEvidence
@@ -14,12 +19,6 @@ from .rules import RuleSet
 
 Status = Literal["delete", "keep", "review", "rule", "skip", "error"]
 Inclination = Literal["DELETE-APPROVED", "KEEP", "REVIEW / KEEP", "RULE", "SKIP", "ERROR / KEEP"]
-
-
-class SpamOutcome(str, Enum):
-    SPAM = "spam"
-    NOT_SPAM = "not_spam"
-    REVIEW = "review"
 
 
 VERDICT_OUTCOME = {
@@ -47,6 +46,14 @@ class Mailbox(Protocol):
 
     def delete_uids(self, uids: Sequence[int]) -> DeleteResult: ...
 
+    def set_classification_keyword(
+        self,
+        uid: int,
+        *,
+        keyword: str,
+        peer_keywords: Sequence[str],
+    ) -> None: ...
+
 
 @dataclass(slots=True)
 class MessageResult:
@@ -66,6 +73,9 @@ class MessageResult:
     request_id: str | None = None
     decision_source: Literal["rule", "spam", "skip", "error"] = "spam"
     matched_rule_id: str | None = None
+    state_source: Literal["none", "imap-keyword"] = "none"
+    state_persisted: bool = False
+    state_keyword: str | None = None
 
     @property
     def deleted(self) -> bool:
@@ -129,6 +139,10 @@ class CleanReport:
         return sum(row.action.action is ActionKind.KEEP for row in self.results)
 
     @property
+    def state_stored(self) -> int:
+        return sum(row.state_persisted for row in self.results)
+
+    @property
     def mutation_error(self) -> Exception | None:
         return self.partial_move_error or self.partial_delete_error or self.action_error
 
@@ -142,12 +156,14 @@ class SpamCleaner:
         policy: SpamPolicy | None = None,
         actions: SpamActions | None = None,
         rules: RuleSet | None = None,
+        state_backend: ClassificationStateBackend = ClassificationStateBackend.NONE,
     ) -> None:
         self._mailbox = mailbox
         self._classifier = classifier
         self._policy = policy or SpamPolicy()
         self._actions = actions or SpamActions()
         self._rules = rules or RuleSet()
+        self._state_backend = state_backend
 
     def run(
         self,
@@ -155,10 +171,19 @@ class SpamCleaner:
         apply: bool,
         selection: MessageSelection | None = None,
         on_result: ResultCallback | None = None,
+        reclassify: bool = False,
     ) -> CleanReport:
         if apply and not self._mailbox.writable:
             raise ValueError("apply=True requires a writable scoped mailbox")
         selection = selection or MessageSelection()
+        if self._state_backend is ClassificationStateBackend.IMAP_KEYWORDS:
+            excluded_keywords = () if reclassify else all_state_keywords()
+            selection = MessageSelection(
+                limit=selection.limit,
+                offset=selection.offset,
+                sort=selection.sort,
+                excluded_keywords=excluded_keywords,
+            )
         total = self._mailbox.selected_count(selection)
         report = CleanReport(folder=self._mailbox.folder, apply=apply, results=[])
 
@@ -248,6 +273,12 @@ class SpamCleaner:
 
             outcome = VERDICT_OUTCOME[decision.verdict]
             action = self._action_for(outcome)
+            state_keyword = (
+                keyword_for_outcome(outcome)
+                if self._state_backend is ClassificationStateBackend.IMAP_KEYWORDS and action.action is ActionKind.KEEP
+                else None
+            )
+            state_source: Literal["none", "imap-keyword"] = "imap-keyword" if state_keyword else "none"
             status = decision.verdict.value
             inclination: Inclination = {
                 SpamVerdict.DELETE: "DELETE-APPROVED",
@@ -267,16 +298,35 @@ class SpamCleaner:
                 outcome=outcome,
                 model=assessment.model,
                 request_id=assessment.request_id,
+                state_source=state_source,
+                state_keyword=state_keyword,
             )
             report.results.append(row)
             should_continue = True
-            if apply and row.action.action is not ActionKind.KEEP:
-                should_continue = self._apply_action(report, row)
+            if apply:
+                if row.action.action is ActionKind.KEEP:
+                    if row.state_keyword is not None:
+                        should_continue = self._persist_state(report, row)
+                else:
+                    should_continue = self._apply_action(report, row)
             notify(row)
             if not should_continue:
                 break
 
         return report
+
+    def _persist_state(self, report: CleanReport, row: MessageResult) -> bool:
+        if row.outcome is None or row.state_keyword is None:
+            return True
+        peers = tuple(keyword for keyword in all_state_keywords() if keyword != row.state_keyword)
+        try:
+            self._mailbox.set_classification_keyword(row.uid, keyword=row.state_keyword, peer_keywords=peers)
+        except Exception as exc:
+            report.action_error = exc
+            row.detail = "Classification state was not confirmed; see the operation error."
+            return False
+        row.state_persisted = True
+        return True
 
     def _action_for(self, outcome: SpamOutcome) -> MessageAction:
         return getattr(self._actions, outcome.value)

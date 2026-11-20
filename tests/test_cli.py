@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pyjev
 import pytest
@@ -15,6 +16,8 @@ from imapledger.cleaner import CleanReport, MessageResult, SpamOutcome
 from imapledger.config import (
     ActionKind,
     AuthSource,
+    ClassificationStateBackend,
+    ClassificationStateSettings,
     ImapAuthSettings,
     ImapSettings,
     MessageAction,
@@ -94,13 +97,17 @@ def test_clean_help_exposes_verbose_and_debug_options():
     assert "--sort" in result.output
     assert "--progress" in result.output
     assert "--no-progress" in result.output
+    assert "--reclassify" in result.output
 
-    assert "final configured action" in result.output
+    assert "final configured" in result.output
+    assert "action as it" in result.output
 
 
 class CleanFakeMailbox:
     folder = "Spam"
     capabilities = frozenset({b"MOVE", b"UIDPLUS"})
+    permanent_flags = frozenset({b"\\*"})
+    permanent_flags_known = True
     uids = frozenset({10, 20, 30, 40})
 
     def __init__(self):
@@ -156,10 +163,11 @@ def _configure_clean(monkeypatch, report, output):
         def __init__(self, mailbox, classifier, *, policy, actions=None, rules=None):
             pass
 
-        def run(self, *, apply, selection, on_result):
+        def run(self, *, apply, selection, on_result, reclassify=False):
             observed["apply"] = apply
             observed["selection"] = selection
             observed["on_result"] = on_result
+            observed["reclassify"] = reclassify
             if on_result is not None:
                 for position, row in enumerate(report.results, start=1):
                     on_result(row, position, len(report.results))
@@ -241,6 +249,20 @@ def test_clean_forwards_selection_arguments(monkeypatch):
     assert "messages=4 selected=0 sort=newest offset=10 limit=10" in output.getvalue()
 
 
+def test_clean_reclassify_option_is_forwarded_without_enabling_apply(monkeypatch):
+    output = StringIO()
+    report = CleanReport(folder="Spam", apply=False, results=[])
+    mailbox, observed = _configure_clean(monkeypatch, report, output)
+
+    result = CliRunner().invoke(cli.app, ["clean", "--reclassify"])
+
+    assert result.exit_code == 0
+    assert observed["apply"] is False
+    assert observed["reclassify"] is True
+    assert observed["selection"] == MessageSelection()
+    assert mailbox.selection is observed["selection"]
+
+
 @pytest.mark.parametrize(
     "arguments",
     [["clean", "--limit", "0"], ["clean", "--offset", "-1"], ["clean", "--sort", "invalid"]],
@@ -276,6 +298,27 @@ def test_rule_clean_output_shows_action_and_rule_without_spam_signals(monkeypatc
     assert "Outcome=" not in rendered
     assert "Verdict=" not in rendered
     assert "Signals=" not in rendered
+
+
+def test_progress_reports_persisted_state(monkeypatch):
+    output = StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
+    row = MessageResult(
+        uid=52,
+        subject="kept",
+        sender="user@example.org",
+        verdict=SpamVerdict.KEEP,
+        signals=None,
+        reasons=(),
+        status="keep",
+        inclination="KEEP",
+        state_source="imap-keyword",
+        state_persisted=True,
+    )
+
+    cli._print_result(row, folder="INBOX.Junk", position=1, total=1, apply=True)
+
+    assert "State=STORED" in output.getvalue()
 
 
 def test_clean_streams_decisions_once_with_summary(monkeypatch):
@@ -334,7 +377,15 @@ def test_apply_progress_reports_final_action_without_duplicate_listing(monkeypat
 
 
 class DoctorFakeClient:
-    def __init__(self, *, size=1, uids=(10,), fail_on=None, existing_folders=("Spam",)):
+    def __init__(
+        self,
+        *,
+        size=1,
+        uids=(10,),
+        fail_on=None,
+        existing_folders=("Spam",),
+        permanent_flags=(b"\\Answered", b"\\Flagged", b"\\Draft", b"\\Deleted", b"\\Seen", b"\\*"),
+    ):
         self.size = size
         self.uids = list(uids)
         self.fail_on = fail_on
@@ -346,6 +397,7 @@ class DoctorFakeClient:
         self.logged_out = False
         self.existing_folders = set(existing_folders)
         self.folder_queries = []
+        self.permanent_flags = permanent_flags
 
     def login(self, username, password):
         pass
@@ -364,7 +416,7 @@ class DoctorFakeClient:
 
     def select_folder(self, folder, readonly=False):
         self.selected.append((folder, readonly))
-        return {b"UIDVALIDITY": 42}
+        return {b"UIDVALIDITY": 42, b"PERMANENTFLAGS": self.permanent_flags}
 
     def search(self, criteria="ALL", charset=None):
         return self.uids
@@ -413,6 +465,234 @@ def _configure_doctor(monkeypatch, client, settings=None):
     return factory_options
 
 
+def _keyword_state_settings() -> Settings:
+    return Settings(
+        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
+        spam=SpamSettings(
+            folders=("Spam",),
+            state=ClassificationStateSettings(ClassificationStateBackend.IMAP_KEYWORDS),
+        ),
+    )
+
+
+def _configure_keyword_state_cli(monkeypatch, client, settings=None):
+    settings = settings or _keyword_state_settings()
+    monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
+    monkeypatch.setattr(
+        cli,
+        "ScopedMailbox",
+        lambda **kwargs: ScopedMailbox(**kwargs, client_factory=lambda *args, **options: client),
+    )
+    return settings
+
+
+def _state_raw_message(subject, body=b"PRIVATE BODY CONTENT"):
+    return (
+        f"From: sender@example.net\r\n"
+        f"To: user@example.org\r\n"
+        f"Subject: {subject}\r\n"
+        "Date: Tue, 01 Jan 2030 00:00:00 +0000\r\n"
+        "Message-ID: <message@example.net>\r\n"
+        "Authentication-Results: mx.example.net; spf=pass; dmarc=pass\r\n"
+        "X-Spam-Flag: YES\r\n"
+        "X-Spam-Status: Yes, score=5.0\r\n\r\n"
+    ).encode() + body
+
+
+def test_state_status_counts_keyword_markers_without_fetching_messages(monkeypatch):
+    client = FolderAwareFakeClient(
+        {"Spam": {uid: _state_raw_message(f"message {uid}") for uid in (10, 20, 30, 40)}},
+        flags={
+            "Spam": {
+                10: {b"imapledger-v1-spam"},
+                20: {b"imapledger-v1-notspam"},
+                30: {b"imapledger-v1-review", b"imapledger-v1-notspam"},
+                40: {b"\\seen"},
+            }
+        },
+    )
+    _configure_keyword_state_cli(monkeypatch, client)
+
+    result = CliRunner().invoke(cli.app, ["state", "status"])
+
+    assert result.exit_code == 0
+    assert "Classification state" in result.output
+    assert "uidvalidity=42" in result.output
+    assert "total=4 spam=1 notspam=2 review=1 unclassified=1 conflicts=1" in " ".join(result.output.split())
+    assert client.fetches == []
+    assert client.added == client.removed == client.expunged == []
+
+
+def test_state_reset_is_dry_run_by_default_and_apply_is_exact_uid_scoped(monkeypatch):
+    client = FolderAwareFakeClient(
+        {
+            "Spam": {10: _state_raw_message("marked"), 20: _state_raw_message("other")},
+            "Archive": {30: _state_raw_message("outside configured source")},
+        },
+        flags={
+            "Spam": {
+                10: {b"imapledger-v1-spam", b"imapledger-v1-notspam", b"\\seen"},
+                20: {b"imapledger-v1-review"},
+            },
+            "Archive": {30: {b"imapledger-v1-review"}},
+        },
+    )
+    _configure_keyword_state_cli(monkeypatch, client)
+
+    preview = CliRunner().invoke(cli.app, ["state", "reset", "--folder", "Spam", "--uid", "10"])
+
+    assert preview.exit_code == 0
+    assert "would remove" in " ".join(preview.output.split())
+    assert "imapledger-v1-spam" in preview.output
+    assert client.removed == []
+
+    applied = CliRunner().invoke(cli.app, ["state", "reset", "--folder", "Spam", "--uid", "10", "--apply"])
+
+    assert applied.exit_code == 0
+    assert client.removed == [
+        ((10,), ("imapledger-v1-spam",), True),
+        ((10,), ("imapledger-v1-notspam",), True),
+    ]
+    assert client.flags["Spam"][10] == {b"\\seen"}
+    assert b"imapledger-v1-review" in client.flags["Spam"][20]
+    assert b"imapledger-v1-review" in client.flags["Archive"][30]
+    assert client.expunged == []
+
+
+def test_state_reset_rejects_uid_outside_the_initial_snapshot(monkeypatch):
+    client = FolderAwareFakeClient(
+        {"Spam": {10: _state_raw_message("marked")}},
+        flags={"Spam": {10: {b"imapledger-v1-spam"}}},
+    )
+    _configure_keyword_state_cli(monkeypatch, client)
+
+    result = CliRunner().invoke(cli.app, ["state", "reset", "--folder", "Spam", "--uid", "99", "--apply"])
+
+    assert result.exit_code == 1
+    assert "refusing UID outside initial mailbox snapshot" in result.output
+    assert client.removed == []
+
+
+def test_state_reset_requires_all_for_an_unbounded_folder_reset(monkeypatch):
+    client = FolderAwareFakeClient({"Spam": {10: _state_raw_message("marked")}})
+    _configure_keyword_state_cli(monkeypatch, client)
+    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: pytest.fail("invalid reset prompted for a password"))
+
+    result = CliRunner().invoke(cli.app, ["state", "reset", "--folder", "Spam"])
+
+    assert result.exit_code == 2
+    assert "unbounded reset requires --all" in result.output
+    assert client.calls == []
+
+
+def test_review_list_fetches_only_bounded_headers_and_does_not_construct_classifier(monkeypatch):
+    client = FolderAwareFakeClient(
+        {
+            "Spam": {
+                10: _state_raw_message("review 10"),
+                20: _state_raw_message("review 20"),
+                30: _state_raw_message("other"),
+            }
+        },
+        flags={"Spam": {10: {b"imapledger-v1-review"}, 20: {b"imapledger-v1-review"}}},
+    )
+    _configure_keyword_state_cli(monkeypatch, client)
+    monkeypatch.setattr(cli, "PyJevSpamClassifier", lambda **kwargs: pytest.fail("review list constructed classifier"))
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["review", "list", "--folder", "Spam", "--limit", "1", "--offset", "1", "--sort", "newest"],
+    )
+
+    assert result.exit_code == 0
+    assert "review 10" in result.output
+    assert "review 20" not in result.output
+    assert "PRIVATE BODY CONTENT" not in result.output
+    assert client.fetches == [((10,), ("BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]",))]
+    assert client.added == client.removed == client.expunged == []
+
+
+def test_explain_uses_header_only_for_persisted_state_and_skips_classifier(monkeypatch):
+    client = FolderAwareFakeClient(
+        {"Spam": {10: _state_raw_message("stored spam")}},
+        flags={"Spam": {10: {b"imapledger-v1-spam"}}},
+    )
+    _configure_keyword_state_cli(monkeypatch, client)
+    monkeypatch.setattr(
+        cli,
+        "PyJevSpamClassifier",
+        lambda **kwargs: pytest.fail("cached explain constructed classifier"),
+    )
+
+    result = CliRunner().invoke(cli.app, ["explain", "10", "--folder", "Spam"])
+
+    assert result.exit_code == 0
+    assert "persisted_state=SPAM" in result.output
+    assert "Authentication evidence=not fetched" in result.output
+    assert "Classifier: NOT RUN" in result.output
+    assert "PRIVATE BODY CONTENT" not in result.output
+    assert all(data != ("BODY.PEEK[]",) for _, data in client.fetches)
+    assert client.added == client.removed == client.expunged == []
+
+
+def test_explain_reclassify_reports_evidence_signals_and_policy_without_mutating(monkeypatch):
+    settings = Settings(
+        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
+        spam=SpamSettings(
+            folders=("Spam",),
+            state=ClassificationStateSettings(ClassificationStateBackend.IMAP_KEYWORDS),
+            trusted_authserv_ids=("mx.example.net",),
+            trusted_provider_headers=("x-spam-status",),
+        ),
+    )
+    client = FolderAwareFakeClient(
+        {"Spam": {10: _state_raw_message("stored spam")}},
+        flags={"Spam": {10: {b"imapledger-v1-spam"}}},
+    )
+    _configure_keyword_state_cli(monkeypatch, client, settings=settings)
+    assessed = []
+
+    class ExplainClassifier:
+        def __init__(self, *, trusted_authserv_ids, trusted_provider_headers):
+            self.trusted_authserv_ids = trusted_authserv_ids
+            self.trusted_provider_headers = trusted_provider_headers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def assess(self, message):
+            assessed.append(message.uid)
+            evidence = cli.build_message_evidence(
+                message,
+                trusted_authserv_ids=self.trusted_authserv_ids,
+                trusted_provider_headers=self.trusted_provider_headers,
+            )
+            return SimpleNamespace(
+                signals=SemanticSpamSignals(0.2, 0.1, 0.1, 0.1, 0.1),
+                evidence=evidence,
+            )
+
+    monkeypatch.setattr(cli, "PyJevSpamClassifier", ExplainClassifier)
+
+    result = CliRunner().invoke(cli.app, ["explain", "10", "--folder", "Spam", "--reclassify"])
+
+    assert result.exit_code == 0
+    assert assessed == [10]
+    assert "persisted_state=SPAM" in result.output
+    assert "Authentication trusted=True" in result.output
+    assert "Provider spam_flag=True" in result.output
+    assert "Signals bulk=0.20" in result.output
+    assert "Policy verdict=REVIEW" in result.output
+    assert "PRIVATE BODY CONTENT" not in result.output
+    assert any(data == ("BODY.PEEK[]",) for _, data in client.fetches)
+    assert client.added == client.removed == client.expunged == []
+
+
 def test_doctor_is_read_only_and_discards_body(monkeypatch):
     client = DoctorFakeClient()
     factory_options = _configure_doctor(monkeypatch, client)
@@ -433,6 +713,43 @@ def test_doctor_is_read_only_and_discards_body(monkeypatch):
     assert client.added == client.removed == client.expunged == []
     assert client.logged_out
     assert factory_options["use_uid"] is True
+
+
+def test_doctor_reports_imap_keyword_persistence_support(monkeypatch):
+    client = DoctorFakeClient()
+    _configure_doctor(monkeypatch, client, settings=_keyword_state_settings())
+
+    result = CliRunner().invoke(cli.app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "classification state backend: imap-keywords" in result.output
+    assert "PERMANENTFLAGS:" in result.output
+    assert "custom keyword persistence: OK" in result.output
+    assert client.added == client.removed == []
+
+
+def test_doctor_reports_unknown_keyword_persistence_without_mutating(monkeypatch):
+    client = DoctorFakeClient(permanent_flags=None)
+    _configure_doctor(monkeypatch, client, settings=_keyword_state_settings())
+
+    result = CliRunner().invoke(cli.app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "custom keyword persistence: UNKNOWN in read-only probe" in result.output
+    assert client.added == client.removed == []
+
+
+def test_clean_apply_aborts_before_classification_when_keywords_are_unsupported(monkeypatch):
+    client = DoctorFakeClient(permanent_flags=())
+    _configure_doctor(monkeypatch, client, settings=_keyword_state_settings())
+
+    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
+
+    assert result.exit_code == 1
+    assert "custom keyword persistence: UNSUPPORTED" in result.output
+    assert "apply aborted before classification/mutation" in result.output
+    assert client.fetches == []
+    assert client.added == client.removed == client.expunged == []
 
 
 def test_doctor_reports_missing_source_and_checks_later_sources(monkeypatch):
@@ -696,6 +1013,8 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
         folder = "Spam"
         uids = frozenset({1, 2})
         capabilities = frozenset({b"MOVE", b"UIDPLUS"})
+        permanent_flags = frozenset({b"\\*"})
+        permanent_flags_known = True
 
         def destination_exists(self, destination):
             return True
@@ -760,6 +1079,7 @@ def test_config_show_prints_effective_config_without_prompt_or_connection(monkey
     assert result.exit_code == 0
     assert f"config: {config_path}" in rendered
     assert 'folders = ["INBOX.Junk", "INBOX.Spam"]' in rendered
+    assert 'backend = "none"' in rendered
     assert "[spam.actions.spam]" in rendered
     assert 'destination = "INBOX.Trash"' in rendered
     assert "password" not in rendered.lower()
@@ -799,6 +1119,7 @@ def test_init_writes_repeated_folders_and_configured_actions(monkeypatch, tmp_pa
     settings = load_settings(config_path)
     assert settings.spam.folders == ("INBOX.Junk", "INBOX.Spam")
     assert settings.spam.actions.spam == MessageAction(ActionKind.MOVE, "INBOX.Trash")
+    assert settings.spam.state.backend is ClassificationStateBackend.IMAP_KEYWORDS
     assert settings.spam.actions.not_spam == MessageAction(ActionKind.MOVE, "INBOX.NotSpam")
     assert "password" not in config_path.read_text(encoding="utf-8").lower()
 
@@ -832,6 +1153,8 @@ def _install_multi_clean(
             self.kwargs = kwargs
             self.uids = frozenset(range(1, 31))
             self.capabilities = frozenset({b"MOVE", b"UIDPLUS"})
+            self.permanent_flags = frozenset({b"\\*"})
+            self.permanent_flags_known = True
             self.selections = []
             state["mailboxes"].append(self)
             state["events"].append(("open", self.folder))
@@ -934,8 +1257,6 @@ def _multi_folder_settings(folders=("INBOX.Junk", "INBOX.Spam")):
     )
 
 
-
-
 def test_clean_apply_keeps_real_folder_provenance_with_selection_drift(monkeypatch):
     output = StringIO()
     settings = _multi_folder_settings(("INBOX.Junk", "INBOX.spam"))
@@ -1017,6 +1338,7 @@ def test_clean_apply_keeps_real_folder_provenance_with_selection_drift(monkeypat
         ((2001,), "INBOX.Trash"),
         ((2000,), "INBOX.Trash"),
     ]
+
 
 def test_clean_visits_multiple_folders_in_order_with_one_password_and_classifier(monkeypatch):
     output = StringIO()
@@ -1208,6 +1530,8 @@ def test_doctor_checks_all_source_folders_capabilities_and_destinations(monkeypa
             self.kwargs = kwargs
             self.folder = kwargs["folder"]
             self.capabilities = {b"MOVE"}
+            self.permanent_flags = frozenset({b"\\*"})
+            self.permanent_flags_known = True
 
         def __enter__(self):
             selections.append((self.folder, self.kwargs["writable"]))
@@ -1215,6 +1539,9 @@ def test_doctor_checks_all_source_folders_capabilities_and_destinations(monkeypa
 
         def __exit__(self, *args):
             return None
+
+        def snapshot(self):
+            return self
 
         def probe(self):
             probes.append(self.folder)
@@ -1253,6 +1580,8 @@ def test_doctor_reports_missing_preconditions_for_each_folder_and_continues(monk
             self.folder = kwargs["folder"]
             self.kwargs = kwargs
             self.capabilities = {b"MOVE"} if self.folder == "INBOX.Junk" else set()
+            self.permanent_flags = frozenset({b"\\*"})
+            self.permanent_flags_known = True
 
         def __enter__(self):
             assert self.kwargs["writable"] is False
@@ -1260,6 +1589,9 @@ def test_doctor_reports_missing_preconditions_for_each_folder_and_continues(monk
 
         def __exit__(self, *args):
             return None
+
+        def snapshot(self):
+            return self
 
         def probe(self):
             probes.append(self.folder)
@@ -1675,8 +2007,6 @@ def test_rule_learn_yes_saves_read_only_without_moving_current_uid(monkeypatch, 
     assert "Saved rule mailer-daemon-gmx-net" in state["output"].getvalue()
 
 
-
-
 def test_rule_learn_reads_source_message_after_destination_probe(monkeypatch, tmp_path):
     output = StringIO()
     source_raw = raw_message("Source example", "mailer-daemon@gmx.net")
@@ -1729,6 +2059,7 @@ def test_rule_learn_reads_source_message_after_destination_probe(monkeypatch, tm
     assert "Subject: Source example" in output.getvalue()
     assert "Wrong destination example" not in output.getvalue()
     assert client.selected[-1] == ("INBOX.Junk", True)
+
 
 def test_rule_learn_preview_does_not_save_even_with_yes(monkeypatch, tmp_path):
     state, _ = _install_rule_learn(monkeypatch, tmp_path)
@@ -1838,6 +2169,7 @@ def _write_auth_config(
     cli.write_settings(settings, path)
     return settings
 
+
 @pytest.mark.parametrize(
     ("storage_args", "source", "expected_prompts"),
     [
@@ -1891,8 +2223,9 @@ def test_auth_set_selects_storage_and_keeps_secrets_out_of_config_and_output(
     monkeypatch.setattr(
         cli,
         "credential_backend_for_storage",
-        lambda storage, *, vault_path=None, vault_min_passphrase_length=12: selected_storage.append(storage)
-        or FakeBackend(source, vault_path),
+        lambda storage, *, vault_path=None, vault_min_passphrase_length=12: (
+            selected_storage.append(storage) or FakeBackend(source, vault_path)
+        ),
     )
 
     result = CliRunner().invoke(
@@ -1953,8 +2286,6 @@ def test_auth_vault_cli_roundtrips_a_secret_without_serializing_it(
     assert password not in repr(resolved)
 
 
-
-
 def test_auth_set_reports_custom_minimum_for_short_new_vault_passphrase(monkeypatch, tmp_path):
     config_path = tmp_path / "config.toml"
     vault_path = tmp_path / "credentials.enc"
@@ -2013,6 +2344,7 @@ def test_auth_set_existing_vault_uses_generic_prompt_and_unlocks_short_passphras
     assert settings.imap.auth.vault_min_passphrase_length == DEFAULT_MIN_PASSPHRASE_LENGTH
     resolved = cli.resolve_credential(settings.imap, prompt_secret=lambda prompt: passphrase)
     assert resolved.password == password
+
 
 def test_configured_vault_path_flows_through_auth_commands_and_runtime(monkeypatch, tmp_path):
     home = tmp_path / "home"

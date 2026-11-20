@@ -6,6 +6,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
+from .classification_state import (
+    ClassificationStateConflict,
+    PersistedState,
+    SpamOutcome,
+    all_state_keywords,
+    keyword_for_outcome,
+    validate_state_flags,
+)
 from .message import MailMessage, parse_message
 
 DELETED_FLAG = "\\Deleted"
@@ -214,6 +222,11 @@ ClientFactory = Callable[..., _Client]
 class MailboxSnapshot:
     uidvalidity: int
     uids: frozenset[int]
+    permanent_flags: frozenset[bytes] = frozenset()
+    permanent_flags_known: bool = False
+
+    def supports_persistent_keyword(self, keyword: str) -> bool:
+        return _supports_persistent_keyword(self.permanent_flags, keyword)
 
 
 class MessageSort(str, Enum):
@@ -226,6 +239,7 @@ class MessageSelection:
     limit: int | None = None
     offset: int = 0
     sort: MessageSort = MessageSort.NEWEST
+    excluded_keywords: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.limit is not None and self.limit < 1:
@@ -234,6 +248,12 @@ class MessageSelection:
             raise ValueError("offset must be non-negative")
         if not isinstance(self.sort, MessageSort):
             raise ValueError("sort must be a MessageSort")
+        if not isinstance(self.excluded_keywords, tuple) or any(
+            not isinstance(keyword, str) or not keyword for keyword in self.excluded_keywords
+        ):
+            raise ValueError("excluded_keywords must be a tuple of non-empty strings")
+        if len(set(self.excluded_keywords)) != len(self.excluded_keywords):
+            raise ValueError("excluded_keywords must not contain duplicates")
 
 
 @dataclass(frozen=True, slots=True)
@@ -560,6 +580,8 @@ class ScopedMailbox:
                 ) from exc
             self._emit(f"select folder={self._folder!r} readonly={not self._writable}")
             uidvalidity = _uidvalidity(selected)
+            permanent_flags = _permanent_flags(selected)
+            permanent_flags_known = _permanent_flags_known(selected)
             self._emit(f"uidvalidity={uidvalidity}")
 
             try:
@@ -579,7 +601,12 @@ class ScopedMailbox:
                 pass
             raise
         self._client = client
-        self._snapshot = MailboxSnapshot(uidvalidity=uidvalidity, uids=uids)
+        self._snapshot = MailboxSnapshot(
+            uidvalidity=uidvalidity,
+            uids=uids,
+            permanent_flags=permanent_flags,
+            permanent_flags_known=permanent_flags_known,
+        )
         self._capabilities = normalized_capabilities
         return self
 
@@ -606,7 +633,320 @@ class ScopedMailbox:
             raise MailboxError("mailbox is not open")
         return self._snapshot
 
+    def candidate_uids(self, *, excluded_keywords: Sequence[str] = ()) -> frozenset[int]:
+        keywords = tuple(excluded_keywords)
+        for keyword in keywords:
+            _require_state_keyword(keyword)
+        if not keywords:
+            return self.snapshot().uids
+        criteria = [part for keyword in keywords for part in ("UNKEYWORD", keyword)]
+        return self._search_snapshot_uids(
+            criteria,
+            operation="imap_search_unclassified",
+            message="UID SEARCH for unclassified messages failed",
+        )
+
+    def require_persistent_classification_state(self) -> None:
+        snapshot = self.snapshot()
+        unsupported = tuple(
+            keyword for keyword in all_state_keywords() if not snapshot.supports_persistent_keyword(keyword)
+        )
+        if unsupported:
+            raise ImapOperationError(
+                operation="imap_keyword_unsupported",
+                message="selected source mailbox does not support persistent classification keywords",
+                folder=self._folder,
+                selector=", ".join(unsupported),
+            )
+
+    def search_keyword(self, keyword: str) -> frozenset[int]:
+        _require_state_keyword(keyword)
+        return self._search_snapshot_uids(
+            ["KEYWORD", keyword],
+            operation="imap_search_keyword",
+            message="UID SEARCH for classification keyword failed",
+        )
+
+    def _search_snapshot_uids(self, criteria: Any, *, operation: str, message: str) -> frozenset[int]:
+        client = self._reselect_source(operation=f"{operation}_select")
+        try:
+            found = {int(uid) for uid in client.search(criteria)}
+        except Exception as exc:
+            selector = " ".join(criteria) if isinstance(criteria, list) else str(criteria)
+            raise _operation_error(
+                operation=operation,
+                message=message,
+                exc=exc,
+                folder=self._folder,
+                selector=selector,
+            ) from exc
+        return frozenset(found & self.snapshot().uids)
+
+    def get_flags(self, uid: int) -> frozenset[bytes | str]:
+        self._validate_snapshot_uid(uid)
+        client = self._reselect_source(operation="imap_fetch_flags_select")
+        if not self._search_exact_uid(client, uid, operation="imap_fetch_flags_search"):
+            raise UnsafeMailboxOperation(f"approved UID no longer exists in scoped mailbox: {uid}")
+        return self._fetch_flags(client, uid, operation="imap_fetch_flags")
+
+    def classification_state(self, uid: int) -> PersistedState:
+        try:
+            return validate_state_flags(self.get_flags(uid))
+        except ClassificationStateConflict as exc:
+            raise self._state_conflict_error(uid) from exc
+
+    def fetch_headers(self, uid: int) -> MailMessage | None:
+        self._validate_snapshot_uid(uid)
+        client = self._reselect_source(operation="imap_fetch_headers_select")
+        if not self._search_exact_uid(client, uid, operation="imap_fetch_headers_search"):
+            return None
+        selector = "BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]"
+        try:
+            response = client.fetch((uid,), [selector])
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_fetch_headers",
+                message="FETCH of message headers failed",
+                exc=exc,
+                folder=self._folder,
+                selector=selector,
+                uids=(uid,),
+            ) from exc
+        data = response.get(uid)
+        if not data:
+            return None
+        raw = next(
+            (
+                value
+                for key, value in data.items()
+                if isinstance(key, bytes) and key.upper().startswith(b"BODY[HEADER.FIELDS")
+            ),
+            None,
+        )
+        if not isinstance(raw, bytes):
+            raise ImapOperationError(
+                operation="imap_fetch_headers",
+                message="server did not return the requested message headers",
+                folder=self._folder,
+                selector=selector,
+                uids=(uid,),
+            )
+        return parse_message(uid, raw, max_body_chars=0)
+
+    def add_keyword(self, uid: int, keyword: str) -> None:
+        self._add_keyword(uid, keyword, allow_existing_state=False)
+
+    def _add_keyword(self, uid: int, keyword: str, *, allow_existing_state: bool) -> None:
+        _require_state_keyword(keyword)
+        client = self._prepare_keyword_mutation(uid, keyword, operation="add_keyword", require_persistence=True)
+        try:
+            current = validate_state_flags(self._fetch_flags(client, uid, operation="imap_verify_keyword"))
+        except ClassificationStateConflict as exc:
+            raise self._state_conflict_error(uid) from exc
+        expected = next(outcome for outcome in SpamOutcome if keyword_for_outcome(outcome) == keyword)
+        if current.outcome is not None and current.outcome is not expected and not allow_existing_state:
+            raise self._state_conflict_error(
+                uid,
+                message="a different classification state already exists; use outcome replacement",
+            )
+        try:
+            client.add_flags((uid,), [keyword], silent=True)
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_add_keyword",
+                message="STORE of classification keyword failed",
+                exc=exc,
+                folder=self._folder,
+                selector=keyword,
+                uids=(uid,),
+            ) from exc
+        flags = self._fetch_flags(client, uid, operation="imap_verify_keyword")
+        if not _contains_keyword(flags, keyword):
+            raise ImapOperationError(
+                operation="imap_verify_keyword",
+                message="server did not persist the classification keyword",
+                folder=self._folder,
+                selector=keyword,
+                uids=(uid,),
+            )
+        if not allow_existing_state:
+            try:
+                state = validate_state_flags(flags)
+            except ClassificationStateConflict as exc:
+                raise self._state_conflict_error(uid) from exc
+            if state.outcome is not expected:
+                raise self._state_conflict_error(
+                    uid,
+                    message="classification state changed during keyword persistence",
+                )
+
+    def remove_keyword(self, uid: int, keyword: str) -> None:
+        _require_state_keyword(keyword)
+        client = self._prepare_keyword_mutation(uid, keyword, operation="remove_keyword", require_persistence=False)
+        try:
+            client.remove_flags((uid,), [keyword], silent=True)
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_remove_keyword",
+                message="STORE removal of classification keyword failed",
+                exc=exc,
+                folder=self._folder,
+                selector=keyword,
+                uids=(uid,),
+            ) from exc
+        flags = self._fetch_flags(client, uid, operation="imap_verify_keyword")
+        if _contains_keyword(flags, keyword):
+            raise ImapOperationError(
+                operation="imap_verify_keyword",
+                message="server did not remove the classification keyword",
+                folder=self._folder,
+                selector=keyword,
+                uids=(uid,),
+            )
+
+    def set_classification_keyword(
+        self,
+        uid: int,
+        *,
+        keyword: str,
+        peer_keywords: Sequence[str],
+    ) -> None:
+        _require_state_keyword(keyword)
+        peers = tuple(peer_keywords)
+        if len(peers) != 2 or set(peers) != set(all_state_keywords()) - {keyword}:
+            raise ValueError("peer_keywords must contain the other classification keywords")
+        self._add_keyword(uid, keyword, allow_existing_state=True)
+        for peer in peers:
+            self.remove_keyword(uid, peer)
+        try:
+            state = validate_state_flags(self.get_flags(uid))
+        except ClassificationStateConflict as exc:
+            raise self._state_conflict_error(uid) from exc
+        expected = next(outcome for outcome in SpamOutcome if keyword_for_outcome(outcome) == keyword)
+        if state.outcome is not expected or state.keywords != frozenset({keyword}):
+            raise ImapOperationError(
+                operation="imap_verify_keyword",
+                message="server did not retain exactly one requested classification state",
+                folder=self._folder,
+                selector=keyword,
+                uids=(uid,),
+            )
+
+    def _prepare_keyword_mutation(
+        self,
+        uid: int,
+        keyword: str,
+        *,
+        operation: str,
+        require_persistence: bool,
+    ) -> _Client:
+        if not self._writable:
+            raise UnsafeMailboxOperation("mailbox is read-only")
+        self._validate_snapshot_uid(uid)
+        client, selected = self._reselect_source_with_response(
+            readonly=False,
+            operation=f"imap_pre{operation}_select",
+        )
+        if not self._search_exact_uid(client, uid, operation=f"imap_pre{operation}_search"):
+            raise UnsafeMailboxOperation(f"approved UID no longer exists in scoped mailbox: {uid}")
+        if require_persistence and not _supports_persistent_keyword(_permanent_flags(selected), keyword):
+            raise ImapOperationError(
+                operation="imap_keyword_unsupported",
+                message="selected mailbox does not advertise persistent support for the classification keyword",
+                folder=self._folder,
+                selector=keyword,
+                uids=(uid,),
+            )
+        return client
+
+    def _validate_snapshot_uid(self, uid: int) -> None:
+        if isinstance(uid, bool) or not isinstance(uid, int) or uid < 1:
+            raise ValueError("uid must be a positive integer")
+        if uid not in self.snapshot().uids:
+            raise UnsafeMailboxOperation(f"refusing UID outside initial mailbox snapshot: {uid}")
+
+    def _search_exact_uid(self, client: _Client, uid: int, *, operation: str) -> bool:
+        try:
+            found = client.search(["UID", uid])
+        except Exception as exc:
+            raise _operation_error(
+                operation=operation,
+                message="exact UID SEARCH failed in scoped mailbox",
+                exc=exc,
+                folder=self._folder,
+                selector=f"UID {uid}",
+                uids=(uid,),
+            ) from exc
+        return uid in {int(found_uid) for found_uid in found}
+
+    def _fetch_flags(self, client: _Client, uid: int, *, operation: str) -> frozenset[bytes | str]:
+        try:
+            response = client.fetch((uid,), ["FLAGS"])
+        except Exception as exc:
+            raise _operation_error(
+                operation=operation,
+                message="FETCH FLAGS failed for scoped UID",
+                exc=exc,
+                folder=self._folder,
+                selector="FLAGS",
+                uids=(uid,),
+            ) from exc
+        data = response.get(uid)
+        flags = data.get(b"FLAGS", data.get("FLAGS")) if isinstance(data, Mapping) else None
+        if flags is None:
+            raise ImapOperationError(
+                operation=operation,
+                message="server did not return FLAGS for scoped UID",
+                folder=self._folder,
+                selector="FLAGS",
+                uids=(uid,),
+            )
+        values = (flags,) if isinstance(flags, (bytes, str)) else flags
+        try:
+            normalized = frozenset(values)
+        except TypeError as exc:
+            raise ImapOperationError(
+                operation=operation,
+                message="server returned malformed FLAGS for scoped UID",
+                folder=self._folder,
+                selector="FLAGS",
+                uids=(uid,),
+                cause_type=type(exc).__name__,
+            ) from exc
+        if any(not isinstance(flag, (bytes, str)) for flag in normalized):
+            raise ImapOperationError(
+                operation=operation,
+                message="server returned malformed FLAGS for scoped UID",
+                folder=self._folder,
+                selector="FLAGS",
+                uids=(uid,),
+            )
+        return normalized
+
+    def _state_conflict_error(
+        self,
+        uid: int,
+        *,
+        message: str = "multiple imapledger classification state keywords are present",
+    ) -> ImapOperationError:
+        return ImapOperationError(
+            operation="imap_state_conflict",
+            message=message,
+            folder=self._folder,
+            selector="classification keywords",
+            uids=(uid,),
+        )
+
     def _reselect_source(self, *, readonly: bool | None = None, operation: str) -> _Client:
+        client, _ = self._reselect_source_with_response(readonly=readonly, operation=operation)
+        return client
+
+    def _reselect_source_with_response(
+        self,
+        *,
+        readonly: bool | None = None,
+        operation: str,
+    ) -> tuple[_Client, Mapping[bytes, Any]]:
         client = self._require_client()
         if readonly is None:
             readonly = not self._writable
@@ -629,7 +969,7 @@ class ScopedMailbox:
                     "refusing source operation"
                 )
         self._emit(f"reselect folder={self._folder!r} readonly={readonly}")
-        return client
+        return client, selected
 
     def probe(self) -> MailboxProbe:
         client = self._require_client()
@@ -791,8 +1131,9 @@ class ScopedMailbox:
         return len(self._selected_uids(selection))
 
     def _selected_uids(self, selection: MessageSelection) -> tuple[int, ...]:
+        candidate_uids = self.candidate_uids(excluded_keywords=selection.excluded_keywords)
         ordered_uids = sorted(
-            self.snapshot().uids,
+            candidate_uids,
             reverse=selection.sort is MessageSort.NEWEST,
         )
         selected_uids = ordered_uids[selection.offset :]
@@ -1208,6 +1549,67 @@ def _operation_error(
         cause_type=type(exc).__name__,
         server_status=_safe_server_status(exc),
     )
+
+
+def _permanent_flags_known(selected: Mapping[bytes, Any]) -> bool:
+    if b"PERMANENTFLAGS" in selected:
+        values = selected[b"PERMANENTFLAGS"]
+    elif "PERMANENTFLAGS" in selected:
+        values = selected["PERMANENTFLAGS"]
+    else:
+        return False
+    if values is None:
+        return False
+    if isinstance(values, (bytes, str)):
+        return True
+    try:
+        flags = tuple(values)
+    except TypeError:
+        return False
+    return all(isinstance(flag, (bytes, str)) for flag in flags)
+
+
+def _permanent_flags(selected: Mapping[bytes, Any]) -> frozenset[bytes]:
+    values = selected.get(b"PERMANENTFLAGS", selected.get("PERMANENTFLAGS"))
+    if values is None:
+        return frozenset()
+    raw_flags = (values,) if isinstance(values, (bytes, str)) else values
+    try:
+        flags = tuple(raw_flags)
+    except TypeError:
+        return frozenset()
+    normalized: set[bytes] = set()
+    for flag in flags:
+        if isinstance(flag, bytes):
+            normalized.add(flag.upper())
+        elif isinstance(flag, str):
+            try:
+                normalized.add(flag.encode("ascii").upper())
+            except UnicodeEncodeError:
+                continue
+    return frozenset(normalized)
+
+
+def _supports_persistent_keyword(permanent_flags: Collection[bytes], keyword: str) -> bool:
+    try:
+        keyword_flag = keyword.encode("ascii").upper()
+    except UnicodeEncodeError:
+        return False
+    normalized = {flag.upper() for flag in permanent_flags}
+    return b"\\*" in normalized or keyword_flag in normalized
+
+
+def _contains_keyword(flags: Collection[bytes | str], keyword: str) -> bool:
+    expected = keyword.casefold()
+    return any(
+        (flag.decode("ascii", errors="replace") if isinstance(flag, bytes) else flag).casefold() == expected
+        for flag in flags
+    )
+
+
+def _require_state_keyword(keyword: str) -> None:
+    if keyword not in all_state_keywords():
+        raise UnsafeMailboxOperation("keyword is not an application-owned classification state")
 
 
 def _uidvalidity(selected: dict[bytes, Any]) -> int:

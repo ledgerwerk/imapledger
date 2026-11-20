@@ -29,7 +29,6 @@ folder=INBOX.Spam messages=294 selected=10 sort=newest offset=0 limit=10
 
 `--progress` streams each classification and the final configured action for that message. `--no-progress` suppresses those rows and prints a final table with `Source`, `Outcome`, and `Action` columns. `--verbose` adds safe IMAP operation diagnostics. `--debug` prints local traceback frames and exception class names without raw exception payloads.
 
-
 Every streamed result row includes `Folder=<exact configured source name>` immediately before the UID. This keeps source provenance visible on each row, including rule-match results.
 
 ## Outcome and action reporting
@@ -43,6 +42,12 @@ Dry-run output can look like:
 [2/10] Folder=INBOX.Junk UID 43653  WOULD MOVE -> INBOX.NotSpam  Outcome=NOT_SPAM  Verdict=KEEP
 [3/10] Folder=INBOX.Junk UID 43652  KEEP  Outcome=REVIEW  Verdict=REVIEW
 ```
+
+## Persistent classification state
+
+With `[spam.state].backend = "imap-keywords"`, `clean` skips previously marked messages before applying `--limit` and `--offset`. State is written only by `clean --apply` when the configured final action is `keep`; dry runs never write markers. Use `--reclassify` to ignore stored state for one run. Marker conflicts are not resolved automatically.
+
+See [Persistent classification state](state.md) for the keyword support requirements, status and reset commands, read-only explanation behavior, review queue, and failure handling.
 
 ## Routing rule precedence
 
