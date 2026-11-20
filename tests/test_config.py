@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from ledgercore import AtomicWriteError
+from vaultconfig.secrets import DEFAULT_MIN_PASSPHRASE_LENGTH
 
 import imapledger.config as config_module
 from imapledger.config import (
@@ -20,6 +21,7 @@ from imapledger.config import (
     load_imap_settings,
     load_settings,
     render_settings,
+    write_auth_config,
     write_settings,
 )
 from imapledger.policy import SpamPolicy
@@ -93,6 +95,7 @@ def test_render_settings_includes_defaults_and_roundtrips_without_credentials(tm
 
     rendered = render_settings(settings)
     path = tmp_path / "rendered.toml"
+    assert f"vault_min_passphrase_length = {DEFAULT_MIN_PASSPHRASE_LENGTH}" in rendered
     path.write_text(rendered, encoding="utf-8")
 
     assert '[spam.actions.spam]\naction = "delete"' in rendered
@@ -314,3 +317,137 @@ def test_imap_auth_configuration_requires_a_table(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="imap.auth must be a table"):
         load_imap_settings(path)
+
+
+def test_optional_auth_vault_path_round_trips_without_expanding(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """[imap]
+host = "imap.example.org"
+username = "me@example.org"
+
+[imap.auth]
+source = "vault"
+vault_path = "~/credentials/custom.enc"
+
+[spam]
+folders = ["Spam"]
+""",
+        encoding="utf-8",
+    )
+
+    settings = load_settings(path)
+
+    assert settings.imap.auth.vault_path == Path("~/credentials/custom.enc")
+    rendered = render_settings(settings)
+    assert 'vault_path = "~/credentials/custom.enc"' in rendered
+    roundtrip = tmp_path / "roundtrip.toml"
+    roundtrip.write_text(rendered, encoding="utf-8")
+    assert load_settings(roundtrip) == settings
+
+
+def test_write_auth_config_preserves_unrelated_toml_and_vault_path(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """# keep this comment
+[imap]
+host = "imap.example.org"
+username = "me@example.org"
+
+[imap.auth]
+# keep auth comments
+source = "prompt"
+
+[spam]
+folders = ["Spam"]
+unrelated = "keep-me"
+""",
+        encoding="utf-8",
+    )
+
+    write_auth_config(path, source=AuthSource.VAULT, vault_path=Path("~/vaults/account.enc"))
+    updated = path.read_text(encoding="utf-8")
+
+    assert "# keep this comment" in updated
+    assert "# keep auth comments" in updated
+    assert 'unrelated = "keep-me"' in updated
+    assert load_settings(path).imap.auth.source is AuthSource.VAULT
+    assert load_settings(path).imap.auth.vault_path == Path("~/vaults/account.enc")
+
+    write_auth_config(path, source=AuthSource.KEYRING)
+    settings = load_settings(path)
+    assert settings.imap.auth.source is AuthSource.KEYRING
+    assert settings.imap.auth.vault_path == Path("~/vaults/account.enc")
+
+
+def test_distinct_configs_preserve_distinct_vault_paths(tmp_path: Path) -> None:
+    config_a = tmp_path / "a.toml"
+    config_b = tmp_path / "b.toml"
+    vault_a = Path("~/imapledger/a.enc")
+    vault_b = Path("~/imapledger/b.enc")
+
+    write_settings(_settings(), config_a)
+    write_settings(_settings(), config_b)
+    write_auth_config(config_a, source=AuthSource.VAULT, vault_path=vault_a)
+    write_auth_config(config_b, source=AuthSource.VAULT, vault_path=vault_b)
+
+    assert load_settings(config_a).imap.auth.vault_path == vault_a
+    assert load_settings(config_b).imap.auth.vault_path == vault_b
+
+
+def test_vault_min_passphrase_length_defaults_and_custom_value_round_trips(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
+        '[imap.auth]\nsource = "vault"\n',
+        encoding="utf-8",
+    )
+    assert load_imap_settings(path).auth.vault_min_passphrase_length == DEFAULT_MIN_PASSPHRASE_LENGTH
+
+    path.write_text(
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
+        '[imap.auth]\nsource = "vault"\nvault_min_passphrase_length = 10\n',
+        encoding="utf-8",
+    )
+    imap = load_imap_settings(path)
+    assert imap.auth.vault_min_passphrase_length == 10
+
+    rendered = render_settings(Settings(imap=imap, spam=SpamSettings(folders=("Spam",))))
+    assert "vault_min_passphrase_length = 10" in rendered
+    round_trip = tmp_path / "round-trip.toml"
+    round_trip.write_text(rendered, encoding="utf-8")
+    assert load_settings(round_trip).imap.auth.vault_min_passphrase_length == 10
+
+
+@pytest.mark.parametrize("raw_value", ["0", "-1", '"10"', "true", "10.0"])
+def test_invalid_vault_min_passphrase_length_is_rejected(tmp_path: Path, raw_value: str) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
+        f'[imap.auth]\nvault_min_passphrase_length = {raw_value}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match=r"imap\.auth\.vault_min_passphrase_length must be a positive integer",
+    ):
+        load_imap_settings(path)
+
+
+def test_write_auth_config_preserves_custom_vault_minimum_across_source_updates(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
+        '[imap.auth]\nsource = "prompt"\nvault_min_passphrase_length = 10\n',
+        encoding="utf-8",
+    )
+
+    write_auth_config(path, source=AuthSource.VAULT, vault_path=Path("~/credentials.enc"))
+    assert load_imap_settings(path).auth.vault_min_passphrase_length == 10
+    write_auth_config(path, source=AuthSource.KEYRING)
+    assert load_imap_settings(path).auth.vault_min_passphrase_length == 10
+    write_auth_config(path, source=AuthSource.PROMPT)
+    settings = load_imap_settings(path)
+    assert settings.auth.source is AuthSource.PROMPT
+    assert settings.auth.vault_min_passphrase_length == 10

@@ -4,28 +4,123 @@ The default configuration path is `$XDG_CONFIG_HOME/imapledger/config.toml`, or 
 
 ## IMAP credential sources
 
-`[imap.auth].source` accepts `prompt`, `keyring`, or `vault`. It selects where imapledger obtains the IMAP password, not where it is written in TOML. `imapledger config show` displays the selected source but never a password, vault passphrase, or ciphertext, and does not connect to IMAP.
+`[imap.auth].source` accepts `prompt`, `keyring`, or `vault`. It selects where imapledger
+obtains the IMAP password, not where it is written in TOML. `imapledger config show`
+displays the selected source, effective vault minimum, and non-secret `vault_path`, but never a password, vault
+passphrase, or ciphertext, and does not connect to IMAP.
 
 ```toml
 [imap.auth]
 source = "prompt"
 ```
 
-Prompt mode is the compatibility default. Stored credentials are opt-in through `auth set`, which reads the IMAP password using hidden input and never accepts it as a command-line argument:
+Prompt mode is the compatibility default. Stored credentials are opt-in through `auth set`,
+which reads the IMAP password using hidden input and never accepts it as a command-line
+argument:
 
 ```bash
 imapledger auth set
-imapledger auth set --storage encrypted-file
-imapledger auth status
+imapledger auth set --storage keyring
+imapledger auth set --storage vault
+imapledger auth set --storage vault --replace
+imapledger auth status --verbose
 imapledger auth delete
 imapledger auth change-passphrase
 ```
 
-`auth set` defaults to the OS keyring. `--storage vault` and its `--storage encrypted-file` alias select the encrypted VaultConfig file. A new encrypted file is stored at `$XDG_DATA_HOME/imapledger/credentials.enc`, or `~/.local/share/imapledger/credentials.enc` when `XDG_DATA_HOME` is unset. Creating it prompts for a hidden master passphrase twice. Install `imapledger[keyring]` to enable the optional keyring backend. Only supported native OS keyrings are accepted; an unavailable backend fails closed and never falls back to plaintext or prompt authentication.
+`auth set` defaults to `--storage auto`. Auto probes for an approved native OS keyring and
+uses it when available. If keyring support or a supported backend is unavailable, the
+command fails before prompting for secrets and shows explicit choices. It never silently
+falls back to a file vault or prompt mode:
 
-An existing credential is not overwritten. Delete the configured credential first, then set a replacement with `--storage vault` when needed. `auth delete` asks for confirmation unless `--yes` is supplied; vault mode also asks for the master passphrase. It removes only the current account's entry and returns the configured source to `prompt`, leaving other entries in a shared encrypted vault intact. `auth status` reports only source availability and, for keyring storage, the backend name; vault status prompts for the master passphrase to check the account entry. `auth change-passphrase` is available when the configured source is `vault` and prompts for the old and confirmed new values. Forgetting the vault passphrase makes its contents unrecoverable.
+```text
+No supported OS keyring is available.
 
-A missing or unavailable credential in an explicitly selected keyring or vault is an error. imapledger does not silently fall back to a password prompt. `clean`, `doctor`, `rule learn`, `rule test`, and `folders` resolve credentials once per invocation. Direct `folders --host ... --username ...` mode has no configured storage source and continues to use hidden prompt authentication.
+Install:
+    pip install 'imapledger[keyring]'
+
+or use the encrypted file vault explicitly:
+    imapledger auth set --storage vault
+```
+
+Choose `--storage keyring` to require an OS keyring, or `--storage vault` to explicitly
+select the encrypted VaultConfig file. `--storage encrypted-file` remains an alias for
+`vault`. Keyring support is optional and accepts only supported native OS keyrings.
+
+For a file vault, `[imap.auth].vault_path` optionally selects its location:
+
+```toml
+[imap.auth]
+source = "vault"
+vault_path = "~/.local/share/imapledger/credentials.enc"
+vault_min_passphrase_length = 10
+```
+
+When omitted, imapledger uses `$XDG_DATA_HOME/imapledger/credentials.enc`, or
+`~/.local/share/imapledger/credentials.enc` when `XDG_DATA_HOME` is unset. A configured
+`~` is expanded at use time. The path is not secret, is safe to show in configuration, and
+allows separate config files to use separate vaults. The configured path is used by
+`auth set`, `auth status`, `auth delete`, `auth change-passphrase`, and runtime credential
+resolution.
+
+New stored credentials are not overwritten by default. If the account already exists in
+the selected backend, `auth set` fails without changing the config or secret. Use
+`--replace` to explicitly target only this account's credential in the selected backend.
+If that entry is absent, `--replace` creates it; if present, it updates it. A failed
+replacement leaves the configured source unchanged. When the selected backend already
+matches the configured source, imapledger does not rewrite the source; when they differ,
+the source changes only after a successful replacement. It never switches to prompt mode
+as an intermediate step. VaultConfig commits file-vault updates atomically. Keyring
+operations depend on the backend's own multi-step guarantees, which may be weaker.
+
+Setting a stored credential creates it in the secure backend before changing the config
+source. If config persistence fails, imapledger attempts to remove only the credential it
+just created. If that rollback also fails, the error reports a possible orphaned
+credential. Deletion changes the config source to `prompt` before removing only the
+current account's credential. If deletion fails, imapledger restores the previous source;
+a failed restoration is reported as inconsistent state. Other credentials in a shared
+vault are retained.
+
+`auth status` never prompts for a password or unlocks the file vault. For keyring storage,
+it reports backend availability and account credential presence when safely available. If
+the keyring is unavailable, it shows a safe reason and installation hint. For vault
+storage, it inspects the file without decrypting entries. It reports safe format and KDF
+metadata; account-specific presence is `unknown until unlock`. `--verbose` includes the
+vault format, KDF, memory and operation limits, entry count, and the current
+`new-passphrase minimum` from local configuration. This minimum describes the policy for
+future creation or passphrase changes, not the policy used to create an existing vault.
+Status does not perform IMAP login.
+
+A new vault prompts for the IMAP password and a separate master passphrase, confirmed
+before the vault is created. The prompt shows the configured minimum. The
+`[imap.auth].vault_min_passphrase_length` setting defaults to 12 characters unless changed;
+it is a minimum character count, and digits or symbols do not alter the threshold. The
+example above sets it to 10.
+
+VaultConfig applies this minimum when it creates a vault and when `auth change-passphrase`
+sets a new master passphrase. The minimum is not enforced while unlocking an existing vault.
+Changing the setting does not rewrite a vault or prevent its existing passphrase from
+unlocking it. The actual master passphrase is never written to TOML.
+
+Lowering the default is a deliberate security tradeoff. Argon2id slows offline guessing,
+but anyone with a copied encrypted vault can attack it offline. Adding digits or symbols
+does not automatically make a shorter human-chosen passphrase equivalent to a longer one.
+An OS keyring remains preferable when the operating system provides a suitable protected
+backend. Do not lose the master passphrase, because the encrypted vault contents cannot be
+recovered without it. It protects credentials at rest but does not protect against malware
+already running with the same user's privileges.
+
+`auth change-passphrase` is available only when the configured source is `vault`. It asks
+for the current passphrase and a confirmed new passphrase, uses the configured vault path,
+and changes neither the IMAP password nor `auth.source`. Passphrases are never printed or
+stored in TOML. `auth delete` asks for confirmation unless `--yes` is supplied; vault mode
+also asks for its master passphrase.
+
+A missing or unavailable credential in an explicitly selected keyring or vault is an
+error. imapledger does not silently fall back to a password prompt. `clean`, `doctor`,
+`rule learn`, `rule test`, and config-mode `folders` resolve credentials once per
+invocation. Direct `folders --host ... --username ...` mode has no configured storage
+source and continues to use hidden prompt authentication.
 
 ## Multi-folder routing example
 

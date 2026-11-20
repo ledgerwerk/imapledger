@@ -60,13 +60,42 @@ The default file is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/ima
 Select stored credentials without placing them in TOML or command arguments:
 
 ```bash
-python -m pip install 'imapledger[keyring]'  # optional keyring support
-imapledger auth set
-imapledger auth set --storage encrypted-file
-imapledger auth status
+python -m pip install 'imapledger[keyring]'  # optional OS keyring support
+imapledger auth set  # auto selects an available approved OS keyring
+imapledger auth set --storage vault
+imapledger auth set --storage keyring
+imapledger auth set --storage vault --replace
+imapledger auth status --verbose
+imapledger auth delete
+imapledger auth change-passphrase
 ```
 
 See the [configuration guide](docs/configuration.md) for credential-source behavior, vault recovery limits, and deletion semantics.
+
+`auth set` defaults to `--storage auto`: it probes an approved native OS keyring and fails
+with explicit choices if none is usable. It never silently changes to the encrypted file
+vault or prompt mode.
+
+`--replace` is an explicit opt-in for replacing the current account's credential in the
+selected backend. The vault uses a separate master passphrase, not an IMAP password or PIN.
+It protects credentials at rest, but not against malware already running with the same
+user's privileges.
+
+The encrypted-file vault requires a minimum master-passphrase length of 12 characters by
+default. Set a different minimum for new vaults and passphrase changes with
+`[imap.auth].vault_min_passphrase_length`; it does not affect unlocking existing vaults.
+For example:
+
+```toml
+[imap.auth]
+source = "vault"
+vault_path = "~/.local/share/imapledger/credentials.enc"
+vault_min_passphrase_length = 10
+```
+
+This is a minimum character count, not a character-class rule. Lowering it is a deliberate
+security tradeoff because a copied encrypted vault can be attacked offline. See the
+[configuration guide](docs/configuration.md) for the policy details and security guidance.
 
 Example configuration:
 

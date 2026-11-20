@@ -7,6 +7,7 @@ from enum import Enum
 from pathlib import Path
 
 from ledgercore import AtomicWriteError, atomic_write_text
+from vaultconfig.secrets import DEFAULT_MIN_PASSPHRASE_LENGTH
 
 try:
     import tomllib
@@ -38,14 +39,22 @@ class AuthSource(str, Enum):
 @dataclass(frozen=True, slots=True)
 class ImapAuthSettings:
     source: AuthSource = AuthSource.PROMPT
+    vault_path: Path | None = None
+    vault_min_passphrase_length: int = DEFAULT_MIN_PASSPHRASE_LENGTH
 
     def __post_init__(self) -> None:
+        minimum = self.vault_min_passphrase_length
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
+            raise ConfigError("imap.auth.vault_min_passphrase_length must be a positive integer")
         if not isinstance(self.source, AuthSource):
             try:
                 object.__setattr__(self, "source", AuthSource(self.source))
             except (TypeError, ValueError) as exc:
                 raise ConfigError(f"unknown IMAP credential source: {self.source!r}") from exc
-
+        if self.vault_path is not None and not isinstance(self.vault_path, Path):
+            if not isinstance(self.vault_path, str) or not self.vault_path.strip():
+                raise ConfigError("imap.auth.vault_path must be a non-empty path")
+            object.__setattr__(self, "vault_path", Path(self.vault_path))
 
 @dataclass(frozen=True, slots=True)
 class MessageAction:
@@ -161,7 +170,7 @@ def _load_config_payload(path: Path | None = None) -> tuple[Path, dict[str, obje
 def _parse_imap_auth_settings(value: object) -> ImapAuthSettings:
     if not isinstance(value, dict):
         raise ConfigError("imap.auth must be a table")
-    unknown = set(value) - {"source"}
+    unknown = set(value) - {"source", "vault_path", "vault_min_passphrase_length"}
     if unknown:
         raise ConfigError(f"unknown key in imap.auth: {sorted(unknown)[0]}")
     try:
@@ -169,7 +178,14 @@ def _parse_imap_auth_settings(value: object) -> ImapAuthSettings:
     except (TypeError, ValueError) as exc:
         allowed = ", ".join(source.value for source in AuthSource)
         raise ConfigError(f"imap.auth.source must be one of: {allowed}") from exc
-    return ImapAuthSettings(source)
+    vault_path = value.get("vault_path")
+    if vault_path is not None and (not isinstance(vault_path, str) or not vault_path.strip()):
+        raise ConfigError("imap.auth.vault_path must be a non-empty path")
+    return ImapAuthSettings(
+        source,
+        Path(vault_path) if vault_path is not None else None,
+        value.get("vault_min_passphrase_length", DEFAULT_MIN_PASSPHRASE_LENGTH),
+    )
 
 
 def _parse_imap_settings(payload: dict[str, object]) -> ImapSettings:
@@ -331,12 +347,17 @@ def render_settings(settings: Settings) -> str:
         "",
         "[imap.auth]",
         f'source = "{settings.imap.auth.source.value}"',
+        f"vault_min_passphrase_length = {settings.imap.auth.vault_min_passphrase_length}",
         "",
         "[spam]",
         f"folders = {_toml_string_array(settings.spam.folders)}",
         f"max_message_bytes = {settings.spam.max_message_bytes}",
         f"max_body_chars = {settings.spam.max_body_chars}",
     ]
+    if settings.imap.auth.vault_path is not None:
+        source_line = f'source = "{settings.imap.auth.source.value}"'
+        vault_path = _toml_string(str(settings.imap.auth.vault_path))
+        lines.insert(lines.index(source_line) + 1, f'vault_path = "{vault_path}"')
     for outcome in ("spam", "not_spam", "review"):
         action = getattr(settings.spam.actions, outcome)
         lines.extend(("", f"[spam.actions.{outcome}]", f'action = "{action.action.value}"'))
@@ -372,6 +393,76 @@ def write_settings(settings: Settings, path: Path | None = None, *, overwrite: b
     except OSError:
         pass
     return config_path
+
+
+def write_auth_config(
+    config_path: Path,
+    *,
+    source: AuthSource,
+    vault_path: Path | None = None,
+) -> None:
+    """Atomically update auth settings without rewriting unrelated TOML."""
+    config_path, _ = _load_config_payload(config_path)
+    try:
+        lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        raise ConfigError(f"could not read config {config_path}") from None
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+    table_start = next((index for index, line in enumerate(lines) if line.strip() == "[imap.auth]"), None)
+    source_line = f'source = "{source.value}"'
+    vault_line = f'vault_path = "{_toml_string(str(vault_path))}"' if vault_path is not None else None
+
+    if table_start is None:
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += newline
+        if lines and lines[-1].strip():
+            lines.append(newline)
+        lines.extend(("[imap.auth]" + newline, source_line + newline))
+        if vault_line is not None:
+            lines.append(vault_line + newline)
+    else:
+        table_end = next(
+            (
+                index
+                for index in range(table_start + 1, len(lines))
+                if lines[index].strip().startswith("[") and lines[index].strip().endswith("]")
+            ),
+            len(lines),
+        )
+        section = [lines[table_start]]
+        source_found = False
+        vault_found = False
+        for line in lines[table_start + 1 : table_end]:
+            key, separator, _ = line.lstrip().partition("=")
+            key = key.strip()
+            if not separator or key not in {"source", "vault_path"}:
+                section.append(line)
+                continue
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            if key == "source":
+                section.append(source_line + ending)
+                source_found = True
+            elif vault_line is None:
+                section.append(line)
+            else:
+                section.append(vault_line + ending)
+                vault_found = True
+        missing = []
+        if not source_found:
+            missing.append(source_line + newline)
+        if vault_line is not None and not vault_found:
+            missing.append(vault_line + newline)
+        section[1:1] = missing
+        lines[table_start:table_end] = section
+
+    try:
+        atomic_write_text(config_path, "".join(lines))
+    except (AtomicWriteError, OSError):
+        raise ConfigError("could not update config credential source") from None
+    try:
+        config_path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def _string_tuple(value: object, key: str) -> tuple[str, ...]:
