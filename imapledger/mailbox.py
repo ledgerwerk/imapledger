@@ -475,15 +475,22 @@ class ScopedMailbox:
             raise UnsafeMailboxOperation("refusing to inspect a destination outside the configured allow-list")
         client = self._require_client()
         try:
-            return bool(client.folder_exists(destination))
+            exists = bool(client.folder_exists(destination))
         except Exception as exc:
-            raise _operation_error(
+            failure = _operation_error(
                 operation="imap_folder_exists",
                 message="could not verify configured move destination",
                 exc=exc,
                 folder=self._folder,
                 selector=destination,
-            ) from exc
+            )
+            try:
+                self._reselect_source(operation="imap_post_destination_select")
+            except Exception as restore_exc:
+                self._emit(f"source restore after destination probe failed error_type={type(restore_exc).__name__}")
+            raise failure from exc
+        self._reselect_source(operation="imap_post_destination_select")
+        return exists
 
     def __enter__(self) -> ScopedMailbox:
         self._emit(f"connect host={self._host} port={self._port} tls=true")
@@ -599,6 +606,31 @@ class ScopedMailbox:
             raise MailboxError("mailbox is not open")
         return self._snapshot
 
+    def _reselect_source(self, *, readonly: bool | None = None, operation: str) -> _Client:
+        client = self._require_client()
+        if readonly is None:
+            readonly = not self._writable
+        try:
+            selected = client.select_folder(self._folder, readonly=readonly)
+        except Exception as exc:
+            raise _operation_error(
+                operation=operation,
+                message="could not reselect configured source folder",
+                exc=exc,
+                folder=self._folder,
+            ) from exc
+
+        snapshot = self._snapshot
+        if snapshot is not None:
+            current_uidvalidity = _uidvalidity(selected)
+            if current_uidvalidity != snapshot.uidvalidity:
+                raise UnsafeMailboxOperation(
+                    f"UIDVALIDITY changed from {snapshot.uidvalidity} to {current_uidvalidity}; "
+                    "refusing source operation"
+                )
+        self._emit(f"reselect folder={self._folder!r} readonly={readonly}")
+        return client
+
     def probe(self) -> MailboxProbe:
         client = self._require_client()
         snapshot = self.snapshot()
@@ -616,6 +648,7 @@ class ScopedMailbox:
 
         uid = ordered_uids[0]
         self._emit(f"doctor-size-fetch uid={uid}")
+        client = self._reselect_source(operation="imap_preprobe_select")
         try:
             sizes = client.fetch([uid], ["RFC822.SIZE"])
         except Exception as exc:
@@ -654,6 +687,7 @@ class ScopedMailbox:
             body_skip_reason = f"probe message size {size} exceeds limit {self._max_message_bytes}"
         else:
             self._emit(f"doctor-body-fetch uid={uid}")
+            client = self._reselect_source(operation="imap_prebody_select")
             try:
                 response = client.fetch([uid], ["BODY.PEEK[]"])
             except Exception as exc:
@@ -695,6 +729,7 @@ class ScopedMailbox:
             raise UnsafeMailboxOperation(f"refusing UID outside initial mailbox snapshot: {uid}")
 
         self._emit(f"size-fetch uid={uid}")
+        client = self._reselect_source(operation="imap_prefetch_select")
         try:
             sizes = client.fetch((uid,), ["RFC822.SIZE"])
         except Exception as exc:
@@ -732,6 +767,7 @@ class ScopedMailbox:
             )
 
         self._emit(f"body-fetch uid={uid}")
+        client = self._reselect_source(operation="imap_prebody_select")
         try:
             response = client.fetch((uid,), ["BODY.PEEK[]"])
         except Exception as exc:
@@ -782,6 +818,7 @@ class ScopedMailbox:
                 f"size-fetch batch={batch_number}/{batch_count} uid_count={len(uid_batch)} "
                 f"uid_min={min(uid_batch)} uid_max={max(uid_batch)}"
             )
+            client = self._reselect_source(operation="imap_prefetch_select")
             try:
                 sizes = client.fetch(uid_batch, ["RFC822.SIZE"])
             except Exception as exc:
@@ -810,6 +847,7 @@ class ScopedMailbox:
                     continue
 
                 self._emit(f"body-fetch uid={uid}")
+                client = self._reselect_source(operation="imap_prebody_select")
                 try:
                     response = client.fetch([uid], ["BODY.PEEK[]"])
                 except Exception as exc:
@@ -879,6 +917,8 @@ class ScopedMailbox:
         batch_count = (len(requested) + self._mutation_batch_size - 1) // self._mutation_batch_size
         completed: list[int] = []
         for batch_number, uid_batch in enumerate(_iter_chunks(requested, self._mutation_batch_size), start=1):
+            if batch_number > 1:
+                client = self._reselect_source(readonly=False, operation="imap_premove_select")
             self._emit(
                 f"move batch={batch_number}/{batch_count} destination={destination!r} "
                 f"uid_count={len(uid_batch)} uid_min={min(uid_batch)} uid_max={max(uid_batch)}"
@@ -935,6 +975,8 @@ class ScopedMailbox:
         batch_count = (len(requested) + self._mutation_batch_size - 1) // self._mutation_batch_size
         completed: list[int] = []
         for batch_number, uid_batch in enumerate(_iter_chunks(requested, self._mutation_batch_size), start=1):
+            if batch_number > 1:
+                self._reselect_source(readonly=False, operation="imap_predelete_select")
             self._emit(
                 f"delete batch={batch_number}/{batch_count} uid_count={len(uid_batch)} "
                 f"uid_min={min(uid_batch)} uid_max={max(uid_batch)}"
@@ -983,22 +1025,10 @@ class ScopedMailbox:
         if not has_capability:
             raise UnsafeMailboxOperation(f"{capability_name} disappeared; refusing {operation_prefix}")
 
-        try:
-            selected = client.select_folder(self._folder, readonly=False)
-        except Exception as exc:
-            raise _operation_error(
-                operation=f"imap_pre{operation_prefix}_select",
-                message="could not reselect configured folder before mutation",
-                exc=exc,
-                folder=self._folder,
-                uids=requested,
-            ) from exc
-        current_uidvalidity = _uidvalidity(selected)
-        if current_uidvalidity != snapshot.uidvalidity:
-            raise UnsafeMailboxOperation(
-                f"UIDVALIDITY changed from {snapshot.uidvalidity} to {current_uidvalidity}; refusing {operation_prefix}"
-            )
-
+        client = self._reselect_source(
+            readonly=False,
+            operation=f"imap_pre{operation_prefix}_select",
+        )
         try:
             current_uids = {int(uid) for uid in client.search("ALL")}
         except Exception as exc:
@@ -1031,6 +1061,10 @@ class ScopedMailbox:
         if required_capability not in self.capabilities:
             raise UnsafeMailboxOperation(f"{capability_name} disappeared; refusing {operation_prefix}")
 
+        client = self._reselect_source(
+            readonly=False,
+            operation=f"imap_pre{operation_prefix}_select",
+        )
         try:
             current_uids = client.search(["UID", uid])
         except Exception as exc:

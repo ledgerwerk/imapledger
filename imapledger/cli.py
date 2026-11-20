@@ -646,7 +646,7 @@ def rule_test(
                         continue
                     matched += 1
                     console.print(
-                        f"[{matched}] UID {item.uid} MATCH From={_safe_text(item.message.sender)} "
+                        f"[{matched}] Folder={folder} UID {item.uid} MATCH From={_safe_text(item.message.sender)} "
                         f"Subject={_safe_text(item.message.subject)}",
                         markup=False,
                     )
@@ -974,8 +974,9 @@ def clean(
                             apply=apply,
                             selection=selection,
                             on_result=(
-                                lambda row, position, total: _print_result(
+                                lambda row, position, total, source_folder=mailbox.folder: _print_result(
                                     row,
+                                    folder=source_folder,
                                     position=position,
                                     total=total,
                                     apply=apply,
@@ -1048,6 +1049,7 @@ def _safe_text(value: str) -> str:
 def _print_result(
     row: MessageResult,
     *,
+    folder: str,
     position: int,
     total: int,
     apply: bool,
@@ -1056,7 +1058,7 @@ def _print_result(
     if row.matched_rule_id is not None:
         details = f"  Detail={row.detail}" if row.detail else ""
         console.print(
-            f"[{position}/{total}] UID {row.uid}  Action={action}  Rule={row.matched_rule_id}  "
+            f"[{position}/{total}] Folder={folder} UID {row.uid}  Action={action}  Rule={row.matched_rule_id}  "
             f"From={_safe_text(row.sender)}  Subject={_safe_text(row.subject)}{details}",
             markup=False,
         )
@@ -1065,7 +1067,7 @@ def _print_result(
     verdict = row.verdict.name if row.verdict else "-"
     outcome = row.outcome.value.upper() if row.outcome else "-"
     console.print(
-        f"[{position}/{total}] UID {row.uid}  {action}  Outcome={outcome}  Verdict={verdict}  "
+        f"[{position}/{total}] Folder={folder} UID {row.uid}  {action}  Outcome={outcome}  Verdict={verdict}  "
         f"Signals={_signal_summary(row)}  Reasons={reasons}  "
         f"From={_safe_text(row.sender)}  Subject={_safe_text(row.subject)}",
         markup=False,

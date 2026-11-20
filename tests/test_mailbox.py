@@ -13,6 +13,8 @@ from imapledger.mailbox import (
     ScopedMailbox,
     UnsafeMailboxOperation,
 )
+from tests.fakes import FolderAwareFakeClient
+from tests.fakes import raw_message as _folder_raw_message
 
 RAW = b"From: spammer@example.org\r\nTo: me@example.org\r\nSubject: Buy now\r\n\r\nCheap pills"
 
@@ -112,6 +114,8 @@ class FakeClient:
         self.uids = [uid for uid in self.uids if uid not in messages]
 
 
+
+
 def factory_for(client):
     return lambda *args, **kwargs: client
 
@@ -165,7 +169,7 @@ def test_dry_run_selects_only_scoped_folder_readonly() -> None:
         items = list(mailbox.iter_messages())
     assert [item.uid for item in items] == [10]
     assert items[0].message is not None
-    assert client.selected == [("Spam", True)]
+    assert client.selected == [("Spam", True), ("Spam", True), ("Spam", True)]
     assert client.expunged == []
 
 
@@ -258,6 +262,238 @@ def test_fetch_uid_reads_only_requested_uid_and_uses_body_peek() -> None:
     assert client.removed == []
 
 
+
+
+def test_destination_probe_does_not_redirect_fetch_uid_to_another_folder():
+    client = FolderAwareFakeClient(
+        {
+            "INBOX.spam": {10: _folder_raw_message("source message", "spam@example.org")},
+            "INBOX.Trash": {10: _folder_raw_message("destination message", "trash@example.org")},
+        }
+    )
+    with make_mailbox(
+        client,
+        writable=False,
+        folder="INBOX.spam",
+        allowed_destinations=("INBOX.Trash",),
+    ) as mailbox:
+        assert mailbox.destination_exists("INBOX.Trash")
+        item = mailbox.fetch_uid(10)
+
+    assert item.message is not None
+    assert item.message.sender == "spam@example.org"
+    assert item.message.subject == "source message"
+    assert client.selected[-1] == ("INBOX.spam", True)
+
+
+
+def test_iter_messages_remains_source_scoped_after_destination_probe():
+    client = FolderAwareFakeClient(
+        {
+            "INBOX.spam": {11: _folder_raw_message("source message", "spam@example.org")},
+            "INBOX.Trash": {11: _folder_raw_message("destination message", "trash@example.org")},
+        }
+    )
+    with make_mailbox(
+        client,
+        writable=False,
+        folder="INBOX.spam",
+        allowed_destinations=("INBOX.Trash",),
+    ) as mailbox:
+        assert mailbox.destination_exists("INBOX.Trash")
+        item = next(mailbox.iter_messages())
+
+    assert item.message is not None
+    assert item.message.sender == "spam@example.org"
+    assert item.message.subject == "source message"
+
+
+def test_streaming_move_drift_does_not_redirect_next_generator_fetch():
+    client = FolderAwareFakeClient(
+        {
+            "INBOX.spam": {
+                10: _folder_raw_message("source first", "first@example.org"),
+                11: _folder_raw_message("source second", "second@example.org"),
+            },
+            "INBOX.Trash": {
+                10: _folder_raw_message("old first", "old-first@example.org"),
+                11: _folder_raw_message("old second", "old-second@example.org"),
+            },
+        }
+    )
+    with make_mailbox(
+        client,
+        writable=True,
+        folder="INBOX.spam",
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+    ) as mailbox:
+        messages = mailbox.iter_messages(MessageSelection(sort=MessageSort.OLDEST))
+        first = next(messages)
+        assert first.message is not None and first.message.subject == "source first"
+        mailbox.move_uid(first.uid, "INBOX.Trash")
+        second = next(messages)
+
+    assert second.uid == 11
+    assert second.message is not None
+    assert second.message.sender == "second@example.org"
+    assert second.message.subject == "source second"
+
+
+def test_streaming_move_search_and_action_use_reselected_source():
+    source_message = _folder_raw_message("source message", "spam@example.org")
+    destination_message = _folder_raw_message("destination message", "trash@example.org")
+    client = FolderAwareFakeClient(
+        {"INBOX.spam": {10: source_message}, "INBOX.Trash": {10: destination_message}}
+    )
+    with make_mailbox(
+        client,
+        writable=True,
+        folder="INBOX.spam",
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+    ) as mailbox:
+        client.selected_folder = "INBOX.Trash"
+        result = mailbox.move_uid(10, "INBOX.Trash")
+
+    assert result == MoveResult(moved=(10,), destination="INBOX.Trash")
+    assert client.searches == ["ALL", ["UID", 10]]
+    assert client.moves == [((10,), "INBOX.Trash")]
+    assert client.folders["INBOX.Trash"][10] == source_message
+    assert client.selected[-1] == ("INBOX.spam", False)
+
+
+def test_streaming_delete_search_and_action_use_reselected_source():
+    destination_message = _folder_raw_message("destination message", "trash@example.org")
+    client = FolderAwareFakeClient(
+        {
+            "INBOX.spam": {10: _folder_raw_message("source message", "spam@example.org")},
+            "INBOX.Trash": {10: destination_message},
+        }
+    )
+    with make_mailbox(client, writable=True, folder="INBOX.spam", allow_delete=True) as mailbox:
+        client.selected_folder = "INBOX.Trash"
+        result = mailbox.delete_uid(10)
+
+    assert result == DeleteResult(deleted=(10,))
+    assert client.searches == ["ALL", ["UID", 10]]
+    assert client.folders["INBOX.spam"] == {}
+    assert client.folders["INBOX.Trash"][10] == destination_message
+    assert client.expunged == [(10,)]
+
+
+def test_fetch_aborts_if_uidvalidity_changes_after_destination_probe():
+    client = FolderAwareFakeClient(
+        {
+            "INBOX.spam": {10: _folder_raw_message("source message", "spam@example.org")},
+            "INBOX.Trash": {},
+        }
+    )
+    with make_mailbox(
+        client,
+        writable=False,
+        folder="INBOX.spam",
+        allowed_destinations=("INBOX.Trash",),
+    ) as mailbox:
+        assert mailbox.destination_exists("INBOX.Trash")
+        client.uidvalidities["INBOX.spam"] = 43
+        with pytest.raises(UnsafeMailboxOperation, match="UIDVALIDITY changed"):
+            mailbox.fetch_uid(10)
+
+    assert client.fetches == []
+
+
+@pytest.mark.parametrize("operation", ["move", "delete"])
+def test_streaming_mutation_aborts_on_uidvalidity_change_before_search_or_action(operation):
+    client = FolderAwareFakeClient(
+        {
+            "INBOX.spam": {10: _folder_raw_message("source message", "spam@example.org")},
+            "INBOX.Trash": {},
+        }
+    )
+    with make_mailbox(
+        client,
+        writable=True,
+        folder="INBOX.spam",
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=operation == "delete",
+    ) as mailbox:
+        client.uidvalidities["INBOX.spam"] = 43
+        with pytest.raises(UnsafeMailboxOperation, match="UIDVALIDITY changed"):
+            if operation == "move":
+                mailbox.move_uid(10, "INBOX.Trash")
+            else:
+                mailbox.delete_uid(10)
+
+    assert client.searches == ["ALL"]
+    assert client.moves == []
+    assert client.added == []
+    assert client.expunged == []
+
+
+def test_batch_move_reselects_source_between_batches_after_selection_drift():
+    source_first = _folder_raw_message("source first", "first@example.org")
+    source_second = _folder_raw_message("source second", "second@example.org")
+    client = FolderAwareFakeClient(
+        {
+            "INBOX.spam": {10: source_first, 11: source_second},
+            "INBOX.Trash": {},
+        }
+    )
+    with make_mailbox(
+        client,
+        writable=True,
+        folder="INBOX.spam",
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+        mutation_batch_size=1,
+    ) as mailbox:
+        result = mailbox.move_uids((10, 11), "INBOX.Trash")
+
+    assert result.moved == (10, 11)
+    assert client.folders["INBOX.Trash"] == {10: source_first, 11: source_second}
+    assert client.moves == [((10,), "INBOX.Trash"), ((11,), "INBOX.Trash")]
+    assert client.selected[-1] == ("INBOX.spam", False)
+
+
+
+@pytest.mark.parametrize("operation", ["fetch", "move"])
+def test_source_reselection_failure_aborts_read_or_mutation(operation):
+    client = FakeClient()
+    with make_mailbox(
+        client,
+        writable=operation == "move",
+        allowed_destinations=("INBOX.Trash",),
+        allow_delete=False,
+    ) as mailbox:
+        client.fail_on = "select"
+        with pytest.raises(ImapOperationError) as raised:
+            if operation == "fetch":
+                mailbox.fetch_uid(10)
+            else:
+                mailbox.move_uid(10, "INBOX.Trash")
+
+    assert raised.value.operation == "imap_prefetch_select" if operation == "fetch" else "imap_premove_select"
+    assert client.fetches == []
+    assert client.searches == ["ALL"]
+    assert client.moves == []
+
+
+def test_destination_probe_failure_remains_primary_when_source_restore_fails():
+    client = FakeClient()
+    with make_mailbox(
+        client,
+        writable=False,
+        allowed_destinations=("INBOX.Trash",),
+    ) as mailbox:
+        client.fail_on = {"folder_exists", "select"}
+        with pytest.raises(ImapOperationError) as raised:
+            mailbox.destination_exists("INBOX.Trash")
+
+    assert raised.value.operation == "imap_folder_exists"
+    assert "password=secret" not in str(raised.value)
+    assert RAW.decode() not in str(raised.value)
+
 def test_fetch_uid_rejects_invalid_and_missing_uids() -> None:
     client = FakeClient()
     with make_mailbox(client, writable=False) as mailbox:
@@ -302,7 +538,7 @@ def test_delete_uses_uid_expunge_for_exact_snapshot_uids() -> None:
     assert client.expunged == [(10,)]
 
 
-def test_streaming_move_uses_exact_uids_without_reselecting_source():
+def test_streaming_move_reselects_source_before_exact_uid_validation():
     client = FakeClient(uids=[10, 20])
     with make_mailbox(
         client,
@@ -317,7 +553,7 @@ def test_streaming_move_uses_exact_uids_without_reselecting_source():
     assert second == MoveResult(moved=(20,), destination="INBOX.Trash")
     assert client.moves == [((10,), "INBOX.Trash"), ((20,), "INBOX.Trash")]
     assert client.searches == ["ALL", ["UID", 10], ["UID", 20]]
-    assert client.selected == [("Spam", False)]
+    assert client.selected == [("Spam", False), ("Spam", False), ("Spam", False)]
     assert client.uids == []
 
 
@@ -328,7 +564,7 @@ def test_streaming_delete_uses_uidplus_and_exact_uid():
 
     assert result == DeleteResult(deleted=(10,))
     assert client.searches == ["ALL", ["UID", 10]]
-    assert client.selected == [("Spam", False)]
+    assert client.selected == [("Spam", False), ("Spam", False)]
     assert client.added == [((10,), ("\\Deleted",), True)]
     assert client.expunged == [(10,)]
     assert client.uids == []
@@ -421,7 +657,7 @@ def test_streaming_mutation_rejects_uid_that_disappeared_from_selected_source():
 
     assert client.searches == ["ALL", ["UID", 10]]
     assert client.moves == []
-    assert client.selected == [("Spam", False)]
+    assert client.selected == [("Spam", False), ("Spam", False)]
 
 
 def test_streaming_move_failure_is_reported_as_unconfirmed():

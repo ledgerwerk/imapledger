@@ -29,6 +29,9 @@ folder=INBOX.Spam messages=294 selected=10 sort=newest offset=0 limit=10
 
 `--progress` streams each classification and the final configured action for that message. `--no-progress` suppresses those rows and prints a final table with `Source`, `Outcome`, and `Action` columns. `--verbose` adds safe IMAP operation diagnostics. `--debug` prints local traceback frames and exception class names without raw exception payloads.
 
+
+Every streamed result row includes `Folder=<exact configured source name>` immediately before the UID. This keeps source provenance visible on each row, including rule-match results.
+
 ## Outcome and action reporting
 
 The current spam policy is unchanged. `SpamVerdict.DELETE` maps to the spam outcome, `SpamVerdict.KEEP` maps to not-spam, and `SpamVerdict.REVIEW` maps to review. Configuration determines the action for each outcome. A model, message body, or header cannot choose an action or destination.
@@ -36,9 +39,9 @@ The current spam policy is unchanged. `SpamVerdict.DELETE` maps to the spam outc
 Dry-run output can look like:
 
 ```text
-[1/10] UID 43654  WOULD MOVE -> INBOX.Trash  Outcome=SPAM  Verdict=DELETE
-[2/10] UID 43653  WOULD MOVE -> INBOX.NotSpam  Outcome=NOT_SPAM  Verdict=KEEP
-[3/10] UID 43652  KEEP  Outcome=REVIEW  Verdict=REVIEW
+[1/10] Folder=INBOX.Junk UID 43654  WOULD MOVE -> INBOX.Trash  Outcome=SPAM  Verdict=DELETE
+[2/10] Folder=INBOX.Junk UID 43653  WOULD MOVE -> INBOX.NotSpam  Outcome=NOT_SPAM  Verdict=KEEP
+[3/10] Folder=INBOX.Junk UID 43652  KEEP  Outcome=REVIEW  Verdict=REVIEW
 ```
 
 ## Routing rule precedence
@@ -52,9 +55,9 @@ Use [`Learned routing rules`](rules.md) for the learning, storage, management, a
 In apply mode, each configured MOVE or DELETE is attempted as its message is processed, before the progress callback and before the next message is classified. Progress reports the final action state after the attempt, using `MOVED` or `DELETED` only when confirmed:
 
 ```text
-[1/10] UID 43654  MOVED -> INBOX.Trash  Outcome=SPAM  Verdict=DELETE
-[2/10] UID 43653  MOVED -> INBOX.NotSpam  Outcome=NOT_SPAM  Verdict=KEEP
-[3/10] UID 43652  KEEP  Outcome=REVIEW  Verdict=REVIEW
+[1/10] Folder=INBOX.Junk UID 43654  MOVED -> INBOX.Trash  Outcome=SPAM  Verdict=DELETE
+[2/10] Folder=INBOX.Junk UID 43653  MOVED -> INBOX.NotSpam  Outcome=NOT_SPAM  Verdict=KEEP
+[3/10] Folder=INBOX.Junk UID 43652  KEEP  Outcome=REVIEW  Verdict=REVIEW
 ```
 
 Dry-run remains read-only and continues to report `WOULD MOVE` or `WOULD DELETE`. Progress mode prints each action once, followed by the per-folder summary; `--no-progress` prints the final table instead.
@@ -70,7 +73,8 @@ Before applying actions, imapledger checks the configured MOVE destination folde
 - A configured move action requires the IMAP MOVE capability.
 - A configured delete action requires UIDPLUS.
 - Dry-run does not require mutation capabilities.
-- The writable source session captures UIDVALIDITY and the initial UID snapshot when selected. Each streaming target must belong to that snapshot; the action reuses the selected source session and verifies live existence with exact-UID `UID SEARCH`. It does not reselect the source or run full `SEARCH ALL` per message.
+- The writable source session captures UIDVALIDITY and the initial UID snapshot. Source-scoped reads and mutations reselect the exact configured folder before folder-local commands and verify UIDVALIDITY before using snapshot UIDs. Destination probes restore the source selection.
+- A UIDVALIDITY change aborts the operation; imapledger never reuses old snapshot UIDs in a new generation. Streaming targets must belong to the initial snapshot and remain present in exact-UID `UID SEARCH` against the reselected source. Batch mutation validation also verifies source selection and live UID membership.
 - Move destinations are checked against the configured allow-list. The classifier has no access to the IMAP client or destination names.
 - Permanent deletion uses `\\Deleted` and exact-UID `UID EXPUNGE`, never mailbox-wide EXPUNGE.
 
