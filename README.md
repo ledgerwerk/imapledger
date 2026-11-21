@@ -1,6 +1,6 @@
 # imapledger
 
-A security-scoped IMAP automation tool. `imapledger` scans configured source folders, classifies messages using `pyjev` evidence, then maps deterministic policy outcomes to configured mailbox actions. The semantic model never receives an IMAP client and cannot select destinations or issue IMAP commands.
+imapledger is a security-scoped IMAP automation and configuration-ledger tool. It scans configured source folders, classifies messages using `pyjev` evidence, then maps deterministic policy outcomes to configured mailbox actions. The semantic model never receives an IMAP client and cannot select destinations or issue IMAP commands.
 
 ## Security model
 
@@ -133,6 +133,18 @@ For the new plural `folders` schema, omitted action tables default to `keep`. Pe
 Legacy configurations with `spam.folder` remain supported with a deprecation warning. If they have no action tables, the old behavior is preserved: spam is deleted when `--apply` is used, and not-spam and review are kept. New configurations use `folders` and explicit action tables.
 
 Legacy `spam.threshold` values are deprecated, warned about, and ignored. The documented policy defaults apply when `[spam.policy]` is absent. There is deliberately no password setting. Configure `pyjev` authentication separately as documented by `pyjev`.
+
+## Configuration ledger
+
+Store small UTF-8 configuration files for arbitrary tools as append-only, readable email snapshots in a dedicated IMAP folder. Configure `[config_store]` locally, then use `config push`, `list`, `versions`, `diff`, `pull`, or `cat`. The store folder must already exist. Snapshots are not encrypted, and the secret scan is best-effort. See the [configuration ledger guide](docs/config-store.md) for setup, history, overwrite behavior, and security limits.
+
+```bash
+imapledger config push ruff ~/.config/ruff/ruff.toml
+imapledger config list
+imapledger config versions ruff
+imapledger config diff ruff --direction local-to-imap
+imapledger config pull ruff
+```
 
 ## Dry run and apply
 

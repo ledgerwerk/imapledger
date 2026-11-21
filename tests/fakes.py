@@ -195,3 +195,120 @@ class FolderAwareFakeClient:
 
 def _flag_bytes(flag):
     return flag if isinstance(flag, bytes) else str(flag).encode("ascii")
+
+
+class ConfigStoreFakeClient:
+    """Strict deterministic fake for fixed-folder config-store IMAP operations."""
+
+    def __init__(self, folders, uidvalidities=None):
+        self.folders = {name: dict(messages) for name, messages in folders.items()}
+        self.uidvalidities = uidvalidities or {name: 42 for name in folders}
+        self.selected_folder = None
+        self.selected_folders = []
+        self.readonly_selections = []
+        self.folder_queries = []
+        self.searches = []
+        self.fetch_selectors = []
+        self.appends = []
+        self.login_args = None
+        self.logged_out = False
+        self.calls = []
+        self.fail_on = None
+
+    def _maybe_fail(self, operation):
+        if self.fail_on == operation or (isinstance(self.fail_on, set) and operation in self.fail_on):
+            raise RuntimeError("fake IMAP failure")
+
+    def login(self, username, password):
+        self.calls.append("login")
+        self._maybe_fail("login")
+        self.login_args = (username, password)
+
+    def logout(self):
+        self.calls.append("logout")
+        self.logged_out = True
+
+    def capabilities(self):
+        self.calls.append("capabilities")
+        return (b"IMAP4rev1", b"UIDPLUS")
+
+    def folder_exists(self, folder):
+        self.calls.append("folder_exists")
+        self._maybe_fail("folder_exists")
+        self.folder_queries.append(folder)
+        return folder in self.folders
+
+    def select_folder(self, folder, readonly=False):
+        self.calls.append("select")
+        self._maybe_fail("select")
+        if folder not in self.folders:
+            raise AssertionError(f"cannot select unknown folder: {folder}")
+        self.selected_folder = folder
+        self.selected_folders.append(folder)
+        self.readonly_selections.append(readonly)
+        return {b"UIDVALIDITY": self.uidvalidities[folder], b"EXISTS": len(self.folders[folder])}
+
+    def search(self, criteria, charset=None):
+        self.calls.append("search")
+        self.searches.append(criteria)
+        self._maybe_fail("search")
+        if self.selected_folder is None:
+            raise AssertionError("SEARCH requires a selected folder")
+        if not isinstance(criteria, (list, tuple)) or len(criteria) == 0 or len(criteria) % 3:
+            raise AssertionError(f"unsupported config-store search criteria: {criteria!r}")
+        if any(str(criteria[index]).upper() != "HEADER" for index in range(0, len(criteria), 3)):
+            raise AssertionError(f"unsupported config-store search criteria: {criteria!r}")
+        found = []
+        for uid, raw in self.folders[self.selected_folder].items():
+            headers = BytesHeaderParser(policy=policy.default).parsebytes(raw.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n")
+            if all(
+                any(
+                    str(value).casefold().find(str(criteria[index + 2]).casefold()) >= 0
+                    for value in headers.get_all(str(criteria[index + 1]), [])
+                )
+                for index in range(0, len(criteria), 3)
+            ):
+                found.append(uid)
+        return sorted(found)
+
+    def fetch(self, messages, data, modifiers=None):
+        self.calls.append("fetch")
+        messages = tuple(messages)
+        data = tuple(data)
+        self.fetch_selectors.append(data)
+        self._maybe_fail("fetch")
+        if self.selected_folder is None:
+            raise AssertionError("FETCH requires a selected folder")
+        folder = self.folders[self.selected_folder]
+        selector = str(data[0]) if len(data) == 1 else ""
+        if selector.startswith("BODY.PEEK[HEADER.FIELDS"):
+            start, end = selector.find("("), selector.rfind(")")
+            if start < 0 or end <= start:
+                raise AssertionError(f"malformed header selector: {selector}")
+            names = selector[start + 1 : end].split()
+            response_key = f"BODY[HEADER.FIELDS ({' '.join(names)})]".encode("ascii")
+            result = {}
+            for uid in messages:
+                raw = folder.get(uid)
+                if raw is None:
+                    continue
+                headers = BytesHeaderParser(policy=policy.default).parsebytes(
+                    raw.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
+                )
+                selected = b"".join(
+                    f"{name}: {value}\r\n".encode() for name in names for value in headers.get_all(name, [])
+                )
+                result[uid] = {response_key: selected + b"\r\n"}
+            return result
+        if selector == "BODY.PEEK[]":
+            return {uid: {b"BODY[]": folder[uid]} for uid in messages if uid in folder}
+        raise AssertionError(f"unsupported config-store FETCH selector: {data!r}")
+
+    def append(self, folder, message, flags=None, msg_time=None):
+        self.calls.append("append")
+        self._maybe_fail("append")
+        self.appends.append((folder, flags, msg_time, bytes(message)))
+        if folder not in self.folders:
+            raise AssertionError(f"APPEND to unknown folder: {folder}")
+        next_uid = max(self.folders[folder], default=0) + 1
+        self.folders[folder][next_uid] = bytes(message)

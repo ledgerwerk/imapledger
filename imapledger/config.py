@@ -19,6 +19,8 @@ from .policy import SpamPolicy
 
 DEFAULT_MAX_MESSAGE_BYTES = 2_000_000
 DEFAULT_MAX_BODY_CHARS = 20_000
+DEFAULT_CONFIG_STORE_MAX_FILE_BYTES = 1_048_576
+MAX_CONFIG_STORE_FILE_BYTES = 10 * 1024 * 1024
 
 
 class ConfigError(ValueError):
@@ -164,9 +166,46 @@ class SpamSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfigStoreSettings:
+    folder: str
+    max_file_bytes: int = DEFAULT_CONFIG_STORE_MAX_FILE_BYTES
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.folder, str) or not self.folder:
+            raise ConfigError("config_store.folder must be a non-empty string")
+        if not self.folder.strip():
+            raise ConfigError("config_store.folder must not be empty")
+        if self.folder != self.folder.strip():
+            raise ConfigError("config_store.folder must not have leading or trailing whitespace")
+        if isinstance(self.max_file_bytes, bool) or not isinstance(self.max_file_bytes, int) or self.max_file_bytes < 1:
+            raise ConfigError("config_store.max_file_bytes must be a positive integer")
+        if self.max_file_bytes > MAX_CONFIG_STORE_FILE_BYTES:
+            raise ConfigError("config_store.max_file_bytes must not exceed 10 MiB")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigStoreContext:
+    imap: ImapSettings
+    store: ConfigStoreSettings
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     imap: ImapSettings
     spam: SpamSettings
+    config_store: ConfigStoreSettings | None = None
+
+    def __post_init__(self) -> None:
+        if self.config_store is None:
+            return
+        if not isinstance(self.config_store, ConfigStoreSettings):
+            raise ConfigError("config_store must be config store settings")
+        if self.config_store.folder in self.spam.folders:
+            raise ConfigError("config_store.folder must not be a spam source folder")
+        for outcome in ("spam", "not_spam", "review"):
+            action = getattr(self.spam.actions, outcome)
+            if action.action is ActionKind.MOVE and action.destination == self.config_store.folder:
+                raise ConfigError(f"config_store.folder must not be spam.actions.{outcome} destination")
 
 
 def default_config_path() -> Path:
@@ -238,6 +277,27 @@ def _parse_imap_settings(payload: dict[str, object]) -> ImapSettings:
         raise ConfigError(f"invalid config value: {exc}") from exc
 
 
+def _parse_config_store_settings(value: object) -> ConfigStoreSettings:
+    if not isinstance(value, dict):
+        raise ConfigError("config requires a [config_store] table")
+    unknown = set(value) - {"folder", "max_file_bytes"}
+    if unknown:
+        raise ConfigError(f"unknown key in config_store: {sorted(unknown)[0]}")
+    folder = value.get("folder")
+    if not isinstance(folder, str):
+        raise ConfigError("config_store.folder must be a string")
+    max_file_bytes = value.get("max_file_bytes", DEFAULT_CONFIG_STORE_MAX_FILE_BYTES)
+    return ConfigStoreSettings(folder=folder, max_file_bytes=max_file_bytes)
+
+
+def load_config_store_context(path: Path | None = None) -> ConfigStoreContext:
+    """Load only the IMAP connection and config-store settings."""
+    _, payload = _load_config_payload(path)
+    imap = _parse_imap_settings(payload)
+    store = _parse_config_store_settings(payload.get("config_store"))
+    return ConfigStoreContext(imap=imap, store=store)
+
+
 def load_imap_settings(path: Path | None = None) -> ImapSettings:
     _, payload = _load_config_payload(path)
     return _parse_imap_settings(payload)
@@ -253,6 +313,7 @@ def load_settings(path: Path | None = None) -> Settings:
     if not isinstance(spam, dict):
         raise ConfigError("config requires a [spam] table")
     imap_settings = _parse_imap_settings(payload)
+    config_store_settings = _parse_config_store_settings(payload["config_store"]) if "config_store" in payload else None
     if "threshold" in spam:
         warnings.warn(
             "spam.threshold is deprecated and ignored; configure named [spam.policy] thresholds instead",
@@ -291,6 +352,7 @@ def load_settings(path: Path | None = None) -> Settings:
     try:
         return Settings(
             imap=imap_settings,
+            config_store=config_store_settings,
             spam=SpamSettings(
                 folders=folders,
                 state=state_settings,
@@ -412,6 +474,15 @@ def render_settings(settings: Settings) -> str:
             "",
         )
     )
+    if settings.config_store is not None:
+        lines.extend(
+            (
+                "",
+                "[config_store]",
+                f'folder = "{_toml_string(settings.config_store.folder)}"',
+                f"max_file_bytes = {settings.config_store.max_file_bytes}",
+            )
+        )
     return "\n".join(lines)
 
 

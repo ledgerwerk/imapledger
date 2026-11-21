@@ -30,6 +30,9 @@ from .config import (
     render_settings,
     write_settings,
 )
+from .config_errors import ConfigLedgerError, ConfigStoreFolderMissingError
+from .config_mailbox import ConfigStoreMailbox, ConfigStoreOperationError
+from .config_store_cli import register_config_store_commands
 from .credential_service import configure_stored_credential, remove_stored_credential
 from .credentials import (
     CredentialError,
@@ -153,6 +156,9 @@ def _resolve_password(imap: ImapSettings) -> str:
     except CredentialError as exc:
         err_console.print(f"Credential error: {exc}", markup=False)
         raise typer.Exit(2) from exc
+
+
+register_config_store_commands(config_app, resolve_password=lambda imap: _resolve_password(imap))
 
 
 @auth_app.command("set")
@@ -774,6 +780,11 @@ def doctor(
     except RuleError as exc:
         err_console.print(f"[red]Rules error:[/red] {exc}")
         raise typer.Exit(2) from exc
+    try:
+        _validate_config_store_cleaning(settings, rules)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
     password = _resolve_password(settings.imap)
 
     actions = settings.spam.actions
@@ -847,6 +858,35 @@ def doctor(
                 _print_failure(error, debug=False, command="doctor")
             failed = failed or not result.ok
 
+        if settings.config_store is not None:
+            store = settings.config_store
+            try:
+                with ConfigStoreMailbox(
+                    host=settings.imap.host,
+                    port=settings.imap.port,
+                    username=settings.imap.username,
+                    password=password,
+                    folder=store.folder,
+                    max_file_bytes=store.max_file_bytes,
+                    writable=False,
+                    event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+                ):
+                    pass
+            except ConfigStoreFolderMissingError as exc:
+                err_console.print(str(exc), markup=False)
+                console.print(f"config store folder: {store.folder}: MISSING", markup=False)
+                failed = True
+            except ConfigStoreOperationError as exc:
+                _print_failure(exc, debug=False, command="doctor")
+                console.print(f"config store folder: {store.folder}: FAILED", markup=False)
+                failed = True
+            except ConfigLedgerError as exc:
+                err_console.print(f"Configuration store error: {exc}", markup=False)
+                console.print(f"config store folder: {store.folder}: FAILED", markup=False)
+                failed = True
+            else:
+                console.print(f"config store folder: {store.folder}: OK", markup=False)
+
     finally:
         password = ""
     if failed:
@@ -904,6 +944,11 @@ def clean(
         rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
     except RuleError as exc:
         err_console.print(f"[red]Rules error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    try:
+        _validate_config_store_cleaning(settings, rules)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
         raise typer.Exit(2) from exc
     password = _resolve_password(settings.imap)
 
@@ -1459,6 +1504,16 @@ def _move_destinations(actions: SpamActions, rules: RuleSet | None = None) -> tu
     if rules is not None:
         destinations.extend(rules.move_destinations())
     return tuple(dict.fromkeys(destinations))
+
+
+def _validate_config_store_cleaning(settings: Settings, rules: RuleSet) -> None:
+    store = settings.config_store
+    if store is None:
+        return
+    if store.folder in settings.spam.folders:
+        raise ConfigError("config-store folder must not be a spam source folder")
+    if store.folder in _move_destinations(settings.spam.actions, rules):
+        raise ConfigError("config-store folder must not be a cleaning move destination")
 
 
 def _signal_summary(row: MessageResult) -> str:

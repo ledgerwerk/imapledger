@@ -14,12 +14,15 @@ from imapledger.config import (
     ClassificationStateBackend,
     ClassificationStateSettings,
     ConfigError,
+    ConfigStoreContext,
+    ConfigStoreSettings,
     ImapAuthSettings,
     ImapSettings,
     MessageAction,
     Settings,
     SpamActions,
     SpamSettings,
+    load_config_store_context,
     load_imap_settings,
     load_settings,
     render_settings,
@@ -488,3 +491,88 @@ def test_invalid_classification_state_config_is_rejected(
 ) -> None:
     with pytest.raises(ConfigError, match=message):
         _load_spam(tmp_path, f'folders = ["Spam"]\n\n{state_table}')
+
+
+def test_config_store_context_loads_without_spam_section(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
+        '[config_store]\nfolder = "INBOX.imapledger.Config"\n',
+        encoding="utf-8",
+    )
+
+    context = load_config_store_context(path)
+
+    assert context == ConfigStoreContext(
+        imap=ImapSettings(host="imap.example.org", username="me@example.org"),
+        store=ConfigStoreSettings(folder="INBOX.imapledger.Config"),
+    )
+    assert context.store.max_file_bytes == 1_048_576
+
+
+def test_config_store_settings_roundtrip_with_full_settings(tmp_path: Path) -> None:
+    original = Settings(
+        imap=ImapSettings(host="imap.example.org", username="me@example.org"),
+        spam=SpamSettings(folders=("INBOX.Junk",)),
+        config_store=ConfigStoreSettings("INBOX.imapledger.Config", 2_000_000),
+    )
+    rendered = render_settings(original)
+    path = tmp_path / "config.toml"
+    path.write_text(rendered, encoding="utf-8")
+
+    assert '[config_store]\nfolder = "INBOX.imapledger.Config"\nmax_file_bytes = 2000000' in rendered
+    assert load_settings(path) == original
+
+
+@pytest.mark.parametrize(
+    ("folder", "max_file_bytes", "message"),
+    [
+        ("", 1, "non-empty"),
+        ("   ", 1, "must not be empty"),
+        (" INBOX.Config", 1, "whitespace"),
+        ("INBOX.Config", 0, "positive integer"),
+        ("INBOX.Config", True, "positive integer"),
+        ("INBOX.Config", 10 * 1024 * 1024 + 1, "10 MiB"),
+    ],
+)
+def test_config_store_settings_validate_folder_and_size(
+    folder: str,
+    max_file_bytes: int,
+    message: str,
+) -> None:
+    with pytest.raises(ConfigError, match=message):
+        ConfigStoreSettings(folder, max_file_bytes)
+
+
+def test_config_store_folder_cannot_be_spam_source_or_move_destination() -> None:
+    store = ConfigStoreSettings("INBOX.imapledger.Config")
+    with pytest.raises(ConfigError, match="spam source folder"):
+        Settings(
+            imap=ImapSettings(host="imap.example.org", username="me@example.org"),
+            spam=SpamSettings(folders=(store.folder,)),
+            config_store=store,
+        )
+
+    spam = SpamSettings(
+        folders=("INBOX.Junk",),
+        actions=SpamActions(spam=MessageAction(ActionKind.MOVE, store.folder)),
+    )
+    with pytest.raises(ConfigError, match="spam.actions.spam destination"):
+        Settings(
+            imap=ImapSettings(host="imap.example.org", username="me@example.org"),
+            spam=spam,
+            config_store=store,
+        )
+
+
+def test_load_settings_rejects_invalid_config_store_values(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
+        '[spam]\nfolders = ["INBOX.Junk"]\n\n'
+        '[config_store]\nfolder = "INBOX.Config"\nmax_file_bytes = true\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="positive integer"):
+        load_settings(path)

@@ -1,6 +1,6 @@
 # imapledger
 
-`imapledger` is a security-scoped IMAP tool for classifying messages and applying configured, deterministic mailbox actions. It supports multiple source folders, dry-run by default, and explicit MOVE or delete actions. The semantic model receives message evidence only. Python policy and configuration control every side effect.
+`imapledger` is a security-scoped IMAP tool for classifying messages and an append-only ledger for small configuration files. The semantic model receives message evidence only; deterministic policy and configuration control every cleaning side effect.
 
 ## Quick start
 
@@ -26,10 +26,13 @@ Credential resolution defaults to hidden prompt authentication, and no password 
 
 ## Guides
 
+The configuration ledger stores readable snapshots in a dedicated existing IMAP folder. It is not a secret store and does not require spam settings. See the [configuration ledger guide](config-store.md) for bootstrap requirements and command workflows.
+
 ```{toctree}
 :maxdepth: 2
 
 configuration
+config-store
 cleaning
 state
 rules

@@ -122,6 +122,20 @@ error. imapledger does not silently fall back to a password prompt. `clean`, `do
 invocation. Direct `folders --host ... --username ...` mode has no configured storage
 source and continues to use hidden prompt authentication.
 
+## Configuration ledger
+
+The optional `[config_store]` section selects an existing IMAP folder for append-only configuration snapshots. Config-ledger commands load only `[imap]` and `[config_store]`, so they do not require `[spam]`. The configured store folder cannot be a cleaning source or move destination. `imapledger config show` remains an inspection of the effective local application configuration and never connects to IMAP. See the [configuration ledger guide](config-store.md) for setup, commands, history, secret handling, and retention limits.
+
+Example:
+
+```toml
+[config_store]
+folder = "INBOX.imapledger.Config"
+max_file_bytes = 1048576
+```
+
+The folder must already exist. Snapshot messages are readable email, not encrypted secret storage.
+
 ## Multi-folder routing example
 
 This configuration scans two source folders and routes spam and not-spam outcomes to existing destination folders:
