@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from pathlib import Path
 
@@ -33,14 +34,27 @@ SUMMARY = MailSummary(9, MESSAGE.sender, MESSAGE.subject, MESSAGE.date, MESSAGE.
 class FakeMailService:
     def __init__(self):
         self.closed = False
+        self.folder_list_modes = []
         self.slow_delay = 0
+        self.started = None
+        self.release = None
 
-    def list_folders(self):
+    def list_folders(self, *, include_counts=True):
+        self.folder_list_modes.append(include_counts)
         return (FolderInfo("Spam", ".", frozenset(), 1, 1), FolderInfo("INBOX", ".", frozenset(), 1, 0))
 
+    def refresh_folder_counts(self, folders):
+        return {folder: (1, 0) for folder in folders}
+
     def list_messages(self, folder, *, limit, offset):
+        if folder == "Fail":
+            raise RuntimeError("sensitive server error")
         if folder == "Slow":
-            time.sleep(self.slow_delay)
+            if self.started is not None:
+                self.started.set()
+                self.release.wait(timeout=5)
+            else:
+                time.sleep(self.slow_delay)
         return MessagePage(folder, 42, offset, limit, 1, MessageSort.NEWEST, (SUMMARY,), False, False)
 
     def review_messages(self, *, limit, offset):
@@ -116,12 +130,15 @@ async def _browse_classify_apply():
         assert app._analysis is not None
         await pilot.press("a")
         await pilot.pause()
+        folder_list_calls_before_action = len(mail.folder_list_modes)
         await pilot.click("#apply")
         await pilot.pause()
         assert len(actions.calls) == 1
         assert actions.calls[0][1:] == (42, True)
+        assert len(mail.folder_list_modes) == folder_list_calls_before_action
+        assert app._rows[0][1].persisted_state is SpamOutcome.REVIEW
         assert "confirmed" in str(app.query_one("#activity", Static).render())
-        assert "messages loaded" in str(app.query_one("#status", Static).render())
+        assert "Action confirmed" in str(app.query_one("#status", Static).render())
         actions.fail = True
         await app._open_message("Spam", 9)
         await pilot.press("c")
@@ -138,9 +155,10 @@ async def _browse_classify_apply():
 
 
 async def _review_and_narrow():
+    mail = FakeMailService()
     app = MailReviewApp(
         Path("unused.toml"),
-        mail_service=FakeMailService(),
+        mail_service=mail,
         settings=SETTINGS,
         rules=RuleSet(),
         analysis_service=FakeAnalysisService(),
@@ -149,6 +167,7 @@ async def _review_and_narrow():
 
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.pause()
+        assert mail.folder_list_modes[0] is False
         assert str(app.query_one("#workspace").styles.layout).strip("<>") == "vertical"
         await app._select_folder("Review")
         assert app._rows == [("Spam", SUMMARY)]
@@ -187,3 +206,88 @@ def test_tui_browse_read_classify_and_apply_in_activity():
 
 def test_tui_review_view_and_narrow_terminal_render():
     asyncio.run(_review_and_narrow())
+
+
+async def _slow_folder_keeps_message_pump_responsive():
+    from textual.widgets import Static
+
+    mail = FakeMailService()
+    mail.started = threading.Event()
+    mail.release = threading.Event()
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=mail,
+        settings=SETTINGS,
+        rules=RuleSet(),
+        analysis_service=FakeAnalysisService(),
+        action_service=FakeActionService(),
+    )
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.pause()
+        app.run_worker(app._select_folder("Slow"), group="folder-page", exclusive=True, exit_on_error=False)
+        assert await asyncio.to_thread(mail.started.wait, 2)
+        await pilot.press("?")
+        assert "Keys:" in str(app.query_one("#status", Static).render())
+        mail.release.set()
+        await pilot.pause(0.1)
+
+
+def test_slow_folder_worker_keeps_message_pump_responsive():
+    asyncio.run(_slow_folder_keeps_message_pump_responsive())
+
+
+async def _folder_worker_failure_is_recoverable():
+    from textual.widgets import Static
+
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        rules=RuleSet(),
+        analysis_service=FakeAnalysisService(),
+        action_service=FakeActionService(),
+    )
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.pause()
+        app.run_worker(app._select_folder("Fail"), group="folder-page", exit_on_error=False)
+        await pilot.pause(0.1)
+        status = str(app.query_one("#status", Static).render())
+        assert "RuntimeError" in status
+        assert "sensitive server error" not in status
+        await pilot.press("?")
+        assert "Keys:" in str(app.query_one("#status", Static).render())
+
+
+def test_folder_worker_failure_does_not_terminate_tui():
+    asyncio.run(_folder_worker_failure_is_recoverable())
+
+
+def test_tui_resolves_credentials_before_textual_run(monkeypatch):
+    from types import SimpleNamespace
+
+    from imapledger.tui import app as tui_module
+
+    def resolve_credential(settings):
+        order.append("credential")
+        return SimpleNamespace(password="secret")
+
+    order = []
+
+    class Service:
+        def __init__(self, *args):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tui_module, "load_settings", lambda path: order.append("settings") or SETTINGS)
+    monkeypatch.setattr(tui_module, "load_rules", lambda *args, **kwargs: order.append("rules") or RuleSet())
+    monkeypatch.setattr(tui_module, "resolve_credential", resolve_credential)
+    monkeypatch.setattr(tui_module, "MailService", Service)
+    monkeypatch.setattr(tui_module, "ActionService", Service)
+    monkeypatch.setattr(tui_module, "AnalysisService", Service)
+    monkeypatch.setattr(MailReviewApp, "run", lambda self: order.append("run"))
+
+    tui_module.run(Path("unused.toml"))
+
+    assert order == ["settings", "rules", "credential", "run"]

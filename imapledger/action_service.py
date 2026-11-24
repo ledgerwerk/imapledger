@@ -44,6 +44,9 @@ class ActionService:
         self._mailbox_factory = mailbox_factory
         self._preflight = preflight
 
+    def close(self) -> None:
+        self._password = ""
+
     def apply(
         self,
         analysis: MessageAnalysis,

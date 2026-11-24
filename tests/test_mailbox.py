@@ -5,6 +5,7 @@ import pytest
 
 from imapledger.classification_state import SpamOutcome, all_state_keywords, keyword_for_outcome
 from imapledger.mailbox import (
+    BrowserMailbox,
     DeleteResult,
     FolderCatalog,
     FolderInfo,
@@ -137,10 +138,20 @@ class FakeClient:
         if data == ("RFC822.SIZE",):
             self._maybe_fail("fetch_size")
             return {uid: {b"RFC822.SIZE": self.size} for uid in messages if uid in self.uids}
+        if "RFC822.SIZE" in data and "FLAGS" in data:
+            self._maybe_fail("fetch_size")
+            return {
+                uid: {
+                    b"RFC822.SIZE": self.size,
+                    b"FLAGS": tuple(self.flags.get(uid, set())),
+                }
+                for uid in messages
+                if uid in self.uids
+            }
         if data == ("FLAGS",):
             self._maybe_fail("fetch_flags")
             return {uid: {b"FLAGS": tuple(self.flags.get(uid, set()))} for uid in messages if uid in self.uids}
-        if len(data) == 1 and str(data[0]).startswith("BODY.PEEK[HEADER.FIELDS"):
+        if any(str(item).startswith("BODY.PEEK[HEADER.FIELDS") for item in data):
             self._maybe_fail("fetch_headers")
             raw_headers = RAW.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
             parsed = BytesHeaderParser(policy=policy.default).parsebytes(raw_headers)
@@ -336,6 +347,52 @@ def test_fetch_uid_reads_only_requested_uid_and_uses_body_peek() -> None:
     assert item.message is not None and item.message.uid == 20
     assert client.fetches == [((20,), ("RFC822.SIZE",)), ((20,), ("BODY.PEEK[]",))]
     assert client.added == []
+
+
+def test_browser_mailbox_exact_open_avoids_full_snapshot_and_fetches_flags_with_size() -> None:
+    client = FakeClient(uids=range(1, 100_001))
+    browser = BrowserMailbox(
+        host="imap.example.org",
+        port=993,
+        username="user",
+        password="secret",
+        folder="Spam",
+        max_message_bytes=10_000,
+        max_body_chars=100,
+        client_factory=factory_for(client),
+    )
+
+    with browser:
+        item, state = browser.fetch_uid(10)
+
+    assert item.message is not None
+    assert state is not None and state.outcome is None
+    assert "ALL" not in client.searches
+    assert client.fetches[0] == ((10,), ("RFC822.SIZE", "FLAGS"))
+    assert client.fetches[1] == ((10,), ("BODY.PEEK[]",))
+    assert client.selected == [("Spam", True)]
+
+
+def test_browser_page_fetches_only_requested_summaries() -> None:
+    client = FakeClient(uids=range(1, 101))
+    browser = BrowserMailbox(
+        host="imap.example.org",
+        port=993,
+        username="user",
+        password="secret",
+        folder="Spam",
+        max_message_bytes=10_000,
+        max_body_chars=100,
+        client_factory=factory_for(client),
+    )
+
+    with browser:
+        uids = browser.list_page_uids(offset=0, limit=5)
+        browser.fetch_summaries(uids)
+
+    assert len(uids) == 5
+    assert client.searches == ["ALL"]
+    assert client.fetches[0][0] == tuple(uids)
     assert client.removed == []
 
 

@@ -407,6 +407,26 @@ class FolderCatalog:
             )
         return tuple(sorted(rows, key=lambda row: (row.name.casefold(), row.name)))
 
+    def folder_counts(self, folders: Sequence[str]) -> dict[str, tuple[int, int]]:
+        client = self._require_client()
+        counts = {}
+        for folder in folders:
+            try:
+                status = client.folder_status(folder, ("MESSAGES", "UNSEEN"))
+                total = _status_int(status, "MESSAGES")
+                unread = _status_int(status, "UNSEEN")
+                if unread > total:
+                    raise ValueError("UNSEEN exceeds MESSAGES")
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_folder_status",
+                    message="could not read mailbox counts",
+                    exc=exc,
+                    folder=folder,
+                ) from exc
+            counts[folder] = (total, unread)
+        return counts
+
     def _emit(self, event: str) -> None:
         if self._event_callback is not None:
             self._event_callback(event)
@@ -1705,6 +1725,193 @@ def _skipped_summary(uid: int, reason: str) -> MailSummary:
         persisted_state=None,
         skip_reason=reason,
     )
+
+
+class BrowserMailbox:
+    """Read-only mailbox pinned to one folder, optimized for interactive browsing."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        folder: str,
+        max_message_bytes: int,
+        max_body_chars: int,
+        client_factory: ClientFactory | None = None,
+        timeout: float = 30.0,
+    ) -> None:
+        self._host, self._port, self._username = host, port, username
+        self._password, self._folder = password, folder
+        self._max_message_bytes, self._max_body_chars = max_message_bytes, max_body_chars
+        self._client_factory = client_factory or _default_client_factory
+        self._timeout = timeout
+        self._client: _Client | None = None
+        self.uidvalidity = 0
+        self.message_count = 0
+
+    def __enter__(self) -> BrowserMailbox:
+        try:
+            client = self._client_factory(self._host, port=self._port, ssl=True, timeout=self._timeout, use_uid=True)
+            client.login(self._username, self._password)
+        except Exception as exc:
+            self._password = ""
+            raise _operation_error(
+                operation="imap_connect",
+                message="could not open read-only browser session",
+                exc=exc,
+            ) from exc
+        self._password = ""
+        self._client = client
+        try:
+            selected = client.select_folder(self._folder, readonly=True)
+            self.uidvalidity = _uidvalidity(selected)
+            exists = selected.get(b"EXISTS", selected.get("EXISTS", 0))
+            self.message_count = int(exists or 0)
+        except Exception as exc:
+            self.__exit__(type(exc), exc, exc.__traceback__)
+            raise _operation_error(
+                operation="imap_select_folder",
+                message="could not select read-only folder",
+                exc=exc,
+                folder=self._folder,
+            ) from exc
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        client, self._client = self._client, None
+        self._password = ""
+        if client is not None:
+            try:
+                client.logout()
+            except Exception:
+                if exc is None:
+                    raise
+
+    def list_page_uids(self, *, offset: int, limit: int, sort: MessageSort = MessageSort.NEWEST) -> tuple[int, ...]:
+        if offset < 0 or limit < 1:
+            raise ValueError("offset must be non-negative and limit must be positive")
+        client = self._require_client()
+        try:
+            found = client.search("ALL")
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_search",
+                message="UID SEARCH ALL failed",
+                exc=exc,
+                folder=self._folder,
+                selector="ALL",
+            ) from exc
+        uids = sorted((int(uid) for uid in found), reverse=sort is MessageSort.NEWEST)
+        return tuple(uids[offset : offset + limit])
+
+    def search_keyword(self, keyword: str) -> tuple[int, ...]:
+        _require_state_keyword(keyword)
+        try:
+            found = self._require_client().search(["KEYWORD", keyword])
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_search_keyword",
+                message="UID SEARCH for classification keyword failed",
+                exc=exc,
+                folder=self._folder,
+                selector=keyword,
+            ) from exc
+        return tuple(int(uid) for uid in found)
+
+    def fetch_summaries(self, uids: Sequence[int]) -> tuple[MailSummary, ...]:
+        if not uids:
+            return ()
+        selector = "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)]"
+        try:
+            response = self._require_client().fetch(tuple(uids), [selector, "FLAGS", "RFC822.SIZE"])
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_fetch_summaries",
+                message="FETCH of message summaries failed",
+                exc=exc,
+                folder=self._folder,
+                selector="headers FLAGS RFC822.SIZE",
+                uids=uids,
+            ) from exc
+        summaries = []
+        for uid in uids:
+            data = response.get(uid)
+            raw = _fetch_header_bytes(data) if isinstance(data, Mapping) else None
+            flags = _fetch_flags_value(data) if isinstance(data, Mapping) else None
+            size = _fetch_size_value(data) if isinstance(data, Mapping) else None
+            if raw is not None and flags is not None:
+                summaries.append(parse_summary(uid, raw, flags=flags, size_bytes=size))
+            else:
+                summaries.append(_skipped_summary(uid, "message summary unavailable"))
+        return tuple(summaries)
+
+    def fetch_uid(self, uid: int) -> tuple[MailboxItem, PersistedState | None]:
+        if isinstance(uid, bool) or not isinstance(uid, int) or uid < 1:
+            raise ValueError("uid must be a positive integer")
+        client = self._require_client()
+        try:
+            exists = {int(found) for found in client.search(["UID", uid])}
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_fetch_uid_search",
+                message="exact UID SEARCH failed",
+                exc=exc,
+                folder=self._folder,
+                selector=f"UID {uid}",
+                uids=(uid,),
+            ) from exc
+        if uid not in exists:
+            return MailboxItem(uid, skip_reason="message does not exist in selected folder"), None
+        try:
+            sized = client.fetch((uid,), ["RFC822.SIZE", "FLAGS"]).get(uid)
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_fetch_size",
+                message="FETCH of message size and flags failed",
+                exc=exc,
+                folder=self._folder,
+                selector="RFC822.SIZE FLAGS",
+                uids=(uid,),
+            ) from exc
+        size = _fetch_size_value(sized) if isinstance(sized, Mapping) else None
+        flags = _fetch_flags_value(sized) if isinstance(sized, Mapping) else None
+        if size is None or flags is None:
+            return MailboxItem(uid, skip_reason="message size or flags unavailable"), None
+        try:
+            state = validate_state_flags(flags)
+        except ClassificationStateConflict as exc:
+            raise ImapOperationError(
+                operation="imap_fetch_flags",
+                message="conflicting persisted classification flags",
+                folder=self._folder,
+                selector=f"UID {uid}",
+            ) from exc
+        if size > self._max_message_bytes:
+            return MailboxItem(uid, skip_reason=f"message size {size} exceeds limit {self._max_message_bytes}"), state
+        try:
+            body_data = client.fetch((uid,), ["BODY.PEEK[]"]).get(uid)
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_fetch_body",
+                message="FETCH of BODY.PEEK[] failed",
+                exc=exc,
+                folder=self._folder,
+                selector="BODY.PEEK[]",
+                uids=(uid,),
+            ) from exc
+        raw = body_data.get(b"BODY[]") if isinstance(body_data, Mapping) else None
+        if not isinstance(raw, bytes):
+            return MailboxItem(uid, skip_reason="message body unavailable"), state
+        message = parse_message(uid, raw, max_body_chars=self._max_body_chars, size_bytes=size)
+        return MailboxItem(uid, message=message), state
+
+    def _require_client(self) -> _Client:
+        if self._client is None:
+            raise MailboxError("browser mailbox is not open")
+        return self._client
 
 
 class ReadOnlyMailbox:

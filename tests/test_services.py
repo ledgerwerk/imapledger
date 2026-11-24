@@ -6,7 +6,7 @@ from imapledger.classifier import SemanticSpamSignals, SpamAssessment
 from imapledger.config import ImapSettings, MessageAction, Settings, SpamSettings
 from imapledger.evidence import build_message_evidence
 from imapledger.mail_service import MailService
-from imapledger.mailbox import MailboxItem, MailboxSnapshot, MessageSort
+from imapledger.mailbox import MailboxItem, MessageSort
 from imapledger.message import MailSummary, parse_message
 from imapledger.policy import SpamVerdict
 from imapledger.rules import MailRule, RuleMatch, RuleSet
@@ -90,11 +90,11 @@ def test_mail_service_lists_pages_and_opens_message_read_only(monkeypatch):
     summary = MailSummary(7, "sender", "subject", "date", "id", 123, frozenset(), None)
     message = _message()
 
-    class FakeScopedMailbox:
-        writable = False
-
+    class FakeBrowserMailbox:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.uidvalidity = 42
+            self.message_count = 2
 
         def __enter__(self):
             return self
@@ -102,10 +102,7 @@ def test_mail_service_lists_pages_and_opens_message_read_only(monkeypatch):
         def __exit__(self, *args):
             return None
 
-        def snapshot(self):
-            return MailboxSnapshot(42, frozenset({7, 8}))
-
-        def page_uids(self, *, offset, limit, sort):
+        def list_page_uids(self, *, offset, limit, sort):
             assert sort is MessageSort.NEWEST
             return (7,)
 
@@ -113,12 +110,15 @@ def test_mail_service_lists_pages_and_opens_message_read_only(monkeypatch):
             return (summary,)
 
         def fetch_uid(self, uid):
-            return MailboxItem(uid, message=message)
+            return (
+                MailboxItem(uid, message=message),
+                PersistedState(SpamOutcome.REVIEW, frozenset({"imapledger-v1-review"})),
+            )
 
-        def classification_state(self, uid):
-            return PersistedState(SpamOutcome.REVIEW, frozenset({"imapledger-v1-review"}))
+        def search_keyword(self, keyword):
+            return (7,)
 
-    monkeypatch.setattr("imapledger.mail_service.ScopedMailbox", FakeScopedMailbox)
+    monkeypatch.setattr("imapledger.mail_service.BrowserMailbox", FakeBrowserMailbox)
     service = MailService(_settings(), "secret")
 
     page = service.list_messages("Other", limit=1)

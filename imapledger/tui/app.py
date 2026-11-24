@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +22,8 @@ from ..mail_service import MailService, MessageDetail
 from ..mailbox import FolderInfo
 from ..message import MailSummary
 from ..rules import RuleSet, load_rules, rules_path_for_config
+
+_LOG = logging.getLogger(__name__)
 
 
 class ApplyConfirmation(ModalScreen[bool]):
@@ -110,7 +115,10 @@ class MailReviewApp(App[None]):
         self._selected_folder: str | None = None
         self._detail: MessageDetail | None = None
         self._analysis: MessageAnalysis | None = None
-        self._generation = 0
+        self._folder_generation = 0
+        self._message_generation = 0
+        self._classification_generation = 0
+        self._action_running = False
         self._activity: list[str] = []
         self._active_pane = 0
 
@@ -150,18 +158,24 @@ class MailReviewApp(App[None]):
             self.query_one("#analysis").styles.height = 12
             self.query_one("#activity").styles.height = 8
 
-    async def on_mount(self) -> None:
+    def on_mount(self) -> None:
         self.query_one("#messages", DataTable).add_columns("Folder", "State", "UID", "From", "Subject", "Date", "Size")
+        self._set_status("Loading folders…")
+        self.run_worker(self._startup(), group="startup-folders", exclusive=True, exit_on_error=False)
+
+    async def _startup(self) -> None:
         try:
-            await self._initialize()
-            self.folders = await asyncio.to_thread(self.mail_service.list_folders)
+            if self.mail_service is None:
+                raise RuntimeError("Mail services were not initialized before Textual started")
+            self.folders = await asyncio.to_thread(self.mail_service.list_folders, include_counts=False)
             self._render_folders()
             self._set_status("Connected. Choose a folder.")
+            self.run_worker(self._refresh_counts(), group="folder-counts", exit_on_error=False)
         except Exception as exc:
-            self._set_status(f"Could not start: {type(exc).__name__}: {exc}")
+            self._set_status(f"Could not start: {type(exc).__name__}")
             self.query_one("#message-detail", Static).update(
                 "imapledger could not connect. No mailbox changes were made.\n\n"
-                f"{type(exc).__name__}: {exc}\n\nPress r to retry or q to quit.",
+                f"{type(exc).__name__}. Press r to retry or q to quit."
             )
 
     def _render_folders(self) -> None:
@@ -175,34 +189,25 @@ class MailReviewApp(App[None]):
                 unread = f" ({folder.unread} unread)" if folder.unread else ""
                 view.append(ListItem(Label(f"{folder.name}{counts}{unread}")))
 
-    async def _initialize(self) -> None:
-        if self.mail_service is not None:
-            return
-        self._set_status("Loading configuration and credentials…")
-        settings, rules, password = await asyncio.to_thread(self._load_configuration)
-        self.settings = settings
-        self.rules = rules
-        self.mail_service = MailService(settings, password)
-        self.analysis_service = AnalysisService(settings, rules)
-        self.action_service = ActionService(settings, password, rules)
-
-    def _load_configuration(self) -> tuple[Settings, RuleSet, str]:
-        settings = load_settings(self.config)
-        password = resolve_credential(settings.imap).password
-        rules = load_rules(rules_path_for_config(self.config), source_folders=settings.spam.folders)
-        return settings, rules, password
-
-    async def on_list_view_selected(self, event: ListView.Selected) -> None:
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id != "folders" or event.item is None:
             return
         index = event.list_view.index
         if index is None or index >= len(self._folder_items):
             return
-        await self._select_folder(self._folder_items[index])
+        self._set_status(f"Loading {self._folder_items[index]} page…")
+        self.run_worker(
+            self._select_folder(self._folder_items[index]),
+            group="folder-page",
+            exclusive=True,
+            exit_on_error=False,
+        )
 
     async def _select_folder(self, folder: str) -> None:
-        self._generation += 1
-        generation = self._generation
+        self._folder_generation += 1
+        self._message_generation += 1
+        self._classification_generation += 1
+        generation = self._folder_generation
         self._selected_folder = folder
         self._detail = None
         self._analysis = None
@@ -215,13 +220,13 @@ class MailReviewApp(App[None]):
             else:
                 page = await asyncio.to_thread(self.mail_service.list_messages, folder, limit=50, offset=0)
                 page_rows = tuple((folder, item) for item in page.items)
-            if generation != self._generation:
+            if generation != self._folder_generation:
                 return
             self._populate_rows(page_rows)
             self._set_status(f"{folder}: {len(page_rows)} messages loaded.")
         except Exception as exc:
-            if generation == self._generation:
-                self._set_status(f"Could not load {folder}: {type(exc).__name__}: {exc}")
+            if generation == self._folder_generation:
+                self._set_status(f"Could not load {folder}: {type(exc).__name__}")
 
     def _populate_rows(self, rows: tuple[tuple[str, MailSummary], ...]) -> None:
         self._rows = list(rows)
@@ -245,21 +250,28 @@ class MailReviewApp(App[None]):
                 key=str(index),
             )
 
-    async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         index = event.cursor_row
         if index < 0 or index >= len(self._rows):
             return
         folder, summary = self._rows[index]
-        await self._open_message(folder, summary.uid)
+        self._set_status(f"Opening {folder} UID {summary.uid}…")
+        self.run_worker(
+            self._open_message(folder, summary.uid),
+            group="message-detail",
+            exclusive=True,
+            exit_on_error=False,
+        )
 
     async def _open_message(self, folder: str, uid: int) -> None:
-        self._generation += 1
-        generation = self._generation
+        self._message_generation += 1
+        self._classification_generation += 1
+        generation = self._message_generation
         self._selected_folder = folder
         self.query_one("#message-detail", Static).update("Opening message with BODY.PEEK…")
         try:
             detail = await asyncio.to_thread(self.mail_service.get_message, folder, uid)
-            if generation != self._generation:
+            if generation != self._message_generation:
                 return
             self._detail = detail
             self._analysis = None
@@ -275,7 +287,7 @@ class MailReviewApp(App[None]):
                     message,
                     persisted_outcome=state,
                 )
-                if generation != self._generation:
+                if generation != self._message_generation:
                     return
                 self._render_analysis(self._analysis)
             else:
@@ -284,9 +296,9 @@ class MailReviewApp(App[None]):
                 )
             self._set_status(f"{folder} UID {uid}. Read-only browsing; no message was marked seen.")
         except Exception as exc:
-            if generation == self._generation:
-                self._set_status(f"Could not open message: {type(exc).__name__}: {exc}")
-                self.query_one("#message-detail", Static).update(str(exc))
+            if generation == self._message_generation:
+                self._set_status(f"Could not open message: {type(exc).__name__}")
+                self.query_one("#message-detail", Static).update(f"Message could not be opened ({type(exc).__name__}).")
 
     def _render_message(self, folder: str, message: Any, detail: MessageDetail, state: SpamOutcome | None) -> str:
         parts = [
@@ -338,11 +350,11 @@ class MailReviewApp(App[None]):
             lines.append("Automation unavailable: this folder is not configured in spam.folders.")
         self.query_one("#analysis", Static).update("\n".join(lines))
 
-    async def action_classify(self) -> None:
-        await self._classify(reclassify=False)
+    def action_classify(self) -> None:
+        self.run_worker(self._classify(reclassify=False), group="classification", exclusive=True, exit_on_error=False)
 
-    async def action_reclassify(self) -> None:
-        await self._classify(reclassify=True)
+    def action_reclassify(self) -> None:
+        self.run_worker(self._classify(reclassify=True), group="classification", exclusive=True, exit_on_error=False)
 
     async def _classify(self, *, reclassify: bool) -> None:
         detail = self._detail
@@ -350,7 +362,9 @@ class MailReviewApp(App[None]):
             self._set_status("Select a message first.")
             return
         self._set_status("Classifying in a background thread…")
-        generation = self._generation
+        started = time.monotonic()
+        self._classification_generation += 1
+        generation = self._classification_generation
         try:
             state = detail.persisted_state.outcome if detail.persisted_state else None
             analysis = await asyncio.to_thread(
@@ -360,24 +374,33 @@ class MailReviewApp(App[None]):
                 persisted_outcome=state,
                 reclassify=reclassify,
             )
-            if generation != self._generation:
+            if generation != self._classification_generation:
                 return
             self._analysis = analysis
             self._render_analysis(analysis)
+            _LOG.debug("ui.classify duration_ms=%.1f result_count=1", (time.monotonic() - started) * 1000)
             outcome = analysis.outcome.value.upper() if analysis.outcome else "RULE"
             self._set_status(f"Classification complete: {outcome}.")
         except Exception as exc:
-            self._set_status(f"Classification failed: {type(exc).__name__}: {exc}")
+            self._set_status(f"Classification failed: {type(exc).__name__}")
 
     def action_apply(self) -> None:
         analysis = self._analysis
+        if self._action_running:
+            self._set_status("An action is already running.")
+            return
         if analysis is None or analysis.configured_action is None:
             self._set_status("Classify the selected message before applying an action.")
             return
         if self.settings is None or analysis.folder not in self.settings.spam.folders:
             self._set_status("Automation unavailable: folder is not configured in spam.folders.")
             return
-        self.push_screen(ApplyConfirmation(analysis), self._apply_confirmed)
+        self.push_screen(ApplyConfirmation(analysis), self._confirmed_action)
+
+    def _confirmed_action(self, confirmed: bool) -> None:
+        if confirmed and not self._action_running:
+            self._action_running = True
+            self.run_worker(self._apply_confirmed(True), group="action", exit_on_error=False)
 
     async def _apply_confirmed(self, confirmed: bool) -> None:
         if not confirmed:
@@ -387,7 +410,7 @@ class MailReviewApp(App[None]):
         if analysis is None or detail is None or self.action_service is None:
             return
         self._set_status("Applying configured action in a background thread…")
-        generation = self._generation
+        started = time.monotonic()
         try:
             receipt: ActionReceipt = await asyncio.to_thread(
                 self.action_service.apply,
@@ -396,6 +419,7 @@ class MailReviewApp(App[None]):
                 confirmed_by_user=True,
             )
             result = "confirmed" if receipt.applied and receipt.confirmed else "not confirmed"
+            _LOG.debug("ui.apply duration_ms=%.1f result_count=1", (time.monotonic() - started) * 1000)
             activity = f"{receipt.folder} UID {receipt.uid}: {receipt.requested_action.action.value.upper()} {result}"
             if receipt.destination:
                 activity += f" to {receipt.destination}"
@@ -405,23 +429,101 @@ class MailReviewApp(App[None]):
             self.query_one("#activity", Static).update("Activity\n" + "\n".join(self._activity[-20:]))
             self._set_status(f"Action {result}.")
             if receipt.applied and receipt.confirmed:
-                self.folders = await asyncio.to_thread(self.mail_service.list_folders)
-                if generation == self._generation and self._selected_folder is not None:
-                    await self._select_folder(self._selected_folder)
+                action = receipt.requested_action.action.value
+                if action in {"move", "delete"}:
+                    summary = self._find_summary(receipt.folder, receipt.uid)
+                    rows = [
+                        (row_folder, summary)
+                        for row_folder, summary in self._rows
+                        if not (row_folder == receipt.folder and summary.uid == receipt.uid)
+                    ]
+                    self._populate_rows(tuple(rows))
+                    if self._detail is not None and self._detail.item.uid == receipt.uid:
+                        self._detail = None
+                        self._analysis = None
+                        self.query_one("#message-detail", Static).update("Select a message to read its text content.")
+                        self.query_one("#analysis", Static).update("Analysis will not run until requested.")
+                if action in {"move", "delete"}:
+                    action_name = receipt.requested_action.action.value.upper()
+                    self._set_status(f"Action confirmed. {action_name} applied; updating counts…")
+                    self._adjust_folder_count(receipt.folder, -1, summary=summary)
+                    targets = tuple(dict.fromkeys(folder for folder in (receipt.folder, receipt.destination) if folder))
+                    self.run_worker(self._refresh_action_counts(targets), group="folder-counts", exit_on_error=False)
+                elif action == "keep" and analysis.outcome is not None:
+                    rows = []
+                    for row_folder, summary in self._rows:
+                        if row_folder == receipt.folder and summary.uid == receipt.uid:
+                            if self._selected_folder == "Review" and analysis.outcome is not SpamOutcome.REVIEW:
+                                continue
+                            summary = replace(summary, persisted_state=analysis.outcome)
+                        rows.append((row_folder, summary))
+                    self._populate_rows(tuple(rows))
         except Exception as exc:
-            self._set_status(f"Action failed: {type(exc).__name__}: {exc}")
+            self._set_status(f"Action failed: {type(exc).__name__}")
+        finally:
+            self._action_running = False
 
-    async def action_refresh(self) -> None:
+    def action_refresh(self) -> None:
+        self._set_status("Refreshing folders and current page…")
+        self.run_worker(self._refresh(), group="startup-folders", exclusive=True, exit_on_error=False)
+
+    async def _refresh(self) -> None:
         try:
-            await self._initialize()
-            self.folders = await asyncio.to_thread(self.mail_service.list_folders)
+            self.folders = await asyncio.to_thread(self.mail_service.list_folders, include_counts=False)
             self._render_folders()
             if self._selected_folder is not None:
                 await self._select_folder(self._selected_folder)
-            else:
-                self._set_status("Folders refreshed.")
+            self.run_worker(self._refresh_counts(), group="folder-counts", exit_on_error=False)
         except Exception as exc:
-            self._set_status(f"Refresh failed: {type(exc).__name__}: {exc}")
+            self._set_status(f"Refresh failed: {type(exc).__name__}")
+
+    async def _refresh_counts(self) -> None:
+        self._set_status("Refreshing counts…")
+        try:
+            self.folders = await asyncio.to_thread(self.mail_service.list_folders, include_counts=True)
+            self._render_folders()
+            folder_label = self._selected_folder or "Folders"
+            self._set_status(f"Folder counts refreshed. {folder_label}: {len(self._rows)} messages loaded.")
+        except Exception as exc:
+            self._set_status(f"Count refresh failed: {type(exc).__name__}")
+
+    def _find_summary(self, folder: str, uid: int) -> MailSummary | None:
+        return next(
+            (summary for row_folder, summary in self._rows if row_folder == folder and summary.uid == uid),
+            None,
+        )
+
+    def _adjust_folder_count(self, name: str, delta: int, *, summary: MailSummary | None = None) -> None:
+        unseen_delta = (
+            delta
+            if summary is not None
+            and not any(
+                (flag.decode("ascii", errors="replace") if isinstance(flag, bytes) else flag) == "\\Seen"
+                for flag in summary.flags
+            )
+            else 0
+        )
+        self.folders = tuple(
+            replace(folder, total=max(0, folder.total + delta), unread=max(0, folder.unread + unseen_delta))
+            if folder.name == name and folder.total is not None and folder.unread is not None
+            else folder
+            for folder in self.folders
+        )
+        self._render_folders()
+
+    async def _refresh_action_counts(self, folders: tuple[str, ...]) -> None:
+        try:
+            counts = await asyncio.to_thread(self.mail_service.refresh_folder_counts, folders)
+            self.folders = tuple(
+                replace(folder, total=counts[folder.name][0], unread=counts[folder.name][1])
+                if folder.name in counts
+                else folder
+                for folder in self.folders
+            )
+            self._render_folders()
+            self._set_status("Action complete. Source/destination counts refreshed.")
+        except Exception as exc:
+            self._set_status(f"Action complete. Count refresh failed: {type(exc).__name__}")
 
     def action_next_pane(self) -> None:
         widgets = [self.query_one("#folders"), self.query_one("#messages"), self.query_one("#message-detail")]
@@ -439,7 +541,37 @@ class MailReviewApp(App[None]):
     def on_unmount(self) -> None:
         if self.mail_service is not None:
             self.mail_service.close()
+        if self.action_service is not None and hasattr(self.action_service, "close"):
+            self.action_service.close()
 
 
 def run(config: Path) -> None:
-    MailReviewApp(config).run()
+    import sys
+
+    password = ""
+    mail_service = None
+    action_service = None
+    try:
+        settings = load_settings(config)
+        rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
+        password = resolve_credential(settings.imap).password
+        mail_service = MailService(settings, password)
+        analysis_service = AnalysisService(settings, rules)
+        action_service = ActionService(settings, password, rules)
+        MailReviewApp(
+            config,
+            mail_service=mail_service,
+            settings=settings,
+            rules=rules,
+            analysis_service=analysis_service,
+            action_service=action_service,
+        ).run()
+    except Exception as exc:
+        print(f"imapledger could not start: {type(exc).__name__}", file=sys.stderr)
+        raise
+    finally:
+        if mail_service is not None:
+            mail_service.close()
+        if action_service is not None:
+            action_service.close()
+        password = ""

@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 
 from .classification_state import PersistedState, SpamOutcome, keyword_for_outcome
 from .config import Settings
 from .mailbox import (
+    BrowserMailbox,
     ClientFactory,
     FolderCatalog,
     FolderClientFactory,
     FolderInfo,
     MailboxItem,
     MessageSort,
-    ReadOnlyMailbox,
-    ScopedMailbox,
 )
 from .message import MailSummary
+
+_LOG = logging.getLogger(__name__)
+
+
+def _log_timing(operation: str, started: float, **fields: int) -> None:
+    duration_ms = (time.monotonic() - started) * 1000
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    _LOG.debug("%s duration_ms=%.1f %s", operation, duration_ms, details)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +66,8 @@ class MailService:
     def close(self) -> None:
         self._password = ""
 
-    def list_folders(self) -> tuple[FolderInfo, ...]:
+    def list_folders(self, *, include_counts: bool = True) -> tuple[FolderInfo, ...]:
+        started = time.monotonic()
         settings = self._settings
         with FolderCatalog(
             host=settings.imap.host,
@@ -66,7 +76,20 @@ class MailService:
             password=self._password,
             client_factory=self._folder_client_factory,
         ) as catalog:
-            return catalog.list_folders()
+            folders = catalog.list_folders(include_counts=include_counts)
+        _log_timing("ui.folder_list", started, folder_count=len(folders))
+        return folders
+
+    def refresh_folder_counts(self, folders: tuple[str, ...]) -> dict[str, tuple[int, int]]:
+        settings = self._settings
+        with FolderCatalog(
+            host=settings.imap.host,
+            port=settings.imap.port,
+            username=settings.imap.username,
+            password=self._password,
+            client_factory=self._folder_client_factory,
+        ) as catalog:
+            return catalog.folder_counts(folders)
 
     def list_messages(
         self,
@@ -76,55 +99,62 @@ class MailService:
         offset: int = 0,
         sort: MessageSort = MessageSort.NEWEST,
     ) -> MessagePage:
+        started = time.monotonic()
         if limit < 1 or offset < 0:
             raise ValueError("limit must be positive and offset must be non-negative")
         if not isinstance(sort, MessageSort):
             raise ValueError("sort must be a MessageSort")
-        with self._open_mailbox(folder) as mailbox:
-            snapshot = mailbox.snapshot()
-            uids = mailbox.page_uids(offset=offset, limit=limit, sort=sort)
+        with self._open_browser(folder) as mailbox:
+            uids = mailbox.list_page_uids(offset=offset, limit=limit, sort=sort)
             items = mailbox.fetch_summaries(uids)
-        return MessagePage(
+            total = mailbox.message_count
+            uidvalidity = mailbox.uidvalidity
+        page = MessagePage(
             folder=folder,
-            uidvalidity=snapshot.uidvalidity,
+            uidvalidity=uidvalidity,
             offset=offset,
             limit=limit,
             sort=sort,
-            total=len(snapshot.uids),
+            total=total,
             items=items,
             has_previous=offset > 0,
-            has_next=offset + len(items) < len(snapshot.uids),
+            has_next=offset + len(items) < total,
         )
+        _log_timing("ui.folder_page", started, message_count=len(page.items), page_size=limit)
+        return page
 
     def get_message(self, folder: str, uid: int) -> MessageDetail:
-        with self._open_mailbox(folder) as mailbox:
-            snapshot = mailbox.snapshot()
-            item = mailbox.fetch_uid(uid)
-            state = mailbox.classification_state(uid) if item.message is not None else None
-        return MessageDetail(folder=folder, uidvalidity=snapshot.uidvalidity, item=item, persisted_state=state)
+        started = time.monotonic()
+        with self._open_browser(folder) as mailbox:
+            item, state = mailbox.fetch_uid(uid)
+            uidvalidity = mailbox.uidvalidity
+        detail = MessageDetail(folder=folder, uidvalidity=uidvalidity, item=item, persisted_state=state)
+        _log_timing("ui.message_open", started, message_count=1)
+        return detail
 
     def review_messages(self, *, limit: int = 50, offset: int = 0) -> tuple[tuple[str, MailSummary], ...]:
+        started = time.monotonic()
         if limit < 1 or offset < 0:
             raise ValueError("limit must be positive and offset must be non-negative")
         rows: list[tuple[str, MailSummary]] = []
         keyword = keyword_for_outcome(SpamOutcome.REVIEW)
         for folder in self._settings.spam.folders:
-            with self._open_mailbox(folder) as mailbox:
+            with self._open_browser(folder) as mailbox:
                 uids = sorted(mailbox.search_keyword(keyword), reverse=True)[offset : offset + limit]
                 rows.extend((folder, summary) for summary in mailbox.fetch_summaries(uids))
-        return tuple(sorted(rows, key=lambda row: (row[1].uid, row[0]), reverse=True))
+        result = tuple(sorted(rows, key=lambda row: (row[1].uid, row[0]), reverse=True))
+        _log_timing("ui.review_page", started, result_count=len(result), page_size=limit)
+        return result
 
-    def _open_mailbox(self, folder: str) -> ReadOnlyMailbox:
+    def _open_browser(self, folder: str) -> BrowserMailbox:
         settings = self._settings
-        scoped = ScopedMailbox(
+        return BrowserMailbox(
             host=settings.imap.host,
             port=settings.imap.port,
             username=settings.imap.username,
             password=self._password,
             folder=folder,
-            writable=False,
             max_message_bytes=settings.spam.max_message_bytes,
             max_body_chars=settings.spam.max_body_chars,
             client_factory=self._client_factory,
         )
-        return ReadOnlyMailbox(scoped)
