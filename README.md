@@ -179,6 +179,21 @@ imapledger explain 43652 --folder INBOX.Junk
 imapledger state reset --folder INBOX.Junk --uid 43652 --apply
 ```
 
+## Mail review console
+
+Launch the interactive console explicitly with `imapledger ui`. It provides folder browsing, a merged Review view, bounded plain-text message reading, on-demand analysis, and confirmation-gated configured actions. Browsing uses read-only mailbox access and `BODY.PEEK`; opening a message does not mark it seen. HTML is not rendered, attachments are not opened, and activity/results are kept only for the current session.
+
+The same services are available through composable commands:
+
+```bash
+imapledger mail list --folder INBOX.Junk --limit 50
+imapledger mail show 43724 --folder INBOX.Junk
+imapledger mail classify 43724 --folder INBOX.Junk
+imapledger mail classify 43724 --folder INBOX.Junk --apply
+```
+
+`mail list` fetches bounded headers only. `mail show` reads bounded text without changing flags. `mail classify` is preview-only unless `--apply` is explicitly supplied; applying uses the configured action and the existing mailbox safety checks. Non-source folders can be inspected but cannot be automated. Bare `imapledger` continues to print help, including in non-interactive use.
+
 ## Learned routing rules
 
 Use a routing rule for a personal mailbox preference that should remain separate from spam classification. For example, learn a narrow rule from one explicitly scoped message UID:

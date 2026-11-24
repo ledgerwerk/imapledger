@@ -14,7 +14,7 @@ from .classification_state import (
     keyword_for_outcome,
     validate_state_flags,
 )
-from .message import MailMessage, parse_message
+from .message import MailMessage, MailSummary, parse_message, parse_summary
 
 DELETED_FLAG = "\\Deleted"
 
@@ -733,6 +733,47 @@ class ScopedMailbox:
             )
         return parse_message(uid, raw, max_body_chars=0)
 
+    def fetch_summaries(self, uids: Sequence[int]) -> tuple[MailSummary, ...]:
+        requested = tuple(uids)
+        for uid in requested:
+            self._validate_snapshot_uid(uid)
+        if not requested:
+            return ()
+
+        selector = "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)]"
+        fetch_data = [selector, "FLAGS", "RFC822.SIZE"]
+        summaries: dict[int, MailSummary] = {}
+        for offset in range(0, len(requested), self._fetch_batch_size):
+            batch = requested[offset : offset + self._fetch_batch_size]
+            client = self._reselect_source(operation="imap_fetch_summaries_select")
+            try:
+                response = client.fetch(batch, fetch_data)
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_fetch_summaries",
+                    message="FETCH of message summaries failed",
+                    exc=exc,
+                    folder=self._folder,
+                    selector=f"{selector} FLAGS RFC822.SIZE",
+                    uids=batch,
+                ) from exc
+            for uid in batch:
+                data = response.get(uid)
+                if not isinstance(data, Mapping):
+                    summaries[uid] = _skipped_summary(uid, "message disappeared before header fetch")
+                    continue
+                raw_headers = _fetch_header_bytes(data)
+                if raw_headers is None:
+                    summaries[uid] = _skipped_summary(uid, "server did not return message headers")
+                    continue
+                flags = _fetch_flags_value(data)
+                size = _fetch_size_value(data)
+                if flags is None:
+                    summaries[uid] = _skipped_summary(uid, "server did not return message flags")
+                    continue
+                summaries[uid] = parse_summary(uid, raw_headers, flags=flags, size_bytes=size)
+        return tuple(summaries[uid] for uid in requested)
+
     def add_keyword(self, uid: int, keyword: str) -> None:
         self._add_keyword(uid, keyword, allow_existing_state=False)
 
@@ -1125,7 +1166,10 @@ class ScopedMailbox:
         raw = body_data.get(b"BODY[]")
         if not isinstance(raw, bytes):
             return MailboxItem(uid=uid, skip_reason="server did not return BODY[] bytes")
-        return MailboxItem(uid=uid, message=parse_message(uid, raw, max_body_chars=self._max_body_chars))
+        return MailboxItem(
+            uid=uid,
+            message=parse_message(uid, raw, max_body_chars=self._max_body_chars, size_bytes=size),
+        )
 
     def selected_count(self, selection: MessageSelection) -> int:
         return len(self._selected_uids(selection))
@@ -1210,7 +1254,7 @@ class ScopedMailbox:
                     continue
                 yield MailboxItem(
                     uid=uid,
-                    message=parse_message(uid, raw, max_body_chars=self._max_body_chars),
+                    message=parse_message(uid, raw, max_body_chars=self._max_body_chars, size_bytes=size),
                 )
 
     def move_uid(self, uid: int, destination: str) -> MoveResult:
@@ -1617,3 +1661,86 @@ def _uidvalidity(selected: dict[bytes, Any]) -> int:
     if value is None:
         raise UnsafeMailboxOperation("server did not provide UIDVALIDITY; refusing scoped operation")
     return int(value)
+
+
+def _fetch_header_bytes(data: Mapping[Any, Any]) -> bytes | None:
+    for key, value in data.items():
+        normalized = key.decode("ascii", errors="replace") if isinstance(key, bytes) else str(key)
+        if normalized.upper().startswith("BODY[HEADER.FIELDS") and isinstance(value, bytes):
+            return value
+    return None
+
+
+def _fetch_flags_value(data: Mapping[Any, Any]) -> frozenset[bytes | str] | None:
+    values = data.get(b"FLAGS", data.get("FLAGS"))
+    if values is None:
+        return None
+    if isinstance(values, (bytes, str)):
+        values = (values,)
+    try:
+        flags = frozenset(values)
+    except TypeError:
+        return None
+    return flags if all(isinstance(flag, (bytes, str)) for flag in flags) else None
+
+
+def _fetch_size_value(data: Mapping[Any, Any]) -> int | None:
+    value = data.get(b"RFC822.SIZE", data.get("RFC822.SIZE"))
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return None
+    return size if size >= 0 else None
+
+
+def _skipped_summary(uid: int, reason: str) -> MailSummary:
+    return MailSummary(
+        uid=uid,
+        sender="",
+        subject="",
+        date="",
+        message_id="",
+        size_bytes=None,
+        flags=frozenset(),
+        persisted_state=None,
+        skip_reason=reason,
+    )
+
+
+class ReadOnlyMailbox:
+    """Narrow read-only facade over one read-only scoped mailbox."""
+
+    def __init__(self, mailbox: ScopedMailbox) -> None:
+        if mailbox.writable:
+            raise ValueError("ReadOnlyMailbox requires a read-only ScopedMailbox")
+        self.__mailbox = mailbox
+
+    def __enter__(self) -> ReadOnlyMailbox:
+        self.__mailbox.__enter__()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.__mailbox.__exit__(exc_type, exc, tb)
+
+    def snapshot(self) -> MailboxSnapshot:
+        return self.__mailbox.snapshot()
+
+    def page_uids(self, *, offset: int = 0, limit: int = 50, sort: MessageSort = MessageSort.NEWEST) -> tuple[int, ...]:
+        if offset < 0 or limit < 1:
+            raise ValueError("offset must be non-negative and limit must be positive")
+        if not isinstance(sort, MessageSort):
+            raise ValueError("sort must be a MessageSort")
+        uids = sorted(self.snapshot().uids, reverse=sort is MessageSort.NEWEST)
+        return tuple(uids[offset : offset + limit])
+
+    def fetch_summaries(self, uids: Sequence[int]) -> tuple[MailSummary, ...]:
+        return self.__mailbox.fetch_summaries(uids)
+
+    def search_keyword(self, keyword: str) -> frozenset[int]:
+        return self.__mailbox.search_keyword(keyword)
+
+    def fetch_uid(self, uid: int) -> MailboxItem:
+        return self.__mailbox.fetch_uid(uid)
+
+    def classification_state(self, uid: int) -> PersistedState:
+        return self.__mailbox.classification_state(uid)

@@ -331,12 +331,12 @@ def test_clean_streams_decisions_once_with_summary(monkeypatch):
     rendered = output.getvalue()
     assert result.exit_code == 0
     assert "folder=Spam messages=4 selected=4 sort=newest offset=0 limit=all" in rendered
-    assert "[1/4] Folder=Spam UID 40  WOULD DELETE  Outcome=SPAM  Verdict=DELETE" in rendered
-    assert "Signals=bulk=0.97 phishing=0.02 identity=0.15 legit=0.01 delete=0.99" in rendered
-    assert "Reasons=unsolicited-bulk,delete-safe-corroboration" in rendered
-    assert "[2/4] Folder=Spam UID 30  KEEP  Outcome=NOT_SPAM  Verdict=KEEP" in rendered
-    assert "[3/4] Folder=Spam UID 20  SKIP / KEEP  Outcome=-  Verdict=-  Signals=-" in rendered
-    assert "[4/4] Folder=Spam UID 10  ERROR / KEEP  Outcome=-  Verdict=-  Signals=-" in rendered
+    assert "[1/4] SPAM | WOULD DELETE |" in rendered
+    assert "Signals=" not in rendered
+    assert "Reasons=" not in rendered
+    assert "[2/4] NOT_SPAM | KEEP |" in rendered
+    assert "[3/4] SKIP | SKIP / KEEP |" in rendered
+    assert "[4/4] ERROR | ERROR / KEEP |" in rendered
     assert rendered.count("spam-subject") == 1
     assert "token=secret" not in rendered
     assert "/path" not in rendered
@@ -369,9 +369,9 @@ def test_apply_progress_reports_final_action_without_duplicate_listing(monkeypat
 
     rendered = output.getvalue()
     assert result.exit_code == 0
-    assert "[1/4] Folder=Spam UID 40  DELETED" in rendered
-    assert "[1/4] Folder=Spam UID 40  DELETE-APPROVED" not in rendered
-    assert rendered.count("[1/4] Folder=Spam UID 40") == 1
+    assert "[1/4] SPAM | DELETED |" in rendered
+    assert "[1/4] SPAM | DELETE |" not in rendered
+    assert rendered.count("[1/4] SPAM |") == 1
     assert "folder=Spam UID 40  DELETED" not in rendered
     assert "Actions: deleted 1; kept 3." in rendered
 
@@ -1320,18 +1320,18 @@ def test_clean_apply_keeps_real_folder_provenance_with_selection_drift(monkeypat
 
     rendered = output.getvalue()
     assert result.exit_code == 0, result.output
-    assert "Folder=INBOX.Junk UID 1001  Action=MOVED -> INBOX.Trash" in rendered
-    assert "From=junk-a@example.org  Subject=JUNK-A" in rendered
-    assert "Folder=INBOX.Junk UID 1000  Action=MOVED -> INBOX.Trash" in rendered
-    assert "From=junk-b@example.org  Subject=JUNK-B" in rendered
-    assert "Folder=INBOX.spam UID 2001  Action=MOVED -> INBOX.Trash" in rendered
-    assert "From=spam-a@example.org  Subject=SPAM-A" in rendered
-    assert "Folder=INBOX.spam UID 2000  Action=MOVED -> INBOX.Trash" in rendered
-    assert "From=spam-b@example.org  Subject=SPAM-B" in rendered
+    assert "MOVED -> INBOX.Trash | junk-a@example.org | JUNK-A" in rendered
+    assert "junk-a@example.org" in rendered
+    assert "MOVED -> INBOX.Trash | junk-b@example.org | JUNK-B" in rendered
+    assert "junk-b@example.org" in rendered
+    assert "MOVED -> INBOX.Trash | spam-a@example.org | SPAM-A" in rendered
+    assert "spam-a@example.org" in rendered
+    assert "MOVED -> INBOX.Trash | spam-b@example.org | SPAM-B" in rendered
+    assert "spam-b@example.org" in rendered
     assert "Folder=INBOX.Spam" not in rendered
-    assert "Folder=INBOX.spam UID 2001  MOVED -> INBOX.Trash  Rule=junk-a" not in rendered
-    assert rendered.count("Subject=JUNK-A") == 1
-    assert rendered.count("Subject=JUNK-B") == 1
+    assert "Rule=junk-a" not in rendered
+    assert rendered.count("JUNK-A") == 1
+    assert rendered.count("JUNK-B") == 1
     assert client.moves == [
         ((1001,), "INBOX.Trash"),
         ((1000,), "INBOX.Trash"),
@@ -1406,9 +1406,9 @@ def test_clean_apply_preflights_each_destination_before_classifying(monkeypatch)
         folder_events = [event for event in state["events"] if event[1] == folder]
         assert folder_events.index(("destination", folder, "INBOX.Trash")) < folder_events.index(("classify", folder))
         assert folder_events.index(("destination", folder, "INBOX.NotSpam")) < folder_events.index(("classify", folder))
-    assert rendered.count("[1/1] Folder=INBOX.Junk UID 10  MOVED -> INBOX.Trash") == 1
-    assert rendered.count("[1/1] Folder=INBOX.Spam UID 10  MOVED -> INBOX.Trash") == 1
-    assert "Folder=INBOX.Junk UID 10  MOVED -> INBOX.Trash" in rendered
+    assert rendered.count("MOVED -> INBOX.Trash |") == 2
+    assert rendered.count("SPAM | MOVED -> INBOX.Trash |") == 2
+    assert "MOVED -> INBOX.Trash |" in rendered
     assert "Aggregate across 2 folders" in rendered
 
 
@@ -1503,12 +1503,12 @@ def test_clean_partial_move_exits_nonzero_and_keeps_confirmed_reporting(monkeypa
         ("INBOX.Spam", False),
         ("INBOX.Junk", True),
     ]
-    assert "[1/2] Folder=INBOX.Junk UID 10  MOVED -> INBOX.Trash" in rendered
+    assert "[1/2] SPAM | MOVED -> INBOX.Trash |" in rendered
 
-    assert "[2/2] Folder=INBOX.Junk UID 20  MOVE NOT CONFIRMED -> INBOX.Trash" in rendered
-    assert rendered.count("[1/2] Folder=INBOX.Junk UID 10") == 1
-    assert "Folder=INBOX.Junk UID 10  MOVED -> INBOX.Trash" in rendered
-    assert "Folder=INBOX.Junk UID 20  MOVE NOT CONFIRMED -> INBOX.Trash" in rendered
+    assert "[2/2] SPAM | MOVE NOT CONFIRMED -> INBOX.Trash |" in rendered
+    assert rendered.count("[1/2] SPAM | MOVED") == 1
+    assert "MOVED -> INBOX.Trash |" in rendered
+    assert "MOVE NOT CONFIRMED -> INBOX.Trash |" in rendered
     assert "Aggregate across 1 folders" in rendered
     assert "destination='INBOX.Trash'" in result.output
 

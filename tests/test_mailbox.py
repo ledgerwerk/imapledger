@@ -14,6 +14,7 @@ from imapledger.mailbox import (
     MoveResult,
     PartialDeleteError,
     PartialMoveError,
+    ReadOnlyMailbox,
     ScopedMailbox,
     UnsafeMailboxOperation,
 )
@@ -1604,3 +1605,72 @@ def test_state_store_never_touches_another_configured_folder() -> None:
     assert client.flags["Spam"][10] == {b"imapledger-v1-spam"}
     assert client.flags["Other"][20] == {b"imapledger-v1-review"}
     assert all(folder == "Spam" for folder, _ in client.selected)
+
+
+class SummaryFakeClient(FakeClient):
+    def fetch(self, messages, data, modifiers=None):
+        messages = tuple(messages)
+        data = tuple(data)
+        self.fetches.append((messages, data))
+        if data != (
+            "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)]",
+            "FLAGS",
+            "RFC822.SIZE",
+        ):
+            return super().fetch(messages, data, modifiers)
+        headers = (
+            b"From: Sender <sender@example.org>\r\nSubject: Page row\r\nDate: Today\r\n"
+            b"Message-ID: <row@example.org>\r\n\r\n"
+        )
+        return {
+            uid: {
+                b"BODY[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)]": headers,
+                b"FLAGS": tuple(self.flags.get(uid, set())),
+                b"RFC822.SIZE": uid * 10,
+            }
+            for uid in messages
+            if uid in self.uids and uid not in getattr(self, "missing_summary_uids", set())
+        }
+
+
+def test_fetch_summaries_batches_preserves_requested_order_and_reads_state() -> None:
+    client = SummaryFakeClient(uids=[10, 20], flags={20: {b"imapledger-v1-review"}})
+    with make_mailbox(client, writable=False, fetch_batch_size=1) as mailbox:
+        summaries = mailbox.fetch_summaries((20, 10))
+
+    assert [summary.uid for summary in summaries] == [20, 10]
+    assert summaries[0].sender == "Sender <sender@example.org>"
+    assert summaries[0].subject == "Page row"
+    assert summaries[0].size_bytes == 200
+    assert summaries[0].persisted_state is SpamOutcome.REVIEW
+    assert summaries[1].persisted_state is None
+    assert [call[0] for call in client.fetches] == [(20,), (10,)]
+    assert all("BODY.PEEK[HEADER.FIELDS" in call[1][0] for call in client.fetches)
+    assert client.selected[0] == ("Spam", True)
+
+
+def test_fetch_summaries_marks_vanished_uid_and_rejects_uid_outside_snapshot() -> None:
+    client = SummaryFakeClient(uids=[10, 20])
+    client.missing_summary_uids = {20}
+    with make_mailbox(client, writable=False) as mailbox:
+        summaries = mailbox.fetch_summaries((20, 10))
+        with pytest.raises(UnsafeMailboxOperation, match="initial mailbox snapshot"):
+            mailbox.fetch_summaries((99,))
+
+    assert summaries[0].skip_reason == "message disappeared before header fetch"
+    assert summaries[1].subject == "Page row"
+    assert len(client.fetches) == 1
+
+
+def test_read_only_facade_exposes_browsing_but_no_mutation_methods() -> None:
+    client = FakeClient(uids=[10, 20])
+    scoped = make_mailbox(client, writable=False)
+    mailbox = ReadOnlyMailbox(scoped)
+
+    assert not hasattr(mailbox, "move_uid")
+    with mailbox:
+        assert mailbox.page_uids(limit=1) == (20,)
+        assert mailbox.page_uids(limit=2, sort=MessageSort.OLDEST) == (10, 20)
+
+    with pytest.raises(ValueError, match="read-only ScopedMailbox"):
+        ReadOnlyMailbox(make_mailbox(FakeClient(), writable=True))

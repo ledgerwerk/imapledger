@@ -10,9 +10,11 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from .action_service import ActionService
+from .analysis_service import AnalysisService
 from .classification_state import all_state_keywords
 from .classifier import PyJevSpamClassifier
-from .cleaner import VERDICT_OUTCOME, CleanReport, MessageResult, SpamCleaner
+from .cleaner import CleanReport, MessageResult, SpamCleaner
 from .config import (
     ActionKind,
     AuthSource,
@@ -45,6 +47,7 @@ from .credentials import (
     resolve_credential,
 )
 from .evidence import build_message_evidence, redact_urls
+from .mail_service import MailService
 from .mailbox import (
     FolderCatalog,
     FolderInfo,
@@ -79,6 +82,8 @@ state_app = typer.Typer(help="Inspect and reset persisted classification state."
 app.add_typer(state_app, name="state")
 review_app = typer.Typer(help="Inspect the persisted review queue.")
 app.add_typer(review_app, name="review")
+mail_app = typer.Typer(help="Browse and analyze mailbox messages.")
+app.add_typer(mail_app, name="mail")
 console = Console()
 err_console = Console(stderr=True)
 
@@ -1062,6 +1067,7 @@ def clean(
                                     position=position,
                                     total=total,
                                     apply=apply,
+                                    verbose=verbose,
                                 )
                             )
                             if progress
@@ -1318,6 +1324,15 @@ def explain(
                 console.print("Classifier: NOT RUN (pass --reclassify to evaluate current policy)", markup=False)
                 console.print(f"Configured action={_action_description(action)}", markup=False)
                 return
+            analysis = AnalysisService(settings, rules, classifier_factory=PyJevSpamClassifier).analyze(
+                folder,
+                message,
+                persisted_outcome=state.outcome,
+                reclassify=reclassify,
+            )
+            evidence = analysis.evidence
+            if evidence is None:
+                raise MailboxError("message analysis did not return evidence")
             authentication = evidence.authentication
             console.print(
                 f"Authentication trusted={authentication.trusted} authserv_id={authentication.authserv_id or '-'} "
@@ -1332,20 +1347,16 @@ def explain(
                 f"spam_marker={provider.spam_marker}",
                 markup=False,
             )
-            rule = rules.first_match(folder, message)
-            if rule is not None:
-                console.print(f"Rule={rule.id} action={_action_description(rule.action)}", markup=False)
+            if analysis.rule_id is not None:
+                console.print(
+                    f"Rule={analysis.rule_id} action={_action_description(analysis.configured_action)}",
+                    markup=False,
+                )
                 console.print("Classifier: NOT RUN (a deterministic rule matches)", markup=False)
                 return
-            with PyJevSpamClassifier(
-                trusted_authserv_ids=settings.spam.trusted_authserv_ids,
-                trusted_provider_headers=settings.spam.trusted_provider_headers,
-            ) as classifier:
-                assessment = classifier.assess(message)
-            decision = settings.spam.policy.decide(assessment.signals, assessment.evidence)
-            outcome = VERDICT_OUTCOME[decision.verdict]
-            action = getattr(settings.spam.actions, outcome.value)
-            signals = assessment.signals
+            signals = analysis.signals
+            if signals is None or analysis.verdict is None or analysis.outcome is None:
+                raise MailboxError("message analysis did not return a classification")
             console.print(
                 "Signals "
                 f"bulk={signals.unsolicited_bulk:.2f} phishing={signals.phishing_or_scam:.2f} "
@@ -1354,15 +1365,166 @@ def explain(
                 markup=False,
             )
             console.print(
-                f"Policy verdict={decision.verdict.name} reasons={','.join(decision.reasons)}",
+                f"Policy verdict={analysis.verdict.name} reasons={','.join(analysis.reasons)}",
                 markup=False,
             )
-            console.print(f"Configured action={_action_description(action)}", markup=False)
+            console.print(f"Configured action={_action_description(analysis.configured_action)}", markup=False)
     except Exception as exc:
         _print_failure(exc, debug=False, command="explain")
         raise typer.Exit(1) from exc
     finally:
         password = ""
+
+
+@mail_app.command("list")
+def mail_list(
+    folder: str = typer.Option(..., "--folder", help="Exact IMAP folder name"),
+    limit: int = typer.Option(50, "--limit", min=1),
+    offset: int = typer.Option(0, "--offset", min=0),
+    sort: MessageSort = typer.Option(MessageSort.NEWEST, "--sort"),  # noqa: B008
+    config: Path = typer.Option(default_config_path(), "--config"),  # noqa: B008
+) -> None:
+    """List a page of message headers without fetching message bodies."""
+    settings = _load_auth_settings(config)
+    password = _resolve_password(settings.imap)
+    service = MailService(settings, password)
+    try:
+        page = service.list_messages(folder, limit=limit, offset=offset, sort=sort)
+        title = f"{folder} | {sort.value} | {offset + 1}..{offset + len(page.items)} of {page.total}"
+        table = Table(title=title)
+        for column in ("State", "UID", "From", "Subject", "Date", "Size"):
+            table.add_column(column)
+        for item in page.items:
+            state = item.persisted_state.value.upper() if item.persisted_state is not None else "?"
+            if b"\\Seen" not in item.flags and "\\Seen" not in item.flags:
+                state = "● " + state
+            table.add_row(
+                state,
+                str(item.uid),
+                _safe_text(item.sender),
+                _safe_text(item.subject),
+                _safe_text(item.date),
+                str(item.size_bytes) if item.size_bytes is not None else "-",
+            )
+        console.print(table, markup=False)
+    except Exception as exc:
+        _print_failure(exc, debug=False, command="mail list")
+        raise typer.Exit(1) from exc
+    finally:
+        service.close()
+        password = ""
+
+
+@mail_app.command("show")
+def mail_show(
+    uid: int = typer.Argument(..., help="Folder-scoped message UID"),
+    folder: str = typer.Option(..., "--folder", help="Exact IMAP folder name"),
+    config: Path = typer.Option(default_config_path(), "--config"),  # noqa: B008
+) -> None:
+    """Read one message using BODY.PEEK without marking it seen."""
+    settings = _load_auth_settings(config)
+    password = _resolve_password(settings.imap)
+    service = MailService(settings, password)
+    try:
+        detail = service.get_message(folder, uid)
+        message = detail.item.message
+        if message is None:
+            raise MailboxError(detail.item.skip_reason or "message is not available")
+        console.print(f"Folder: {folder}\nUID: {uid}", markup=False)
+        console.print(f"From: {_safe_text(message.sender)}", markup=False)
+        console.print(f"To: {_safe_text(', '.join(message.recipients))}", markup=False)
+        console.print(f"Date: {_safe_text(message.date)}", markup=False)
+        console.print(f"Subject: {_safe_text(message.subject)}", markup=False)
+        console.print(f"Message-ID: {_safe_text(message.message_id)}", markup=False)
+        console.print(message.body, markup=False)
+        state = detail.persisted_state.outcome.value.upper() if detail.persisted_state else "UNCLASSIFIED"
+        console.print(f"State: {state}", markup=False)
+        console.print(f"Body source: {message.body_source}", markup=False)
+        if message.body_truncated:
+            console.print(f"Body truncated at max_body_chars={settings.spam.max_body_chars}.", markup=False)
+        if message.has_attachments:
+            console.print(f"Attachments: {message.attachment_count} (not opened by imapledger)", markup=False)
+        if folder in settings.spam.folders and detail.persisted_state and detail.persisted_state.outcome:
+            action = getattr(settings.spam.actions, detail.persisted_state.outcome.value)
+            console.print(f"Configured action: {_action_description(action)}", markup=False)
+        elif folder not in settings.spam.folders:
+            console.print("Automation unavailable: folder is not configured in spam.folders.", markup=False)
+    except Exception as exc:
+        _print_failure(exc, debug=False, command="mail show")
+        raise typer.Exit(1) from exc
+    finally:
+        service.close()
+        password = ""
+
+
+@mail_app.command("classify")
+def mail_classify(
+    uid: int = typer.Argument(..., help="Folder-scoped message UID"),
+    folder: str = typer.Option(..., "--folder", help="Configured source folder"),
+    apply: bool = typer.Option(False, "--apply", help="Apply the configured action after classification"),
+    reclassify: bool = typer.Option(False, "--reclassify", help="Ignore persisted state and classify again"),
+    config: Path = typer.Option(default_config_path(), "--config"),  # noqa: B008
+) -> None:
+    """Classify one message without mutation unless --apply is supplied."""
+    settings = _load_auth_settings(config)
+    if folder not in settings.spam.folders:
+        err_console.print(f"Automation unavailable: {folder} is not configured in spam.folders.", markup=False)
+        raise typer.Exit(2)
+    try:
+        rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
+    except RuleError as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    password = _resolve_password(settings.imap)
+    mail_service = MailService(settings, password)
+    try:
+        detail = mail_service.get_message(folder, uid)
+        message = detail.item.message
+        if message is None:
+            raise MailboxError(detail.item.skip_reason or "message is not available")
+        persisted = detail.persisted_state.outcome if detail.persisted_state is not None else None
+        analysis = AnalysisService(settings, rules, classifier_factory=PyJevSpamClassifier).analyze(
+            folder,
+            message,
+            persisted_outcome=persisted,
+            reclassify=reclassify,
+        )
+        console.print(f"Outcome: {analysis.outcome.value.upper() if analysis.outcome else 'RULE'}", markup=False)
+        console.print(f"Decision source: {analysis.decision_source}", markup=False)
+        if analysis.rule_id:
+            console.print(f"Rule: {analysis.rule_id}", markup=False)
+        if analysis.reasons:
+            console.print(f"Reasons: {', '.join(analysis.reasons)}", markup=False)
+        if analysis.configured_action:
+            console.print(f"Action: {_action_description(analysis.configured_action)}", markup=False)
+        if not apply:
+            console.print("Result: Not applied (preview)", markup=False)
+            return
+        receipt = ActionService(settings, password, rules).apply(
+            analysis,
+            uidvalidity=detail.uidvalidity,
+            confirmed_by_user=True,
+        )
+        result = "Applied and confirmed" if receipt.applied and receipt.confirmed else "Not applied"
+        console.print(f"Result: {result}", markup=False)
+        if receipt.detail:
+            console.print(receipt.detail, markup=False)
+    except Exception as exc:
+        _print_failure(exc, debug=False, command="mail classify")
+        raise typer.Exit(1) from exc
+    finally:
+        mail_service.close()
+        password = ""
+
+
+@app.command("ui")
+def ui(
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """Launch the interactive terminal mail review console."""
+    from .tui.app import run
+
+    run(config)
 
 
 @review_app.command("list")
@@ -1546,8 +1708,20 @@ def _print_result(
     position: int,
     total: int,
     apply: bool,
+    verbose: bool = True,
 ) -> None:
     action = _final_action_label(row, apply=apply)
+    if not verbose:
+        outcome = row.outcome.value.upper() if row.outcome is not None else row.status.upper()
+        details = f" | {row.detail}" if row.detail else ""
+        console.print(
+            (
+                f"[{position}/{total}] {outcome} | {action} | {_safe_text(row.sender)} | "
+                f"{_safe_text(row.subject)}{details}"
+            ),
+            markup=False,
+        )
+        return
     if row.matched_rule_id is not None:
         details = f"  Detail={row.detail}" if row.detail else ""
         console.print(
@@ -1578,9 +1752,9 @@ def _classification_action_label(row: MessageResult, *, apply: bool) -> str:
     if row.action.action is ActionKind.KEEP:
         return "KEEP"
     if row.action.action is ActionKind.MOVE:
-        prefix = "MOVE-APPROVED" if apply else "WOULD MOVE"
+        prefix = "MOVE" if apply else "WOULD MOVE"
         return f"{prefix} -> {row.action.destination}"
-    return "DELETE-APPROVED" if apply else "WOULD DELETE"
+    return "DELETE" if apply else "WOULD DELETE"
 
 
 def _final_action_label(row: MessageResult, *, apply: bool) -> str:

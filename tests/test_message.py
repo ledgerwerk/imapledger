@@ -164,3 +164,37 @@ def test_legacy_message_state_does_not_expose_uid() -> None:
     message = parse_message(26, b"From: sender@example.org\n\nbody", max_body_chars=100)
 
     assert "uid" not in message.as_state()
+
+
+def test_message_exposes_body_source_truncation_and_attachment_metadata() -> None:
+    raw = b"""MIME-Version: 1.0\r
+Content-Type: multipart/mixed; boundary=x\r
+\r
+--x\r
+Content-Type: text/plain\r
+\r
+1234567890\r
+--x\r
+Content-Type: application/pdf; name=one.pdf\r
+Content-Disposition: attachment; filename=one.pdf\r
+\r
+ignored\r
+--x--\r
+"""
+
+    message = parse_message(27, raw, max_body_chars=5, size_bytes=len(raw))
+
+    assert message.body == "12345"
+    assert message.body_truncated
+    assert message.body_source == "plain"
+    assert message.has_attachments
+    assert message.attachment_count == 1
+    assert message.size_bytes == len(raw)
+
+
+def test_empty_message_body_source_is_none() -> None:
+    message = parse_message(28, b"Subject: no body\r\n\r\n", max_body_chars=20)
+
+    assert message.body_source == "none"
+    assert not message.body_truncated
+    assert not message.has_attachments

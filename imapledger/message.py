@@ -4,10 +4,25 @@ from dataclasses import dataclass
 from email import policy
 from email.header import decode_header, make_header
 from email.message import Message
-from email.parser import BytesParser
+from email.parser import BytesHeaderParser, BytesParser
 from email.utils import getaddresses
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
+
+from .classification_state import SpamOutcome, outcome_from_flags
+
+
+@dataclass(frozen=True, slots=True)
+class MailSummary:
+    uid: int
+    sender: str
+    subject: str
+    date: str
+    message_id: str
+    size_bytes: int | None
+    flags: frozenset[bytes | str]
+    persisted_state: SpamOutcome | None
+    skip_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +52,12 @@ class MailMessage:
     x_spam_status: str = ""
     x_spam_score: str = ""
     link_domains: tuple[str, ...] = ()
+    link_domains: tuple[str, ...] = ()
+    body_truncated: bool = False
+    size_bytes: int | None = None
+    body_source: str = "none"
+    has_attachments: bool = False
+    attachment_count: int = 0
 
     def as_state(self) -> dict[str, object]:
         return {
@@ -49,11 +70,13 @@ class MailMessage:
         }
 
 
-def parse_message(uid: int, raw: bytes, *, max_body_chars: int) -> MailMessage:
+def parse_message(uid: int, raw: bytes, *, max_body_chars: int, size_bytes: int | None = None) -> MailMessage:
     msg = BytesParser(policy=policy.default).parsebytes(raw)
     sender = _decode_header_value(msg.get("From", ""))
     from_display_name, from_address = _first_mailbox(sender)
-    body, link_domains = _extract_body(msg, max_body_chars=max_body_chars)
+    body, link_domains, body_source, attachment_count = _extract_body(msg, max_body_chars=max_body_chars)
+    body_truncated = len(body) > max_body_chars
+    body = body[:max_body_chars]
     return MailMessage(
         uid=uid,
         subject=_decode_header_value(msg.get("Subject", "")),
@@ -80,6 +103,38 @@ def parse_message(uid: int, raw: bytes, *, max_body_chars: int) -> MailMessage:
         x_spam_status=_first(_header_values(msg, "X-Spam-Status")),
         x_spam_score=_first(_header_values(msg, "X-Spam-Score")),
         link_domains=link_domains,
+        body_truncated=body_truncated,
+        size_bytes=size_bytes,
+        body_source=body_source,
+        has_attachments=attachment_count > 0,
+        attachment_count=attachment_count,
+    )
+
+
+def parse_summary(
+    uid: int,
+    raw_headers: bytes,
+    *,
+    flags: frozenset[bytes | str],
+    size_bytes: int | None,
+) -> MailSummary:
+    msg = BytesHeaderParser(policy=policy.default).parsebytes(raw_headers)
+    try:
+        persisted_state = outcome_from_flags(flags)
+        skip_reason = None
+    except ValueError:
+        persisted_state = None
+        skip_reason = "conflicting classification state keywords"
+    return MailSummary(
+        uid=uid,
+        sender=_decode_header_value(msg.get("From", "")),
+        subject=_decode_header_value(msg.get("Subject", "")),
+        date=_decode_header_value(msg.get("Date", "")),
+        message_id=_decode_header_value(msg.get("Message-ID", "")),
+        size_bytes=size_bytes,
+        flags=flags,
+        persisted_state=persisted_state,
+        skip_reason=skip_reason,
     )
 
 
@@ -158,13 +213,17 @@ def _url_hostname(value: str) -> str | None:
         return None
 
 
-def _extract_body(msg: Message, *, max_body_chars: int) -> tuple[str, tuple[str, ...]]:
+def _extract_body(msg: Message, *, max_body_chars: int) -> tuple[str, tuple[str, ...], str, int]:
     plain_candidates: list[str] = []
     html_candidates: list[str] = []
     link_domains: list[str] = []
+    attachment_count = 0
     parts = msg.walk() if msg.is_multipart() else (msg,)
     for part in parts:
-        if part.is_multipart() or part.get_content_disposition() == "attachment":
+        if part.is_multipart():
+            continue
+        if part.get_content_disposition() == "attachment" or part.get_filename():
+            attachment_count += 1
             continue
         content_type = part.get_content_type()
         if content_type == "text/plain":
@@ -180,9 +239,10 @@ def _extract_body(msg: Message, *, max_body_chars: int) -> tuple[str, tuple[str,
                     html_candidates.append(text)
                 link_domains.extend(parser.link_domains)
 
+    body_source = "plain" if plain_candidates else "html" if html_candidates else "none"
     body = "\n\n".join(plain_candidates or html_candidates)
     body = "\n".join(line.rstrip() for line in body.splitlines()).strip()
-    return body[:max_body_chars], tuple(dict.fromkeys(link_domains))[:20]
+    return body, tuple(dict.fromkeys(link_domains))[:20], body_source, attachment_count
 
 
 def _part_text(part: Message) -> str:
