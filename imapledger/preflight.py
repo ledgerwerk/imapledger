@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,6 +44,7 @@ def preflight_source(
     destinations: tuple[str, ...],
     requires_delete: bool,
     require_state_persistence: bool = False,
+    uid_scope: Collection[int] | None = None,
     deep_probe: bool,
     mailbox_factory: Callable[..., Any],
     event_callback: Callable[[str], None] | None = None,
@@ -79,6 +80,7 @@ def preflight_source(
             allow_delete=requires_delete,
             max_message_bytes=settings.spam.max_message_bytes,
             max_body_chars=settings.spam.max_body_chars,
+            uid_scope=uid_scope,
             event_callback=event_callback,
         ) as mailbox:
             opened = True

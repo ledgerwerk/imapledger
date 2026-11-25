@@ -390,6 +390,7 @@ class DoctorFakeClient:
     ):
         self.size = size
         self.uids = list(uids)
+        self.use_uid = True
         self.fail_on = fail_on
         self.selected = []
         self.fetches = []
@@ -418,15 +419,26 @@ class DoctorFakeClient:
 
     def select_folder(self, folder, readonly=False):
         self.selected.append((folder, readonly))
-        return {b"UIDVALIDITY": 42, b"PERMANENTFLAGS": self.permanent_flags}
+        return {
+            b"UIDVALIDITY": 42,
+            b"EXISTS": len(self.uids),
+            b"PERMANENTFLAGS": self.permanent_flags,
+        }
 
     def search(self, criteria="ALL", charset=None):
         return self.uids
 
     def fetch(self, messages, data, modifiers=None):
-        messages = tuple(messages)
+        messages = (messages,) if isinstance(messages, str) else tuple(messages)
         data = tuple(data)
         self.fetches.append((messages, data))
+        if data == ("UID",):
+            requested = self.uids if messages == ("1:*",) else messages
+            return {
+                uid: {b"UID": uid, b"SEQ": sequence}
+                for sequence, uid in enumerate(self.uids, start=1)
+                if uid in requested
+            }
         if data == ("RFC822.SIZE",):
             if self.fail_on == "size":
                 raise RuntimeError("password=secret size probe failed")
@@ -523,7 +535,7 @@ def test_state_status_counts_keyword_markers_without_fetching_messages(monkeypat
     assert "Classification state" in result.output
     assert "uidvalidity=42" in result.output
     assert "total=4 spam=1 notspam=2 review=1 unclassified=1 conflicts=1" in " ".join(result.output.split())
-    assert client.fetches == []
+    assert client.fetches == [(("1:*",), ("UID",))]
     assert client.added == client.removed == client.expunged == []
 
 
@@ -612,7 +624,10 @@ def test_review_list_fetches_only_bounded_headers_and_does_not_construct_classif
     assert "review 10" in result.output
     assert "review 20" not in result.output
     assert "PRIVATE BODY CONTENT" not in result.output
-    assert client.fetches == [((10,), ("BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]",))]
+    assert client.fetches == [
+        (("1:*",), ("UID",)),
+        ((10,), ("BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]",)),
+    ]
     assert client.added == client.removed == client.expunged == []
 
 
@@ -711,7 +726,7 @@ def test_doctor_is_read_only_and_discards_body(monkeypatch):
     assert "FETCH BODY.PEEK[] (1 UID): OK" in result.output
     assert "PRIVATE BODY CONTENT" not in result.output
     assert client.selected == [("Spam", True), ("Spam", True), ("Spam", True)]
-    assert client.fetches == [((10,), ("RFC822.SIZE",)), ((10,), ("BODY.PEEK[]",))]
+    assert client.fetches == [(("1:*",), ("UID",)), ((10,), ("RFC822.SIZE",)), ((10,), ("BODY.PEEK[]",))]
     assert client.added == client.removed == client.expunged == []
     assert client.logged_out
     assert factory_options["use_uid"] is True
@@ -750,7 +765,7 @@ def test_clean_apply_aborts_before_classification_when_keywords_are_unsupported(
     assert result.exit_code == 1
     assert "custom keyword persistence: UNSUPPORTED" in result.output
     assert "apply aborted before classification/mutation" in result.output
-    assert client.fetches == []
+    assert client.fetches == [(("1:*",), ("UID",))]
     assert client.added == client.removed == client.expunged == []
 
 
@@ -822,7 +837,7 @@ def test_doctor_skips_body_probe_when_message_exceeds_size_limit(monkeypatch):
     assert result.exit_code == 0
     assert "FETCH RFC822.SIZE (1 UID): OK" in result.output
     assert "FETCH BODY.PEEK[]: SKIPPED" in result.output
-    assert [selector for _, selector in client.fetches] == [("RFC822.SIZE",)]
+    assert [selector for _, selector in client.fetches] == [("UID",), ("RFC822.SIZE",)]
 
 
 def test_doctor_logout_failure_is_contextual_and_private(monkeypatch):

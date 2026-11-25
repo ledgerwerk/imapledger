@@ -94,6 +94,7 @@ class ActionService:
             destinations=(action.destination,) if action.action is ActionKind.MOVE and action.destination else (),
             requires_delete=requires_delete,
             require_state_persistence=state_required,
+            uid_scope=(),
             deep_probe=False,
             mailbox_factory=self._mailbox_factory,
         )
@@ -113,6 +114,7 @@ class ActionService:
                 allow_delete=requires_delete,
                 max_message_bytes=self._settings.spam.max_message_bytes,
                 max_body_chars=self._settings.spam.max_body_chars,
+                uid_scope=(uid,),
             ) as mailbox:
                 snapshot = mailbox.snapshot()
                 if snapshot.uidvalidity != uidvalidity:

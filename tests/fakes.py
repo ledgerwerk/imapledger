@@ -23,6 +23,7 @@ class FolderAwareFakeClient:
             for name in folders
         }
         self.selected_folder = None
+        self.use_uid = True
         self.selected = []
         self.existing_folders = set(folders)
         self.folder_queries = []
@@ -114,12 +115,23 @@ class FolderAwareFakeClient:
         raise AssertionError(f"unsupported search criteria: {criteria!r}")
 
     def fetch(self, messages, data, modifiers=None):
-        messages = tuple(messages)
+        if isinstance(messages, str):
+            messages = (messages,)
+        elif isinstance(messages, int):
+            messages = (messages,)
+        else:
+            messages = tuple(messages)
         data = tuple(data)
         self.fetches.append((messages, data))
         if self.selected_folder is None:
             raise AssertionError("FETCH requires a selected folder")
         folder = self.folders[self.selected_folder]
+        if data == ("UID",):
+            self._maybe_fail("uid_snapshot")
+            requested = set(folder) if messages == ("1:*",) else set(messages)
+            return {
+                uid: {b"UID": uid, b"SEQ": sequence} for sequence, uid in enumerate(folder, start=1) if uid in requested
+            }
         if data == ("RFC822.SIZE",):
             self._maybe_fail("fetch_size")
             return {uid: {b"RFC822.SIZE": len(folder[uid])} for uid in messages if uid in folder}

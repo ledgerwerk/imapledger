@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import imaplib
 import re
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ class ImapOperationError(MailboxError):
         batch: int | None = None,
         batch_count: int | None = None,
         cause_type: str | None = None,
+        cause_code: str | None = None,
         server_status: str | None = None,
     ) -> None:
         super().__init__(message)
@@ -54,6 +56,7 @@ class ImapOperationError(MailboxError):
         self.batch = batch
         self.batch_count = batch_count
         self.cause_type = cause_type
+        self.cause_code = cause_code
         self.server_status = server_status
         self.rollback_error_type: str | None = None
 
@@ -79,6 +82,8 @@ class ImapOperationError(MailboxError):
             details.append(f"rollback_error_type={self.rollback_error_type}")
         if self.server_status is not None:
             details.append(f"server_status={self.server_status}")
+        if self.cause_code is not None:
+            details.append(f"cause={self.cause_code}")
         if self.cause_type is not None:
             details.append(f"server_error_type={self.cause_type}")
         if details:
@@ -142,6 +147,7 @@ class PartialDeleteError(ImapOperationError):
             batch=failure.batch,
             batch_count=failure.batch_count,
             cause_type=failure.cause_type,
+            cause_code=failure.cause_code,
             server_status=failure.server_status,
         )
         self.rollback_error_type = failure.rollback_error_type
@@ -178,6 +184,7 @@ class PartialMoveError(ImapOperationError):
             batch=failure.batch,
             batch_count=failure.batch_count,
             cause_type=failure.cause_type,
+            cause_code=failure.cause_code,
             server_status=failure.server_status,
         )
 
@@ -439,6 +446,17 @@ class FolderCatalog:
         return self._client
 
 
+def _normalize_uid_scope(values: Collection[int] | None) -> tuple[int, ...] | None:
+    if values is None:
+        return None
+    normalized: set[int] = set()
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("uid_scope must contain positive integer UIDs")
+        normalized.add(value)
+    return tuple(sorted(normalized))
+
+
 class ScopedMailbox:
     """An IMAP session permanently scoped to one configured folder.
 
@@ -463,6 +481,7 @@ class ScopedMailbox:
         delete_batch_size: int | None = None,
         allowed_destinations: Collection[str] = (),
         allow_delete: bool = False,
+        uid_scope: Collection[int] | None = None,
         client_factory: ClientFactory | None = None,
         event_callback: Callable[[str], None] | None = None,
     ) -> None:
@@ -476,6 +495,7 @@ class ScopedMailbox:
         self._allowed_destinations = frozenset(destinations)
         self._allow_delete = allow_delete
         self._host = host
+        self._uid_scope = _normalize_uid_scope(uid_scope)
         self._port = port
         self._username = username
         self._password = password
@@ -606,15 +626,7 @@ class ScopedMailbox:
             permanent_flags_known = _permanent_flags_known(selected)
             self._emit(f"uidvalidity={uidvalidity}")
 
-            try:
-                uids = frozenset(int(uid) for uid in client.search("ALL"))
-            except Exception as exc:
-                raise _operation_error(
-                    operation="imap_search",
-                    message="UID SEARCH ALL failed",
-                    exc=exc,
-                    folder=self._folder,
-                ) from exc
+            uids = self._initial_uid_snapshot(client, selected)
             self._emit(f"snapshot messages={len(uids)}")
         except Exception:
             try:
@@ -631,6 +643,79 @@ class ScopedMailbox:
         )
         self._capabilities = normalized_capabilities
         return self
+
+    def _initial_uid_snapshot(
+        self,
+        client: _Client,
+        selected: Mapping[bytes, Any],
+    ) -> frozenset[int]:
+        if self._uid_scope is None:
+            return self._fetch_full_uid_snapshot(client, selected)
+        if not self._uid_scope:
+            return frozenset()
+        return frozenset(
+            uid for uid in self._uid_scope if self._search_exact_uid(client, uid, operation="imap_initial_scope_search")
+        )
+
+    def _fetch_full_uid_snapshot(
+        self,
+        client: _Client,
+        selected: Mapping[bytes, Any],
+    ) -> frozenset[int]:
+        exists = selected.get(b"EXISTS", selected.get("EXISTS", 0))
+        try:
+            exists_count = int(exists)
+        except (TypeError, ValueError) as exc:
+            raise _operation_error(
+                operation="imap_uid_snapshot",
+                message="selected mailbox returned malformed EXISTS metadata",
+                exc=exc,
+                folder=self._folder,
+            ) from exc
+        if exists_count < 0:
+            raise ImapOperationError(
+                operation="imap_uid_snapshot",
+                message="selected mailbox returned malformed EXISTS metadata",
+                folder=self._folder,
+            )
+        if exists_count == 0:
+            return frozenset()
+
+        try:
+            response = client.fetch("1:*", ["UID"])
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_uid_snapshot",
+                message="UID FETCH failed while building mailbox snapshot",
+                exc=exc,
+                folder=self._folder,
+                selector="1:* UID",
+            ) from exc
+
+        uids: set[int] = set()
+        try:
+            if not isinstance(response, Mapping):
+                raise TypeError("FETCH response is not a mapping")
+            for key, data in response.items():
+                if isinstance(key, bool) or not isinstance(key, int) or key < 1:
+                    raise ValueError("FETCH response has an invalid message key")
+                if not isinstance(data, Mapping):
+                    raise TypeError("FETCH response data is not a mapping")
+                uid = data.get(b"UID", data.get("UID", key if client.use_uid else None))
+                if isinstance(uid, bool) or not isinstance(uid, int) or uid < 1:
+                    raise ValueError("FETCH response has an invalid UID")
+                if client.use_uid and uid != key:
+                    raise ValueError("FETCH response UID does not match its UID key")
+                uids.add(uid)
+        except (TypeError, ValueError) as exc:
+            raise _operation_error(
+                operation="imap_uid_snapshot",
+                message="UID FETCH returned malformed UID data",
+                exc=exc,
+                folder=self._folder,
+                selector="1:* UID",
+            ) from exc
+        return frozenset(uids)
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         client = self._client
@@ -1593,6 +1678,27 @@ def _safe_server_status(exc: Exception) -> str | None:
     return match.group(1).upper() if match is not None else None
 
 
+def _safe_cause_code(exc: Exception) -> str | None:
+    text = str(exc).casefold()
+    if "got more than" in text and "bytes" in text:
+        return "response-line-too-long"
+
+    status = _safe_server_status(exc)
+    if status == "BAD":
+        return "command-bad"
+    if status == "NO":
+        return "command-no"
+
+    exception_name = type(exc).__name__.casefold()
+    if isinstance(exc, TimeoutError) or "timeout" in exception_name:
+        return "timeout"
+    if isinstance(exc, (ConnectionError, imaplib.IMAP4.abort)):
+        return "connection-abort"
+    if isinstance(exc, imaplib.IMAP4.error):
+        return "protocol-error"
+    return None
+
+
 def _operation_error(
     *,
     operation: str,
@@ -1612,6 +1718,7 @@ def _operation_error(
         uids=uids,
         batch=batch,
         batch_count=batch_count,
+        cause_code=_safe_cause_code(exc),
         cause_type=type(exc).__name__,
         server_status=_safe_server_status(exc),
     )

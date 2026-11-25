@@ -1,3 +1,4 @@
+import imaplib
 from email import policy
 from email.parser import BytesHeaderParser
 
@@ -18,6 +19,7 @@ from imapledger.mailbox import (
     ReadOnlyMailbox,
     ScopedMailbox,
     UnsafeMailboxOperation,
+    _safe_cause_code,
 )
 from tests.fakes import FolderAwareFakeClient
 from tests.fakes import raw_message as _folder_raw_message
@@ -134,9 +136,18 @@ class FakeClient:
         raise AssertionError(f"unsupported search criteria: {criteria!r}")
 
     def fetch(self, messages, data, modifiers=None):
-        messages = tuple(messages)
+        if isinstance(messages, str):
+            messages = (messages,)
+        elif isinstance(messages, int):
+            messages = (messages,)
+        else:
+            messages = tuple(messages)
         data = tuple(data)
         self.fetches.append((messages, data))
+        if self.use_uid and data == ("UID",):
+            self._maybe_fail("uid_snapshot")
+            requested = set(self.uids) if messages == ("1:*",) else set(messages)
+            return {uid: {b"UID": uid, b"SEQ": sequence} for sequence, uid in self.messages if uid in requested}
         if not self.use_uid:
             self._maybe_fail("fetch_headers")
             header = RAW.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
@@ -219,6 +230,29 @@ class FakeClient:
         self.flags = {uid: flags for uid, flags in self.flags.items() if uid not in messages}
 
 
+class SearchAllTooLargeFakeClient(FakeClient):
+    def search(self, criteria="ALL", charset=None):
+        if criteria == "ALL":
+            self.calls.append("search")
+            self.searches.append(criteria)
+            raise imaplib.IMAP4.error("got more than 1000000 bytes")
+        return super().search(criteria, charset)
+
+
+class MalformedUidFetchFakeClient(FakeClient):
+    def fetch(self, messages, data, modifiers=None):
+        if tuple(data) == ("UID",):
+            return {10: {b"UID": 0}}
+        return super().fetch(messages, data, modifiers)
+
+
+class OversizedUidFetchFakeClient(FakeClient):
+    def fetch(self, messages, data, modifiers=None):
+        if tuple(data) == ("UID",):
+            raise imaplib.IMAP4.error("got more than 1000000 bytes")
+        return super().fetch(messages, data, modifiers)
+
+
 def factory_for(client):
     return lambda *args, **kwargs: client
 
@@ -235,6 +269,7 @@ def make_mailbox(
     allowed_destinations=(),
     allow_delete=None,
     event_callback=None,
+    uid_scope=None,
     client_factory=None,
 ):
     if allow_delete is None:
@@ -253,9 +288,104 @@ def make_mailbox(
         delete_batch_size=delete_batch_size,
         allowed_destinations=allowed_destinations,
         allow_delete=allow_delete,
+        uid_scope=uid_scope,
         client_factory=client_factory or factory_for(client),
         event_callback=event_callback,
     )
+
+
+def test_exact_uid_scope_does_not_search_all() -> None:
+    client = SearchAllTooLargeFakeClient(uids=[217640, 217641])
+    with make_mailbox(
+        client,
+        writable=True,
+        allowed_destinations=("INBOX.Trash",),
+        uid_scope=(217640,),
+    ) as mailbox:
+        assert mailbox.snapshot().uids == frozenset({217640})
+        result = mailbox.move_uid(217640, "INBOX.Trash")
+
+    assert result.moved == (217640,)
+    assert client.searches == [["UID", 217640], ["UID", 217640]]
+    assert "ALL" not in client.searches
+
+
+def test_metadata_only_uid_scope_does_not_search_or_fetch_messages() -> None:
+    client = SearchAllTooLargeFakeClient(uids=[217640])
+    with make_mailbox(
+        client,
+        writable=False,
+        allowed_destinations=("INBOX.Trash",),
+        uid_scope=(),
+    ) as mailbox:
+        assert mailbox.snapshot().uids == frozenset()
+        assert mailbox.destination_exists("INBOX.Trash")
+
+    assert client.searches == []
+    assert client.fetches == []
+
+
+def test_full_snapshot_rejects_malformed_uid_fetch_data() -> None:
+    client = MalformedUidFetchFakeClient()
+    with pytest.raises(ImapOperationError) as raised:
+        with make_mailbox(client, writable=False):
+            pass
+
+    assert raised.value.operation == "imap_uid_snapshot"
+    assert raised.value.message == "UID FETCH returned malformed UID data"
+
+
+def test_oversized_uid_fetch_error_has_safe_cause_code() -> None:
+    client = OversizedUidFetchFakeClient()
+    with pytest.raises(ImapOperationError) as raised:
+        with make_mailbox(client, writable=False):
+            pass
+
+    rendered = str(raised.value)
+    assert raised.value.cause_code == "response-line-too-long"
+    assert "cause=response-line-too-long" in rendered
+    assert "got more than 1000000 bytes" not in rendered
+    assert "password=secret" not in rendered
+    assert RAW.decode() not in rendered
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (imaplib.IMAP4.error("FETCH command error: BAD details"), "command-bad"),
+        (imaplib.IMAP4.error("FETCH command error: NO details"), "command-no"),
+        (TimeoutError("timed out"), "timeout"),
+        (ConnectionResetError("connection reset"), "connection-abort"),
+        (imaplib.IMAP4.error("protocol failure"), "protocol-error"),
+        (ValueError("invalid value"), None),
+    ],
+)
+def test_safe_cause_code_classifies_only_fixed_protocol_categories(exc, expected) -> None:
+    assert _safe_cause_code(exc) == expected
+
+
+def test_full_snapshot_uses_uid_fetch_not_search_all() -> None:
+    client = SearchAllTooLargeFakeClient(uids=[10, 20, 30])
+    with make_mailbox(client, writable=False) as mailbox:
+        assert mailbox.snapshot().uids == frozenset({10, 20, 30})
+
+    assert client.searches == []
+    assert client.fetches[0] == (("1:*",), ("UID",))
+
+
+def test_empty_full_snapshot_skips_uid_fetch() -> None:
+    client = SearchAllTooLargeFakeClient(uids=[])
+    with make_mailbox(client, writable=False) as mailbox:
+        assert mailbox.snapshot().uids == frozenset()
+
+    assert client.fetches == []
+    assert client.searches == []
+
+
+@pytest.mark.parametrize("uid_scope", [(0,), (-1,), (True,), ("10",), (1.5,)])
+def test_uid_scope_rejects_non_positive_or_non_integer_values(uid_scope) -> None:
+    with pytest.raises(ValueError, match="uid_scope must contain positive integer UIDs"):
+        make_mailbox(FakeClient(), writable=False, uid_scope=uid_scope)
 
 
 def test_writable_mode_requires_uidplus() -> None:
@@ -339,7 +469,7 @@ def test_source_existence_check_precedes_select_and_search() -> None:
     with make_mailbox(client, writable=False, folder="INBOX.Spam"):
         pass
 
-    assert client.calls == ["login", "capabilities", "folder_exists", "select", "search", "logout"]
+    assert client.calls == ["login", "capabilities", "folder_exists", "select", "logout"]
     assert client.folder_queries == ["INBOX.Spam"]
     assert client.selected == [("INBOX.Spam", True)]
 
@@ -350,7 +480,7 @@ def test_size_limit_prevents_body_fetch() -> None:
         items = list(mailbox.iter_messages())
     assert items[0].message is None
     assert "exceeds limit" in (items[0].skip_reason or "")
-    assert client.fetches == [((10,), ("RFC822.SIZE",))]
+    assert client.fetches == [(("1:*",), ("UID",)), ((10,), ("RFC822.SIZE",))]
 
 
 def test_fetch_uid_reads_only_requested_uid_and_uses_body_peek() -> None:
@@ -360,7 +490,7 @@ def test_fetch_uid_reads_only_requested_uid_and_uses_body_peek() -> None:
 
     assert item.uid == 20
     assert item.message is not None and item.message.uid == 20
-    assert client.fetches == [((20,), ("RFC822.SIZE",)), ((20,), ("BODY.PEEK[]",))]
+    assert client.fetches == [(("1:*",), ("UID",)), ((20,), ("RFC822.SIZE",)), ((20,), ("BODY.PEEK[]",))]
     assert client.added == []
 
 
@@ -509,7 +639,7 @@ def test_streaming_move_search_and_action_use_reselected_source():
         result = mailbox.move_uid(10, "INBOX.Trash")
 
     assert result == MoveResult(moved=(10,), destination="INBOX.Trash")
-    assert client.searches == ["ALL", ["UID", 10]]
+    assert client.searches == [["UID", 10]]
     assert client.moves == [((10,), "INBOX.Trash")]
     assert client.folders["INBOX.Trash"][10] == source_message
     assert client.selected[-1] == ("INBOX.spam", False)
@@ -528,7 +658,7 @@ def test_streaming_delete_search_and_action_use_reselected_source():
         result = mailbox.delete_uid(10)
 
     assert result == DeleteResult(deleted=(10,))
-    assert client.searches == ["ALL", ["UID", 10]]
+    assert client.searches == [["UID", 10]]
     assert client.folders["INBOX.spam"] == {}
     assert client.folders["INBOX.Trash"][10] == destination_message
     assert client.expunged == [(10,)]
@@ -552,7 +682,7 @@ def test_fetch_aborts_if_uidvalidity_changes_after_destination_probe():
         with pytest.raises(UnsafeMailboxOperation, match="UIDVALIDITY changed"):
             mailbox.fetch_uid(10)
 
-    assert client.fetches == []
+    assert client.fetches == [(("1:*",), ("UID",))]
 
 
 @pytest.mark.parametrize("operation", ["move", "delete"])
@@ -577,7 +707,7 @@ def test_streaming_mutation_aborts_on_uidvalidity_change_before_search_or_action
             else:
                 mailbox.delete_uid(10)
 
-    assert client.searches == ["ALL"]
+    assert client.searches == []
     assert client.moves == []
     assert client.added == []
     assert client.expunged == []
@@ -625,8 +755,8 @@ def test_source_reselection_failure_aborts_read_or_mutation(operation):
                 mailbox.move_uid(10, "INBOX.Trash")
 
     assert raised.value.operation == "imap_prefetch_select" if operation == "fetch" else "imap_premove_select"
-    assert client.fetches == []
-    assert client.searches == ["ALL"]
+    assert client.fetches == [(("1:*",), ("UID",))]
+    assert client.searches == []
     assert client.moves == []
 
 
@@ -655,7 +785,7 @@ def test_fetch_uid_rejects_invalid_and_missing_uids() -> None:
         with pytest.raises(UnsafeMailboxOperation, match="initial mailbox snapshot"):
             mailbox.fetch_uid(11)
 
-    assert client.fetches == []
+    assert client.fetches == [(("1:*",), ("UID",))]
 
 
 def test_fetch_uid_skips_oversized_message_without_fetching_body() -> None:
@@ -665,7 +795,7 @@ def test_fetch_uid_skips_oversized_message_without_fetching_body() -> None:
 
     assert item.message is None
     assert "exceeds limit" in (item.skip_reason or "")
-    assert client.fetches == [((10,), ("RFC822.SIZE",))]
+    assert client.fetches == [(("1:*",), ("UID",)), ((10,), ("RFC822.SIZE",))]
 
 
 def test_fetch_uid_errors_are_contextual_and_sanitized() -> None:
@@ -704,7 +834,7 @@ def test_streaming_move_reselects_source_before_exact_uid_validation():
     assert first == MoveResult(moved=(10,), destination="INBOX.Trash")
     assert second == MoveResult(moved=(20,), destination="INBOX.Trash")
     assert client.moves == [((10,), "INBOX.Trash"), ((20,), "INBOX.Trash")]
-    assert client.searches == ["ALL", ["UID", 10], ["UID", 20]]
+    assert client.searches == [["UID", 10], ["UID", 20]]
     assert client.selected == [("Spam", False), ("Spam", False), ("Spam", False)]
     assert client.uids == []
 
@@ -715,7 +845,7 @@ def test_streaming_delete_uses_uidplus_and_exact_uid():
         result = mailbox.delete_uid(10)
 
     assert result == DeleteResult(deleted=(10,))
-    assert client.searches == ["ALL", ["UID", 10]]
+    assert client.searches == [["UID", 10]]
     assert client.selected == [("Spam", False), ("Spam", False)]
     assert client.added == [((10,), ("\\Deleted",), True)]
     assert client.expunged == [(10,)]
@@ -735,7 +865,7 @@ def test_streaming_mutations_preserve_snapshot_and_destination_safety():
         with pytest.raises(UnsafeMailboxOperation, match="outside the configured allow-list"):
             mailbox.move_uid(10, "INBOX.Other")
 
-    assert client.searches == ["ALL"]
+    assert client.searches == []
     assert client.moves == []
 
     source_client = FakeClient()
@@ -748,7 +878,7 @@ def test_streaming_mutations_preserve_snapshot_and_destination_safety():
         with pytest.raises(UnsafeMailboxOperation, match="source folder"):
             mailbox.move_uid(10, "Spam")
 
-    assert source_client.searches == ["ALL"]
+    assert source_client.searches == []
     assert source_client.moves == []
 
 
@@ -775,7 +905,7 @@ def test_streaming_move_requires_writable_scope_and_capability():
             mailbox.move_uid(10, "INBOX.Trash")
 
     assert client.moves == []
-    assert client.searches == ["ALL"]
+    assert client.searches == []
 
 
 def test_streaming_delete_requires_explicit_allow_and_uidplus():
@@ -790,8 +920,8 @@ def test_streaming_delete_requires_explicit_allow_and_uidplus():
         with pytest.raises(UnsafeMailboxOperation, match="UIDPLUS disappeared"):
             mailbox.delete_uid(10)
 
-    assert disallowed_client.searches == ["ALL"]
-    assert client.searches == ["ALL"]
+    assert disallowed_client.searches == []
+    assert client.searches == []
     assert client.expunged == []
 
 
@@ -807,7 +937,7 @@ def test_streaming_mutation_rejects_uid_that_disappeared_from_selected_source():
         with pytest.raises(UnsafeMailboxOperation, match="no longer exists"):
             mailbox.move_uid(10, "INBOX.Trash")
 
-    assert client.searches == ["ALL", ["UID", 10]]
+    assert client.searches == [["UID", 10]]
     assert client.moves == []
     assert client.selected == [("Spam", False), ("Spam", False)]
 
@@ -827,7 +957,7 @@ def test_streaming_move_failure_is_reported_as_unconfirmed():
     assert raised.value.moved == ()
     assert raised.value.pending == (10,)
     assert raised.value.destination == "INBOX.Trash"
-    assert client.searches == ["ALL", ["UID", 10]]
+    assert client.searches == [["UID", 10]]
     assert client.moves == []
 
 
@@ -855,7 +985,7 @@ def test_uidvalidity_change_aborts_before_flagging() -> None:
         ("login", "imap_login"),
         ("capabilities", "imap_capabilities"),
         ("select", "imap_select_folder"),
-        ("search", "imap_search"),
+        ("uid_snapshot", "imap_uid_snapshot"),
     ],
 )
 def test_protocol_errors_are_contextual_and_do_not_expose_sensitive_data(failure, operation):
@@ -865,8 +995,9 @@ def test_protocol_errors_are_contextual_and_do_not_expose_sensitive_data(failure
         with make_mailbox(client, writable=False):
             pass
     rendered = str(raised.value)
+    assert raised.value.cause_code == "command-bad"
     assert f"error [{operation}]" in rendered
-    assert "folder='Spam'" in rendered if failure in {"select", "search"} else True
+    assert "folder='Spam'" in rendered if failure in {"select", "uid_snapshot"} else True
     assert "password=secret" not in rendered
     assert RAW.decode() not in rendered
     assert raised.value.__cause__ is not None
@@ -884,7 +1015,7 @@ def test_size_fetch_is_chunked_for_large_snapshot():
     assert all(len(messages) <= 100 for messages in size_fetches)
     assert [item.uid for item in items] == list(reversed(uids))
     assert all(item.message is None for item in items)
-    assert len(client.fetches) == 100
+    assert len(client.fetches) == 101
 
 
 def test_newest_limit_fetches_only_selected_uids():
@@ -921,7 +1052,7 @@ def test_offset_beyond_mailbox_returns_empty_without_fetches():
         assert mailbox.selected_count(selection) == 0
         assert list(mailbox.iter_messages(selection)) == []
 
-    assert client.fetches == []
+    assert client.fetches == [(("1:*",), ("UID",))]
 
 
 @pytest.mark.parametrize("kwargs", [{"limit": 0}, {"limit": -1}, {"offset": -1}])
@@ -943,7 +1074,7 @@ def test_selected_size_fetches_remain_chunked_and_exclude_other_uids():
     assert len(size_fetches) == 2
     assert max(map(len, size_fetches)) == 100
     assert [item.uid for item in items] == list(expected)
-    assert all(selector == ("RFC822.SIZE",) for _, selector in client.fetches)
+    assert all(selector == ("RFC822.SIZE",) for _, selector in client.fetches[1:])
 
 
 def test_size_fetch_error_reports_phase_batch_and_uid_range_without_payload():
@@ -1689,15 +1820,15 @@ def test_state_store_never_touches_another_configured_folder() -> None:
 
 class SummaryFakeClient(FakeClient):
     def fetch(self, messages, data, modifiers=None):
-        messages = tuple(messages)
         data = tuple(data)
-        self.fetches.append((messages, data))
         if data != (
             "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)]",
             "FLAGS",
             "RFC822.SIZE",
         ):
             return super().fetch(messages, data, modifiers)
+        messages = (messages,) if isinstance(messages, (str, int)) else tuple(messages)
+        self.fetches.append((messages, data))
         headers = (
             b"From: Sender <sender@example.org>\r\nSubject: Page row\r\nDate: Today\r\n"
             b"Message-ID: <row@example.org>\r\n\r\n"
@@ -1724,8 +1855,8 @@ def test_fetch_summaries_batches_preserves_requested_order_and_reads_state() -> 
     assert summaries[0].size_bytes == 200
     assert summaries[0].persisted_state is SpamOutcome.REVIEW
     assert summaries[1].persisted_state is None
-    assert [call[0] for call in client.fetches] == [(20,), (10,)]
-    assert all("BODY.PEEK[HEADER.FIELDS" in call[1][0] for call in client.fetches)
+    assert [call[0] for call in client.fetches if call[1] != ("UID",)] == [(20,), (10,)]
+    assert all("BODY.PEEK[HEADER.FIELDS" in call[1][0] for call in client.fetches if call[1] != ("UID",))
     assert client.selected[0] == ("Spam", True)
 
 
@@ -1739,7 +1870,7 @@ def test_fetch_summaries_marks_vanished_uid_and_rejects_uid_outside_snapshot() -
 
     assert summaries[0].skip_reason == "message disappeared before header fetch"
     assert summaries[1].subject == "Page row"
-    assert len(client.fetches) == 1
+    assert sum(selector != ("UID",) for _, selector in client.fetches) == 1
 
 
 def test_read_only_facade_exposes_browsing_but_no_mutation_methods() -> None:

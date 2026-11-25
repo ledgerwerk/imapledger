@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import imaplib
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -17,8 +18,18 @@ from imapledger.config import (
     SpamActions,
     SpamSettings,
 )
-from imapledger.mailbox import DeleteResult, MailboxSnapshot, MoveResult
+from imapledger.mailbox import DeleteResult, MailboxSnapshot, MoveResult, ScopedMailbox
 from imapledger.policy import SpamVerdict
+from tests.fakes import FolderAwareFakeClient, raw_message
+
+
+class SearchAllTooLargeActionClient(FolderAwareFakeClient):
+    def search(self, criteria="ALL", charset=None):
+        if criteria == "ALL":
+            self.calls.append("search")
+            self.searches.append(criteria)
+            raise imaplib.IMAP4.error("got more than 1000000 bytes")
+        return super().search(criteria, charset)
 
 
 def _settings(*, state_backend=ClassificationStateBackend.NONE) -> Settings:
@@ -121,6 +132,97 @@ def test_action_service_applies_only_configured_move_and_returns_confirmed_recei
     assert receipt.destination == "Trash"
     assert checks[0]["destinations"] == ("Trash",)
     assert checks[0]["requires_delete"] is False
+
+
+def _real_mailbox_service(client, settings):
+    mailbox_options = []
+
+    def mailbox_factory(**kwargs):
+        mailbox_options.append(kwargs)
+        return ScopedMailbox(**kwargs, client_factory=lambda *args, **options: client)
+
+    return ActionService(settings, "secret", mailbox_factory=mailbox_factory), mailbox_options
+
+
+@pytest.mark.parametrize("action_kind", ["move", "delete", "keyword"])
+def test_action_service_uses_exact_uid_scope_when_search_all_fails(action_kind):
+    settings = _settings()
+    analysis = _analysis()
+    if action_kind == "delete":
+        spam_action = MessageAction(ActionKind.DELETE)
+        actions = replace(settings.spam.actions, spam=spam_action)
+        settings = replace(settings, spam=replace(settings.spam, actions=actions))
+        analysis = replace(analysis, configured_action=spam_action)
+    elif action_kind == "keyword":
+        settings = _settings(state_backend=ClassificationStateBackend.IMAP_KEYWORDS)
+        analysis = replace(
+            analysis,
+            outcome=SpamOutcome.NOT_SPAM,
+            configured_action=settings.spam.actions.not_spam,
+        )
+
+    client = SearchAllTooLargeActionClient({"Spam": {9: raw_message("spam", "sender@example.org")}, "Trash": {}})
+    service, mailbox_options = _real_mailbox_service(client, settings)
+
+    receipt = service.apply(analysis, uidvalidity=42, confirmed_by_user=True)
+
+    assert receipt.applied and receipt.confirmed, receipt.detail
+    assert mailbox_options[0]["uid_scope"] == ()
+    assert mailbox_options[1]["uid_scope"] == (9,)
+    assert client.searches
+    assert all(criteria == ["UID", 9] for criteria in client.searches)
+    assert "ALL" not in client.searches
+    if action_kind == "move":
+        assert receipt.destination == "Trash"
+        assert client.moves == [((9,), "Trash")]
+    elif action_kind == "delete":
+        assert client.expunged == [(9,)]
+        assert client.moves == []
+    else:
+        assert receipt.state_keyword == "imapledger-v1-notspam"
+        assert client.added
+        assert client.moves == []
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_action_service_refuses_missing_uid_or_stale_uidvalidity_with_real_mailbox(stale):
+    uidvalidities = {"Spam": 43 if stale else 42, "Trash": 42}
+    source_messages = (
+        {20: raw_message("other", "sender@example.org")}
+        if not stale
+        else {9: raw_message("spam", "sender@example.org")}
+    )
+    client = SearchAllTooLargeActionClient(
+        {"Spam": source_messages, "Trash": {}},
+        uidvalidities=uidvalidities,
+    )
+    service, _ = _real_mailbox_service(client, _settings())
+
+    receipt = service.apply(_analysis(), uidvalidity=42, confirmed_by_user=True)
+
+    assert not receipt.applied and not receipt.confirmed
+    assert "UIDVALIDITY changed" in receipt.detail if stale else "UID is no longer" in receipt.detail
+    assert client.moves == []
+    assert all(criteria == ["UID", 9] for criteria in client.searches)
+
+
+@pytest.mark.parametrize("failure", ["destination", "move-capability"])
+def test_action_service_preflight_rejects_missing_move_resource(failure):
+    client = SearchAllTooLargeActionClient({"Spam": {9: raw_message("spam", "sender@example.org")}, "Trash": {}})
+    if failure == "destination":
+        client.existing_folders.remove("Trash")
+        client.folders.pop("Trash")
+    else:
+        client._capabilities = (b"IMAP4rev1", b"UIDPLUS")
+    service, mailbox_options = _real_mailbox_service(client, _settings())
+
+    receipt = service.apply(_analysis(), uidvalidity=42, confirmed_by_user=True)
+
+    assert not receipt.applied and not receipt.confirmed
+    assert client.moves == []
+    assert len(mailbox_options) == 1
+    assert mailbox_options[0]["uid_scope"] == ()
+    assert client.searches == []
 
 
 def test_action_service_rejects_stale_uidvalidity_and_missing_uid():
