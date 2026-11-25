@@ -38,18 +38,26 @@ class FakeMailService:
         self.slow_delay = 0
         self.started = None
         self.release = None
+        self.block_folder = None
+        self.requested_folders = []
+        self.count_total = 1
+        self.fail_load = True
 
     def list_folders(self, *, include_counts=True):
         self.folder_list_modes.append(include_counts)
-        return (FolderInfo("Spam", ".", frozenset(), 1, 1), FolderInfo("INBOX", ".", frozenset(), 1, 0))
+        return (
+            FolderInfo("Spam", ".", frozenset(), self.count_total, 1),
+            FolderInfo("INBOX", ".", frozenset(), self.count_total, 0),
+        )
 
     def refresh_folder_counts(self, folders):
         return {folder: (1, 0) for folder in folders}
 
     def list_messages(self, folder, *, limit, offset):
-        if folder == "Fail":
+        self.requested_folders.append(folder)
+        if folder == "Fail" and self.fail_load:
             raise RuntimeError("sensitive server error")
-        if folder == "Slow":
+        if folder == self.block_folder or folder == "Slow":
             if self.started is not None:
                 self.started.set()
                 self.release.wait(timeout=5)
@@ -237,11 +245,12 @@ def test_slow_folder_worker_keeps_message_pump_responsive():
 
 
 async def _folder_worker_failure_is_recoverable():
-    from textual.widgets import Static
+    from textual.widgets import DataTable, Static
 
+    mail = FakeMailService()
     app = MailReviewApp(
         Path("unused.toml"),
-        mail_service=FakeMailService(),
+        mail_service=mail,
         settings=SETTINGS,
         rules=RuleSet(),
         analysis_service=FakeAnalysisService(),
@@ -249,11 +258,20 @@ async def _folder_worker_failure_is_recoverable():
     )
     async with app.run_test(size=(60, 20)) as pilot:
         await pilot.pause()
-        app.run_worker(app._select_folder("Fail"), group="folder-page", exit_on_error=False)
-        await pilot.pause(0.1)
+        await app._select_folder("INBOX.Sent")
+        assert app._rows == [("INBOX.Sent", SUMMARY)]
+        await app._select_folder("Fail")
         status = str(app.query_one("#status", Static).render())
         assert "RuntimeError" in status
         assert "sensitive server error" not in status
+        assert app._selected_folder == "Fail"
+        assert app._rows == []
+        assert app.query_one("#messages", DataTable).row_count == 0
+        assert "Press r to retry" in str(app.query_one("#message-detail", Static).render())
+        mail.fail_load = False
+        await pilot.press("r")
+        await pilot.pause(0.1)
+        assert app._rows == [("Fail", SUMMARY)]
         await pilot.press("?")
         assert "Keys:" in str(app.query_one("#status", Static).render())
 
@@ -291,3 +309,59 @@ def test_tui_resolves_credentials_before_textual_run(monkeypatch):
     tui_module.run(Path("unused.toml"))
 
     assert order == ["settings", "rules", "credential", "run"]
+
+
+async def _folder_activation_clears_stale_rows_and_count_refresh_preserves_state():
+    from types import SimpleNamespace
+
+    from textual.widgets import DataTable, Label, ListView, Static
+
+    mail = FakeMailService()
+    mail.started = threading.Event()
+    mail.release = threading.Event()
+    mail.block_folder = "INBOX"
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=mail,
+        settings=SETTINGS,
+        rules=RuleSet(),
+        analysis_service=FakeAnalysisService(),
+        action_service=FakeActionService(),
+    )
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.pause()
+        await app._select_folder("INBOX.Sent")
+        assert app._rows == [("INBOX.Sent", SUMMARY)]
+
+        view = app.query_one("#folders", ListView)
+        inbox_item = app._folder_item_by_name["INBOX"]
+        view.index = 1
+        view.focus()
+        requested_before = list(mail.requested_folders)
+        app.on_list_view_selected(SimpleNamespace(list_view=view, item=inbox_item))
+        assert app._selected_folder == "INBOX"
+        assert app._rows == []
+        assert app.query_one("#messages", DataTable).row_count == 0
+        assert "Loading INBOX" in str(app.query_one("#status", Static).render())
+        assert await asyncio.to_thread(mail.started.wait, 2)
+
+        mail.count_total = 17
+        await app._refresh_counts()
+        assert app._selected_folder == "INBOX"
+        assert app._rows == []
+        assert app.query_one("#messages", DataTable).row_count == 0
+        assert "Loading INBOX" in str(app.query_one("#status", Static).render())
+        assert app._folder_item_by_name["INBOX"] is inbox_item
+        assert "17" in str(inbox_item.query_one(Label).render())
+        assert view.index == 1
+        assert app.focused is view
+        assert mail.requested_folders == requested_before + ["INBOX"]
+
+        mail.release.set()
+        await pilot.pause(0.1)
+        assert app._rows == [("INBOX", SUMMARY)]
+        assert "INBOX: 1 messages loaded" in str(app.query_one("#status", Static).render())
+
+
+def test_folder_activation_and_count_refresh_preserve_loading_state():
+    asyncio.run(_folder_activation_clears_stale_rows_and_count_refresh_preserves_state())

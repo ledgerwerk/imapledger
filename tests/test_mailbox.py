@@ -44,6 +44,8 @@ class FakeClient:
         self.uidvalidity = uidvalidity
         self.size = len(RAW) if size is None else size
         self.uids = [10] if uids is None else list(uids)
+        self.messages = list(enumerate(self.uids, start=1))
+        self.use_uid = True
         self.selected = []
         self.selected_folder = None
         self.fetches = []
@@ -135,6 +137,19 @@ class FakeClient:
         messages = tuple(messages)
         data = tuple(data)
         self.fetches.append((messages, data))
+        if not self.use_uid:
+            self._maybe_fail("fetch_headers")
+            header = RAW.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
+            return {
+                sequence: {
+                    b"UID": uid,
+                    b"BODY[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)]": header,
+                    b"FLAGS": tuple(self.flags.get(uid, set())),
+                    b"RFC822.SIZE": self.size,
+                }
+                for sequence, uid in self.messages
+                if sequence in messages
+            }
         if data == ("RFC822.SIZE",):
             self._maybe_fail("fetch_size")
             return {uid: {b"RFC822.SIZE": self.size} for uid in messages if uid in self.uids}
@@ -387,12 +402,20 @@ def test_browser_page_fetches_only_requested_summaries() -> None:
     )
 
     with browser:
-        uids = browser.list_page_uids(offset=0, limit=5)
-        browser.fetch_summaries(uids)
+        items = browser.fetch_summary_page(offset=0, limit=5)
 
-    assert len(uids) == 5
-    assert client.searches == ["ALL"]
-    assert client.fetches[0][0] == tuple(uids)
+    assert tuple(item.uid for item in items) == (100, 99, 98, 97, 96)
+    assert client.searches == []
+    assert client.fetches[0][0] == (96, 97, 98, 99, 100)
+    assert client.fetches[0][1] == (
+        "UID",
+        "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)]",
+        "FLAGS",
+        "RFC822.SIZE",
+    )
+    assert len(client.fetches[0][0]) == 5
+    assert client.selected == [("Spam", True)]
+    assert client.use_uid is True
     assert client.removed == []
 
 
@@ -1731,3 +1754,99 @@ def test_read_only_facade_exposes_browsing_but_no_mutation_methods() -> None:
 
     with pytest.raises(ValueError, match="read-only ScopedMailbox"):
         ReadOnlyMailbox(make_mailbox(FakeClient(), writable=True))
+
+
+class LogicalPageClient:
+    def __init__(self, count: int, uid_by_sequence: dict[int, int] | None = None) -> None:
+        self.count = count
+        self.uid_by_sequence = uid_by_sequence or {}
+        self.use_uid = True
+        self.fetches = []
+        self.fail_fetch = False
+
+    def login(self, username: str, password: str) -> None:
+        pass
+
+    def logout(self) -> None:
+        pass
+
+    def select_folder(self, folder: str, readonly: bool = False) -> dict[bytes, int]:
+        return {b"UIDVALIDITY": 1, b"EXISTS": self.count}
+
+    def fetch(self, sequence_numbers, data, modifiers=None):
+        sequence_numbers = tuple(sequence_numbers)
+        self.fetches.append((sequence_numbers, tuple(data)))
+        assert self.use_uid is False
+        if self.fail_fetch:
+            raise RuntimeError("fetch failed")
+        header = b"From: sender@example.org\r\nSubject: page\r\n\r\n"
+        return {
+            sequence: {
+                b"UID": self.uid_by_sequence.get(sequence, sequence * 10 + 100),
+                b"BODY[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)]": header,
+                b"FLAGS": (),
+                b"RFC822.SIZE": 1,
+            }
+            for sequence in sequence_numbers
+        }
+
+
+def _logical_browser(client):
+    return BrowserMailbox(
+        host="imap.example.org",
+        port=993,
+        username="user",
+        password="secret",
+        folder="INBOX",
+        max_message_bytes=10_000,
+        max_body_chars=100,
+        client_factory=factory_for(client),
+    )
+
+
+@pytest.mark.parametrize(
+    ("count", "offset", "limit", "sort", "expected_sequences"),
+    [
+        (0, 0, 50, MessageSort.NEWEST, ()),
+        (1, 0, 50, MessageSort.NEWEST, (1,)),
+        (49, 0, 50, MessageSort.NEWEST, tuple(range(49, 0, -1))),
+        (50, 0, 50, MessageSort.NEWEST, tuple(range(50, 0, -1))),
+        (50, 0, 50, MessageSort.OLDEST, tuple(range(1, 51))),
+        (51, 0, 50, MessageSort.NEWEST, tuple(range(51, 1, -1))),
+        (51, 50, 50, MessageSort.NEWEST, (1,)),
+        (167616, 0, 50, MessageSort.NEWEST, tuple(range(167616, 167566, -1))),
+        (167616, 50, 50, MessageSort.NEWEST, tuple(range(167566, 167516, -1))),
+        (167616, 0, 50, MessageSort.OLDEST, tuple(range(1, 51))),
+        (167616, 50, 50, MessageSort.OLDEST, tuple(range(51, 101))),
+        (10, 10, 3, MessageSort.OLDEST, ()),
+    ],
+)
+def test_summary_page_uses_bounded_sequence_windows(count, offset, limit, sort, expected_sequences):
+    client = LogicalPageClient(count)
+    with _logical_browser(client) as browser:
+        items = browser.fetch_summary_page(offset=offset, limit=limit, sort=sort)
+
+    expected_uids = tuple(sequence * 10 + 100 for sequence in expected_sequences)
+    assert tuple(item.uid for item in items) == expected_uids
+    expected_fetch_sequences = tuple(sorted(expected_sequences))
+    if expected_fetch_sequences:
+        assert client.fetches[0][0] == expected_fetch_sequences
+        assert len(client.fetches) == 1
+        assert len(client.fetches[0][0]) <= limit
+        assert client.fetches[0][1][0] == "UID"
+    else:
+        assert client.fetches == []
+    assert client.use_uid is True
+
+
+def test_summary_page_preserves_non_contiguous_uids_and_restores_uid_mode_on_error():
+    client = LogicalPageClient(4, {1: 100, 2: 104, 3: 900, 4: 901})
+    with _logical_browser(client) as browser:
+        items = browser.fetch_summary_page(offset=0, limit=4)
+        assert tuple(item.uid for item in items) == (901, 900, 104, 100)
+
+        client.fail_fetch = True
+        with pytest.raises(ImapOperationError):
+            browser.fetch_summary_page(offset=0, limit=4)
+
+    assert client.use_uid is True

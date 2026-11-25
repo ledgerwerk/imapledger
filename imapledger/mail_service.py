@@ -105,8 +105,7 @@ class MailService:
         if not isinstance(sort, MessageSort):
             raise ValueError("sort must be a MessageSort")
         with self._open_browser(folder) as mailbox:
-            uids = mailbox.list_page_uids(offset=offset, limit=limit, sort=sort)
-            items = mailbox.fetch_summaries(uids)
+            items = mailbox.fetch_summary_page(offset=offset, limit=limit, sort=sort)
             total = mailbox.message_count
             uidvalidity = mailbox.uidvalidity
         page = MessagePage(

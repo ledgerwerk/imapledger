@@ -26,6 +26,16 @@ from ..rules import RuleSet, load_rules, rules_path_for_config
 _LOG = logging.getLogger(__name__)
 
 
+class FolderListItem(ListItem):
+    def __init__(self, folder_name: str | None, label: str) -> None:
+        super().__init__(Label(label))
+        self.folder_name = folder_name
+
+    @property
+    def is_review(self) -> bool:
+        return self.folder_name is None
+
+
 class ApplyConfirmation(ModalScreen[bool]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
     CSS = """
@@ -110,9 +120,11 @@ class MailReviewApp(App[None]):
         self.analysis_service = analysis_service
         self.action_service = action_service
         self.folders: tuple[FolderInfo, ...] = ()
-        self._folder_items: list[str] = []
+        self._folder_item_by_name: dict[str, FolderListItem] = {}
+        self._review_item: FolderListItem | None = None
         self._rows: list[tuple[str, MailSummary]] = []
         self._selected_folder: str | None = None
+        self._loading_folder: str | None = None
         self._detail: MessageDetail | None = None
         self._analysis: MessageAnalysis | None = None
         self._folder_generation = 0
@@ -178,41 +190,62 @@ class MailReviewApp(App[None]):
                 f"{type(exc).__name__}. Press r to retry or q to quit."
             )
 
+    def _folder_label(self, folder: FolderInfo) -> str:
+        counts = f"  {folder.total}" if folder.total is not None else ""
+        unread = f" ({folder.unread} unread)" if folder.unread else ""
+        return f"{folder.name}{counts}{unread}"
+
     def _render_folders(self) -> None:
-        self._folder_items = ["Review"] + [folder.name for folder in self.folders if folder.selectable]
+        folders = tuple(folder for folder in self.folders if folder.selectable)
         view = self.query_one("#folders", ListView)
-        view.clear()
-        view.append(ListItem(Label("Review smart view")))
-        for folder in self.folders:
-            if folder.selectable:
-                counts = f"  {folder.total}" if folder.total is not None else ""
-                unread = f" ({folder.unread} unread)" if folder.unread else ""
-                view.append(ListItem(Label(f"{folder.name}{counts}{unread}")))
+        current_names = tuple(self._folder_item_by_name)
+        folder_names = tuple(folder.name for folder in folders)
+        if self._review_item is None or current_names != folder_names:
+            view.clear()
+            self._folder_item_by_name = {}
+            self._review_item = FolderListItem(None, "Review smart view")
+            view.append(self._review_item)
+            for folder in folders:
+                item = FolderListItem(folder.name, self._folder_label(folder))
+                self._folder_item_by_name[folder.name] = item
+                view.append(item)
+            return
+
+        for folder in folders:
+            self._folder_item_by_name[folder.name].query_one(Label).update(self._folder_label(folder))
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.list_view.id != "folders" or event.item is None:
+        if event.list_view.id != "folders" or not isinstance(event.item, FolderListItem):
             return
-        index = event.list_view.index
-        if index is None or index >= len(self._folder_items):
+        folder = "Review" if event.item.is_review else event.item.folder_name
+        if folder is None:
             return
-        self._set_status(f"Loading {self._folder_items[index]} page…")
+        generation = self._begin_folder_load(folder)
         self.run_worker(
-            self._select_folder(self._folder_items[index]),
+            self._select_folder(folder, generation),
             group="folder-page",
             exclusive=True,
             exit_on_error=False,
         )
 
-    async def _select_folder(self, folder: str) -> None:
+    def _begin_folder_load(self, folder: str) -> int:
         self._folder_generation += 1
         self._message_generation += 1
         self._classification_generation += 1
-        generation = self._folder_generation
         self._selected_folder = folder
+        self._loading_folder = folder
         self._detail = None
         self._analysis = None
-        self.query_one("#message-detail", Static).update("Select a message to read its text content.")
-        self.query_one("#analysis", Static).update("Analysis will not run until requested.")
+        self._rows = []
+        self.query_one("#messages", DataTable).clear()
+        self.query_one("#message-detail", Static).update(f"Loading {folder}...")
+        self.query_one("#analysis", Static).update("Analysis will not run until a message is opened.")
+        self._set_status(f"Loading {folder} page...")
+        return self._folder_generation
+
+    async def _select_folder(self, folder: str, generation: int | None = None) -> None:
+        if generation is None:
+            generation = self._begin_folder_load(folder)
         try:
             if folder == "Review":
                 rows = await asyncio.to_thread(self.mail_service.review_messages, limit=50, offset=0)
@@ -223,9 +256,16 @@ class MailReviewApp(App[None]):
             if generation != self._folder_generation:
                 return
             self._populate_rows(page_rows)
+            self._loading_folder = None
             self._set_status(f"{folder}: {len(page_rows)} messages loaded.")
         except Exception as exc:
             if generation == self._folder_generation:
+                self._loading_folder = None
+                self._rows = []
+                self.query_one("#messages", DataTable).clear()
+                self.query_one("#message-detail", Static).update(
+                    f"Could not load {folder} ({type(exc).__name__}). Press r to retry."
+                )
                 self._set_status(f"Could not load {folder}: {type(exc).__name__}")
 
     def _populate_rows(self, rows: tuple[tuple[str, MailSummary], ...]) -> None:
@@ -478,14 +518,16 @@ class MailReviewApp(App[None]):
             self._set_status(f"Refresh failed: {type(exc).__name__}")
 
     async def _refresh_counts(self) -> None:
-        self._set_status("Refreshing counts…")
+        if self._loading_folder is None:
+            self._set_status("Refreshing counts…")
         try:
             self.folders = await asyncio.to_thread(self.mail_service.list_folders, include_counts=True)
             self._render_folders()
-            folder_label = self._selected_folder or "Folders"
-            self._set_status(f"Folder counts refreshed. {folder_label}: {len(self._rows)} messages loaded.")
+            if self._loading_folder is None:
+                self._set_status("Folder counts refreshed.")
         except Exception as exc:
-            self._set_status(f"Count refresh failed: {type(exc).__name__}")
+            if self._loading_folder is None:
+                self._set_status(f"Count refresh failed: {type(exc).__name__}")
 
     def _find_summary(self, folder: str, uid: int) -> MailSummary | None:
         return next(

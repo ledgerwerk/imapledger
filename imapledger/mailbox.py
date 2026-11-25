@@ -193,6 +193,8 @@ class UnsafeMailboxOperation(MailboxError):
 
 
 class _Client(Protocol):
+    use_uid: bool
+
     def login(self, username: str, password: str) -> Any: ...
     def logout(self) -> Any: ...
     def capabilities(self) -> Any: ...
@@ -1713,6 +1715,15 @@ def _fetch_size_value(data: Mapping[Any, Any]) -> int | None:
     return size if size >= 0 else None
 
 
+def _fetch_uid_value(data: Mapping[Any, Any]) -> int | None:
+    value = data.get(b"UID", data.get("UID"))
+    try:
+        uid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return uid if uid > 0 else None
+
+
 def _skipped_summary(uid: int, reason: str) -> MailSummary:
     return MailSummary(
         uid=uid,
@@ -1790,22 +1801,71 @@ class BrowserMailbox:
                 if exc is None:
                     raise
 
-    def list_page_uids(self, *, offset: int, limit: int, sort: MessageSort = MessageSort.NEWEST) -> tuple[int, ...]:
+    def fetch_summary_page(
+        self,
+        *,
+        offset: int,
+        limit: int,
+        sort: MessageSort = MessageSort.NEWEST,
+    ) -> tuple[MailSummary, ...]:
         if offset < 0 or limit < 1:
             raise ValueError("offset must be non-negative and limit must be positive")
+        if not isinstance(sort, MessageSort):
+            raise ValueError("sort must be a MessageSort")
+
+        count = self.message_count
+        if sort is MessageSort.NEWEST:
+            high = count - offset
+            if high < 1:
+                return ()
+            low = max(1, high - limit + 1)
+            sequence_numbers = tuple(range(low, high + 1))
+            ordered_sequences = reversed(sequence_numbers)
+        else:
+            low = offset + 1
+            if low > count:
+                return ()
+            high = min(count, low + limit - 1)
+            sequence_numbers = tuple(range(low, high + 1))
+            ordered_sequences = iter(sequence_numbers)
+
         client = self._require_client()
+        previous_use_uid = client.use_uid
+        selector = "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)]"
         try:
-            found = client.search("ALL")
+            client.use_uid = False
+            response = client.fetch(
+                sequence_numbers,
+                ["UID", selector, "FLAGS", "RFC822.SIZE"],
+            )
         except Exception as exc:
             raise _operation_error(
-                operation="imap_search",
-                message="UID SEARCH ALL failed",
+                operation="imap_fetch_summaries",
+                message="FETCH of message summaries failed",
                 exc=exc,
                 folder=self._folder,
-                selector="ALL",
+                selector="sequence page headers UID FLAGS RFC822.SIZE",
             ) from exc
-        uids = sorted((int(uid) for uid in found), reverse=sort is MessageSort.NEWEST)
-        return tuple(uids[offset : offset + limit])
+        finally:
+            client.use_uid = previous_use_uid
+
+        response_by_sequence = {int(sequence): data for sequence, data in response.items()}
+        summaries = []
+        for sequence in ordered_sequences:
+            data = response_by_sequence.get(sequence)
+            if not isinstance(data, Mapping):
+                continue
+            uid = _fetch_uid_value(data)
+            if uid is None:
+                continue
+            raw = _fetch_header_bytes(data)
+            flags = _fetch_flags_value(data)
+            size = _fetch_size_value(data)
+            if raw is not None and flags is not None:
+                summaries.append(parse_summary(uid, raw, flags=flags, size_bytes=size))
+            else:
+                summaries.append(_skipped_summary(uid, "message summary unavailable"))
+        return tuple(summaries)
 
     def search_keyword(self, keyword: str) -> tuple[int, ...]:
         _require_state_keyword(keyword)

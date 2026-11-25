@@ -102,11 +102,8 @@ def test_mail_service_lists_pages_and_opens_message_read_only(monkeypatch):
         def __exit__(self, *args):
             return None
 
-        def list_page_uids(self, *, offset, limit, sort):
-            assert sort is MessageSort.NEWEST
-            return (7,)
-
-        def fetch_summaries(self, uids):
+        def fetch_summary_page(self, *, offset, limit, sort):
+            assert (offset, limit, sort) == (0, 1, MessageSort.NEWEST)
             return (summary,)
 
         def fetch_uid(self, uid):
