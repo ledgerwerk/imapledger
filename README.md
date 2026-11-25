@@ -181,7 +181,7 @@ imapledger state reset --folder INBOX.Junk --uid 43652 --apply
 
 ## Mail review console
 
-Launch the interactive console explicitly with `imapledger ui`. It provides folder browsing, a merged Review view, bounded plain-text message reading, on-demand analysis, and confirmation-gated configured actions. Browsing uses read-only mailbox access and `BODY.PEEK`; opening a message does not mark it seen. HTML is not rendered, attachments are not opened, and activity/results are kept only for the current session.
+Launch the interactive console explicitly with `imapledger ui`. It provides folder browsing, a merged Review view, bounded plain-text message reading, on-demand spam analysis, a separate visual-content section, and confirmation-gated configured actions. Browsing uses read-only mailbox access and `BODY.PEEK`; opening a message does not mark it seen, fetch remote images, or send images to a model. Press `i` to analyze embedded images explicitly. `I` offers remote image loading behind a cancel-default privacy warning and strict HTTPS, DNS/IP, redirect, timeout, and response-size checks. Visual assessments are informational and do not affect spam outcomes or mail actions. HTML is not rendered, attachments are not opened, and results are kept only in the current session. See the [interactive console guide](docs/ui.md) for navigation, shortcuts, and privacy behavior.
 
 The same services are available through composable commands:
 

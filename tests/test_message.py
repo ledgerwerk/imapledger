@@ -198,3 +198,82 @@ def test_empty_message_body_source_is_none() -> None:
     assert message.body_source == "none"
     assert not message.body_truncated
     assert not message.has_attachments
+
+
+def test_embedded_inline_cid_image_is_counted_without_attachment_filename():
+    raw = b"""MIME-Version: 1.0\r
+Content-Type: multipart/related; boundary=x\r
+\r
+--x\r
+Content-Type: text/html; charset=utf-8\r
+\r
+<p>Invoice</p><img src=\"cid:bill-image\" alt=\"bill\">\r
+--x\r
+Content-Type: image/png\r
+Content-ID: <bill-image>\r
+Content-Disposition: inline\r
+Content-Transfer-Encoding: base64\r
+\r
+AQID\r
+--x--\r
+"""
+    message = parse_message(29, raw, max_body_chars=100)
+
+    assert message.image_count == 1
+    image = message.images[0]
+    assert image.content_type == "image/png"
+    assert image.content_id == "bill-image"
+    assert image.disposition == "inline"
+    assert image.data == b"\x01\x02\x03"
+    assert image.classifiable
+    assert message.remote_image_count == 0
+    assert message.attachment_count == 0
+
+
+def test_attached_jpeg_and_unsupported_and_empty_images_preserve_attachment_count():
+    raw = b"""MIME-Version: 1.0\r
+Content-Type: multipart/mixed; boundary=x\r
+\r
+--x\r
+Content-Type: image/jpeg; name=receipt.jpg\r
+Content-Disposition: attachment; filename=receipt.jpg\r
+Content-Transfer-Encoding: base64\r
+\r
+/9j/2Q==\r
+--x\r
+Content-Type: image/gif\r
+Content-Transfer-Encoding: base64\r
+\r\nR0lGODlh\r
+--x\r
+Content-Type: image/png\r
+Content-Transfer-Encoding: base64\r
+\r\n\r
+--x--\r
+"""
+    message = parse_message(30, raw, max_body_chars=100)
+
+    assert message.image_count == 3
+    assert message.attachment_count == 1
+    assert message.images[0].filename == "receipt.jpg"
+    assert message.images[0].classifiable
+    assert not message.images[1].classifiable
+    assert message.images[1].skip_reason == "image/gif is not supported by the visual analyzer"
+    assert not message.images[2].classifiable
+    assert message.images[2].skip_reason == "image payload is empty or malformed"
+
+
+def test_html_remote_image_references_are_bounded_deduplicated_and_private_in_repr():
+    urls = [f"https://img{index}.example/picture?token=secret{index}" for index in range(55)]
+    html = "<p>Newsletter</p>" + "".join(f'<img src="{url}" alt="{"a" * 600}">' for url in [urls[0], *urls])
+    raw = f"Content-Type: text/html; charset=utf-8\r\n\r\n{html}".encode()
+    message = parse_message(31, raw, max_body_chars=100)
+
+    assert message.body == "Newsletter"
+    assert message.remote_image_count == 50
+    assert message.remote_images[0].index == 1
+    assert message.remote_images[0].host == "img0.example"
+    assert len(message.remote_images[0].alt) == 500
+    assert "token=secret" not in repr(message)
+    assert "token=secret" not in repr(message.as_state())
+    assert "token=secret" not in message.body
+    assert "data:image" not in repr(message)

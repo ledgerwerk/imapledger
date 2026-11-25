@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email import policy
 from email.header import decode_header, make_header
 from email.message import Message
@@ -23,6 +23,27 @@ class MailSummary:
     flags: frozenset[bytes | str]
     persisted_state: SpamOutcome | None
     skip_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MailImage:
+    index: int
+    content_type: str
+    filename: str
+    content_id: str
+    disposition: str
+    data: bytes = field(repr=False)
+    size_bytes: int
+    classifiable: bool
+    skip_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteImageRef:
+    index: int
+    url: str = field(repr=False)
+    host: str
+    alt: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,12 +73,21 @@ class MailMessage:
     x_spam_status: str = ""
     x_spam_score: str = ""
     link_domains: tuple[str, ...] = ()
-    link_domains: tuple[str, ...] = ()
     body_truncated: bool = False
     size_bytes: int | None = None
     body_source: str = "none"
     has_attachments: bool = False
     attachment_count: int = 0
+    images: tuple[MailImage, ...] = ()
+    remote_images: tuple[RemoteImageRef, ...] = ()
+
+    @property
+    def image_count(self) -> int:
+        return len(self.images)
+
+    @property
+    def remote_image_count(self) -> int:
+        return len(self.remote_images)
 
     def as_state(self) -> dict[str, object]:
         return {
@@ -74,7 +104,9 @@ def parse_message(uid: int, raw: bytes, *, max_body_chars: int, size_bytes: int 
     msg = BytesParser(policy=policy.default).parsebytes(raw)
     sender = _decode_header_value(msg.get("From", ""))
     from_display_name, from_address = _first_mailbox(sender)
-    body, link_domains, body_source, attachment_count = _extract_body(msg, max_body_chars=max_body_chars)
+    body, link_domains, body_source, attachment_count, images, remote_images = _extract_body(
+        msg, max_body_chars=max_body_chars
+    )
     body_truncated = len(body) > max_body_chars
     body = body[:max_body_chars]
     return MailMessage(
@@ -108,6 +140,8 @@ def parse_message(uid: int, raw: bytes, *, max_body_chars: int, size_bytes: int 
         body_source=body_source,
         has_attachments=attachment_count > 0,
         attachment_count=attachment_count,
+        images=images,
+        remote_images=remote_images,
     )
 
 
@@ -175,10 +209,25 @@ class _VisibleTextParser(HTMLParser):
         self._ignored_depth = 0
         self._parts: list[str] = []
         self._links: list[str] = []
+        self._remote_images: list[RemoteImageRef] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in {"script", "style"}:
             self._ignored_depth += 1
+        if tag == "img" and len(self._remote_images) < 50:
+            attr_map = dict(attrs)
+            src = attr_map.get("src")
+            if src and len(src) <= 2048 and src not in {image.url for image in self._remote_images}:
+                host = _url_hostname(src)
+                if host:
+                    self._remote_images.append(
+                        RemoteImageRef(
+                            index=len(self._remote_images) + 1,
+                            url=src,
+                            host=host,
+                            alt=(attr_map.get("alt") or "")[:500],
+                        )
+                    )
         for name, value in attrs:
             if name in {"href", "action"} and value and len(self._links) < 100:
                 hostname = _url_hostname(value)
@@ -202,6 +251,10 @@ class _VisibleTextParser(HTMLParser):
     def link_domains(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys(self._links))[:20]
 
+    @property
+    def remote_images(self) -> tuple[RemoteImageRef, ...]:
+        return tuple(self._remote_images)
+
 
 def _url_hostname(value: str) -> str | None:
     try:
@@ -213,19 +266,53 @@ def _url_hostname(value: str) -> str | None:
         return None
 
 
-def _extract_body(msg: Message, *, max_body_chars: int) -> tuple[str, tuple[str, ...], str, int]:
+def _extract_body(
+    msg: Message, *, max_body_chars: int
+) -> tuple[str, tuple[str, ...], str, int, tuple[MailImage, ...], tuple[RemoteImageRef, ...]]:
     plain_candidates: list[str] = []
     html_candidates: list[str] = []
     link_domains: list[str] = []
+    images: list[MailImage] = []
+    remote_images: list[RemoteImageRef] = []
+    seen_remote_urls: set[str] = set()
     attachment_count = 0
     parts = msg.walk() if msg.is_multipart() else (msg,)
     for part in parts:
         if part.is_multipart():
             continue
-        if part.get_content_disposition() == "attachment" or part.get_filename():
+        content_type = part.get_content_type().lower()
+        disposition = part.get_content_disposition() or "inline"
+        filename = part.get_filename() or ""
+        if content_type.startswith("image/"):
+            payload = part.get_payload(decode=True)
+            data = payload if isinstance(payload, bytes) else b""
+            classifiable = content_type in {"image/png", "image/jpeg"} and bool(data)
+            if content_type not in {"image/png", "image/jpeg"}:
+                skip_reason = f"{content_type} is not supported by the visual analyzer"
+            elif not data:
+                skip_reason = "image payload is empty or malformed"
+            else:
+                skip_reason = None
+            content_id = str(part.get("Content-ID", "")).strip().strip("<>")
+            images.append(
+                MailImage(
+                    index=len(images) + 1,
+                    content_type=content_type,
+                    filename=filename,
+                    content_id=content_id,
+                    disposition=disposition,
+                    data=data,
+                    size_bytes=len(data),
+                    classifiable=classifiable,
+                    skip_reason=skip_reason,
+                )
+            )
+            if disposition == "attachment" or filename:
+                attachment_count += 1
+            continue
+        if disposition == "attachment" or filename:
             attachment_count += 1
             continue
-        content_type = part.get_content_type()
         if content_type == "text/plain":
             text = _part_text(part)
             if text:
@@ -238,11 +325,25 @@ def _extract_body(msg: Message, *, max_body_chars: int) -> tuple[str, tuple[str,
                 if text:
                     html_candidates.append(text)
                 link_domains.extend(parser.link_domains)
+                for remote in parser.remote_images:
+                    if len(remote_images) >= 50:
+                        break
+                    if remote.url in seen_remote_urls:
+                        continue
+                    seen_remote_urls.add(remote.url)
+                    remote_images.append(RemoteImageRef(len(remote_images) + 1, remote.url, remote.host, remote.alt))
 
     body_source = "plain" if plain_candidates else "html" if html_candidates else "none"
     body = "\n\n".join(plain_candidates or html_candidates)
     body = "\n".join(line.rstrip() for line in body.splitlines()).strip()
-    return body, tuple(dict.fromkeys(link_domains))[:20], body_source, attachment_count
+    return (
+        body,
+        tuple(dict.fromkeys(link_domains))[:20],
+        body_source,
+        attachment_count,
+        tuple(images),
+        tuple(remote_images),
+    )
 
 
 def _part_text(part: Message) -> str:

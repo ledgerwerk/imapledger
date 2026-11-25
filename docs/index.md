@@ -36,6 +36,7 @@ config-store
 cleaning
 state
 rules
+ui
 ```
 
 ## Safety invariant
