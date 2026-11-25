@@ -43,6 +43,12 @@ class AnalysisService:
         self._rules = rules
         self._classifier_factory = classifier_factory
 
+    def set_rules(self, rules: RuleSet) -> None:
+        self._rules = rules
+
+    def set_settings(self, settings: Settings) -> None:
+        self._settings = settings
+
     def analyze(
         self,
         folder: str,
@@ -50,9 +56,17 @@ class AnalysisService:
         *,
         persisted_outcome: SpamOutcome | None = None,
         reclassify: bool = False,
+        use_persisted_state: bool = True,
+        prefer_rules: bool = False,
     ) -> MessageAnalysis:
         settings = self._settings
-        if persisted_outcome is not None and not reclassify:
+        rule = self._rules.first_match(folder, message)
+        if (
+            persisted_outcome is not None
+            and not reclassify
+            and use_persisted_state
+            and not (prefer_rules and rule is not None)
+        ):
             action = getattr(settings.spam.actions, persisted_outcome.value)
             return MessageAnalysis(
                 folder=folder,
@@ -67,7 +81,6 @@ class AnalysisService:
                 decision_source="persisted-state",
             )
 
-        rule = self._rules.first_match(folder, message)
         if rule is not None:
             return MessageAnalysis(
                 folder=folder,

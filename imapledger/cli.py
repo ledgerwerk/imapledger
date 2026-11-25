@@ -59,7 +59,8 @@ from .mailbox import (
     ScopedMailbox,
 )
 from .preflight import preflight_source
-from .rule_learning import RuleProposal, build_rule_candidates, learn_rule_proposal
+from .rule_candidates import build_rule_candidates
+from .rule_learning import RuleProposal, learn_rule_proposal
 from .rules import (
     RuleError,
     RuleSet,

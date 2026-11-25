@@ -44,6 +44,12 @@ class ActionService:
         self._mailbox_factory = mailbox_factory
         self._preflight = preflight
 
+    def set_rules(self, rules: RuleSet) -> None:
+        self._rules = rules
+
+    def set_settings(self, settings: Settings) -> None:
+        self._settings = settings
+
     def close(self) -> None:
         self._password = ""
 

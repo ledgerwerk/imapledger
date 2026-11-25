@@ -8,12 +8,11 @@ from pyjev.results import BundleResult, ChoiceResult, NoulResult
 
 from imapledger.config import ActionKind, MessageAction
 from imapledger.message import MailMessage
+from imapledger.rule_candidates import RuleCandidate, build_rule_candidates
 from imapledger.rule_learning import (
     MIN_CANDIDATE_CONFIDENCE,
     MIN_GENERALIZATION_PROBABILITY,
     NONE_CANDIDATE_ID,
-    RuleCandidate,
-    build_rule_candidates,
     learn_rule_proposal,
 )
 from imapledger.rules import RuleError, RuleMatch

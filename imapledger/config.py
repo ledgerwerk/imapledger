@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
@@ -14,7 +14,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib
 
-from .classification_state import ClassificationStateBackend
+from .classification_state import ClassificationStateBackend, SpamOutcome
 from .policy import SpamPolicy
 
 DEFAULT_MAX_MESSAGE_BYTES = 2_000_000
@@ -430,6 +430,16 @@ def _parse_spam_actions(value: object, *, legacy_defaults: bool = False) -> Spam
             destination = None
         parsed[outcome] = MessageAction(action=action, destination=destination)
     return SpamActions(**parsed)
+
+
+def replace_spam_action(settings: Settings, *, outcome: SpamOutcome, action: MessageAction) -> Settings:
+    if not isinstance(outcome, SpamOutcome):
+        raise ConfigError("outcome must be a SpamOutcome")
+    if not isinstance(action, MessageAction):
+        raise ConfigError("outcome action must be a MessageAction")
+    actions = replace(settings.spam.actions, **{outcome.value: action})
+    spam = replace(settings.spam, actions=actions)
+    return replace(settings, spam=spam)
 
 
 def render_settings(settings: Settings) -> str:

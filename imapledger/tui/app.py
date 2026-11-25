@@ -23,7 +23,21 @@ from ..mail_service import MailService, MessageDetail
 from ..mailbox import FolderInfo
 from ..message import MailSummary
 from ..remote_images import RemoteImageLoader
-from ..rules import RuleSet, load_rules, rules_path_for_config
+from ..rule_service import RuleService
+from ..rule_test_service import RuleTestService
+from ..rules import MailRule, RuleSet, load_rules, rules_path_for_config
+from ..settings_service import SettingsService
+from .rule_screens import (
+    ActionCenterScreen,
+    DeletePolicyConfirmation,
+    OutcomeActionEditorScreen,
+    OutcomePolicyScreen,
+    RuleCenterScreen,
+    RuleDeleteConfirmation,
+    RuleDetailScreen,
+    RuleEditorScreen,
+    RuleTestResultScreen,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -46,6 +60,11 @@ def _image_guidance(recommendation: ImageRecommendation) -> str:
         ImageRecommendation.SAFE_TO_IGNORE: "no important meaning appears to be lost",
         ImageRecommendation.REVIEW: "uncertain assessment; review using a trusted rich mail view",
     }[recommendation]
+
+
+def _format_action(action: Any) -> str:
+    label = action.action.value.upper()
+    return f"{label} -> {action.destination}" if action.destination else label
 
 
 class FolderListItem(ListItem):
@@ -73,23 +92,30 @@ class ApplyConfirmation(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         action = self.analysis.configured_action
-        action_text = action.action.value.upper() if action else "UNKNOWN"
-        if action is not None and action.destination:
-            action_text += f" to {action.destination}"
+        action_label = _format_action(action) if action is not None else "UNKNOWN"
+        current_action = MailReviewApp._current_action_label(self.analysis, action)
         warning = (
             "Permanently delete this exact message? UID EXPUNGE cannot be undone by imapledger."
             if action is not None and action.action.value == "delete"
-            else "Apply the configured action to this exact message?"
+            else "Apply this action to the exact selected message?"
+        )
+        classification = (
+            self.analysis.outcome.value.upper()
+            if self.analysis.outcome is not None
+            else f"routing rule {self.analysis.rule_id}"
+            if self.analysis.rule_id
+            else "unavailable"
         )
         with Vertical(id="confirm-box"):
             yield Static(warning, markup=False)
             yield Static(
-                f"Outcome: {self.analysis.outcome.value.upper() if self.analysis.outcome else 'RULE'}\n"
-                f"Action: {action_text}\nFolder: {self.analysis.folder}\nUID: {self.analysis.uid}",
+                f"Classification: {classification}\n"
+                f"Current action: {current_action}\n"
+                f"Folder: {self.analysis.folder}\nUID: {self.analysis.uid}",
                 markup=False,
             )
             with Horizontal(id="confirm-buttons"):
-                yield Button("Apply", variant="error" if action_text == "DELETE" else "primary", id="apply")
+                yield Button("Apply", variant="error" if action_label.startswith("DELETE") else "primary", id="apply")
                 yield Button("Cancel", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -243,8 +269,22 @@ class HelpScreen(ModalScreen[None]):
                     "  i               analyze embedded images only\n"
                     "  I               review remote-image loading (privacy-sensitive)\n\n"
                     "Actions\n"
-                    "  a               apply configured action; confirmation required\n"
+                    "  a               apply current action or open Action Center\n"
+                    "  R               open Rule Center\n"
+                    "  Outcome policy edits global SPAM/NOT_SPAM/REVIEW actions.\n"
+                    "  SPAM DELETE affects future apply operations, not saved mail.\n"
+                    "  Rule save-only never changes the current mailbox message.\n"
                     "  r               refresh\n\n"
+                    "Rules\n"
+                    "  j/k             move through rules\n"
+                    "  Enter           show selected rule\n"
+                    "  n/e             new/edit rule\n"
+                    "  Space           enable/disable rule\n"
+                    "  t               bounded read-only test\n"
+                    "  d               remove rule\n"
+                    "  [ / ]           move rule priority\n\n"
+                    "Classifier verdict, configured outcome action, and routing rules are separate. "
+                    "Routing rules support KEEP/MOVE only.\n"
                     "General\n"
                     "  h / ?           show help (h closes this page)\n"
                     "  Escape          close help\n"
@@ -268,7 +308,8 @@ class MailReviewApp(App[None]):
         Binding("r", "refresh", "Refresh"),
         Binding("c", "classify", "Classify"),
         Binding("C", "reclassify", "Reclassify"),
-        Binding("a", "apply", "Apply"),
+        Binding("a", "apply", "Action"),
+        Binding("R", "rules", "Rules"),
         Binding("i", "analyze_images", "Analyze images"),
         Binding("I", "remote_images", "Remote images"),
         Binding("tab", "next_pane", "Next pane", priority=True),
@@ -302,6 +343,9 @@ class MailReviewApp(App[None]):
         mail_service: Any | None = None,
         settings: Settings | None = None,
         rules: RuleSet | None = None,
+        rule_service: RuleService | None = None,
+        rule_test_service: RuleTestService | None = None,
+        settings_service: SettingsService | None = None,
         analysis_service: Any | None = None,
         action_service: Any | None = None,
         image_analysis_service: Any | None = None,
@@ -311,7 +355,12 @@ class MailReviewApp(App[None]):
         self.config = config
         self.mail_service = mail_service
         self.settings = settings
-        self.rules = rules
+        self.settings_service = settings_service or (SettingsService(config) if settings else None)
+        self.rules = rules or RuleSet()
+        self.rule_service = rule_service or (
+            RuleService(rules_path_for_config(config), source_folders=settings.spam.folders) if settings else None
+        )
+        self.rule_test_service = rule_test_service
         self.analysis_service = analysis_service
         self.action_service = action_service
         self.image_analysis_service = image_analysis_service
@@ -832,33 +881,95 @@ class MailReviewApp(App[None]):
 
     def _render_analysis(self, analysis: MessageAnalysis) -> None:
         action = analysis.configured_action
-        action_label = action.action.value.upper() if action else "unavailable"
-        if action is not None and action.destination:
-            action_label += f" to {action.destination}"
-        persisted = analysis.persisted_outcome.value.upper() if analysis.persisted_outcome else "none"
-        lines = ["Analysis", f"Persisted state: {persisted}"]
-        if analysis.decision_source == "persisted-state":
-            lines.append("Classifier: not run (stored state)")
-        elif analysis.rule_id:
-            lines.extend((f"Rule: {analysis.rule_id}", "Classifier: not run (deterministic rule)"))
+        action_label = _format_action(action) if action is not None else "not configured"
+        lines = ["Analysis"]
+        if analysis.decision_source == "rule":
+            lines.extend(
+                (
+                    "  Source: deterministic rule",
+                    f"  Rule: {analysis.rule_id}",
+                    "  Classifier: not run",
+                    "",
+                    "Action",
+                    f"  {self._current_action_label(analysis, action)}",
+                    "",
+                    "Next",
+                    "  a Apply",
+                    "  R View/edit rule",
+                )
+            )
+        elif analysis.decision_source == "persisted-state":
+            outcome = analysis.persisted_outcome.value.upper() if analysis.persisted_outcome else "-"
+            lines.extend(
+                (
+                    "  Source: persisted state",
+                    f"  Stored outcome: {outcome}",
+                    "  Classifier: not run",
+                    "",
+                    "Policy",
+                    f"  Configured {outcome} action: {action_label}",
+                    f"  Effect: {self._action_effect(action)}",
+                    "",
+                    "Next",
+                    "  a Choose/apply message action",
+                    "  R Rules",
+                )
+            )
         elif analysis.verdict is not None:
-            lines.append(f"Outcome: {analysis.outcome.value.upper() if analysis.outcome else '-'}")
-            lines.append(f"Verdict: {analysis.verdict.name}")
+            outcome = analysis.outcome.value.upper() if analysis.outcome else "-"
+            lines.extend(
+                (
+                    "  Source: semantic classifier",
+                    f"  Outcome: {outcome}",
+                    f"  Verdict: {analysis.verdict.name}",
+                )
+            )
             if analysis.signals is not None:
                 lines.append(
-                    "Signals: "
+                    "  Signals: "
                     f"bulk {analysis.signals.unsolicited_bulk:.2f}, phishing {analysis.signals.phishing_or_scam:.2f}, "
                     f"identity {analysis.signals.identity_deception:.2f}, "
                     f"legitimate {analysis.signals.legitimate_expected:.2f}, "
                     f"delete {analysis.signals.delete_safe:.2f}"
                 )
-            lines.append(f"Reasons: {', '.join(analysis.reasons) or '-'}")
+            lines.extend(
+                (
+                    f"  Reasons: {', '.join(analysis.reasons) or '-'}",
+                    "",
+                    "Policy",
+                    f"  Configured {outcome} action: {action_label}",
+                    f"  Effect: {self._action_effect(action)}",
+                    "",
+                    "Next",
+                    "  a Choose/apply message action",
+                    "  R Rules",
+                )
+            )
         else:
-            lines.append("Classifier: not run")
-        lines.append(f"Configured action: {action_label}")
+            lines.extend(("  Source: none", "  Classifier: not run"))
         if self._selected_folder not in (self.settings.spam.folders if self.settings else ()):
             lines.append("Automation unavailable: this folder is not configured in spam.folders.")
         self.query_one("#analysis", Static).update("\n".join(lines))
+
+    @staticmethod
+    def _action_effect(action: Any) -> str:
+        if action is None:
+            return "no mailbox action is configured"
+        if action.action.value == "keep":
+            return "no move/delete"
+        if action.action.value == "move":
+            return f"move to {action.destination}"
+        return "delete this exact UID after confirmation"
+
+    @staticmethod
+    def _current_action_label(analysis: MessageAnalysis, action: Any) -> str:
+        if action is None:
+            return "no mailbox action is configured"
+        if action.action.value == "move":
+            return f"MOVE UID {analysis.uid} from {analysis.folder} to {action.destination}"
+        if action.action.value == "delete":
+            return f"DELETE UID {analysis.uid} from {analysis.folder}"
+        return f"KEEP UID {analysis.uid} in {analysis.folder} (no move/delete)"
 
     def action_classify(self) -> None:
         self.run_worker(self._classify(reclassify=False), group="classification", exclusive=True, exit_on_error=False)
@@ -889,23 +1000,349 @@ class MailReviewApp(App[None]):
             self._analysis = analysis
             self._render_analysis(analysis)
             _LOG.debug("ui.classify duration_ms=%.1f result_count=1", (time.monotonic() - started) * 1000)
-            outcome = analysis.outcome.value.upper() if analysis.outcome else "RULE"
-            self._set_status(f"Classification complete: {outcome}.")
+            if analysis.decision_source == "rule":
+                self._set_status(f"Analysis complete: routing rule {analysis.rule_id} matched.")
+            elif analysis.decision_source == "persisted-state":
+                outcome = analysis.persisted_outcome.value.upper() if analysis.persisted_outcome else "unknown"
+                self._set_status(f"Analysis complete: using stored {outcome} state.")
+            else:
+                outcome = analysis.outcome.value.upper() if analysis.outcome else "unknown"
+                self._set_status(f"Classification complete: {outcome}.")
         except Exception as exc:
             self._set_status(f"Classification failed: {type(exc).__name__}")
 
     def action_apply(self) -> None:
-        analysis = self._analysis
+        detail = self._detail
+        if detail is None or detail.item.message is None:
+            self._set_status("Select a message first.")
+            return
         if self._action_running:
             self._set_status("An action is already running.")
             return
-        if analysis is None or analysis.configured_action is None:
-            self._set_status("Classify the selected message before applying an action.")
+        analysis = self._analysis
+        if analysis is None:
+            self._set_status("Classify this message first with c.")
             return
-        if self.settings is None or analysis.folder not in self.settings.spam.folders:
-            self._set_status("Automation unavailable: folder is not configured in spam.folders.")
+        if self.settings is None:
+            self._set_status("Action services are unavailable.")
             return
-        self.push_screen(ApplyConfirmation(analysis), self._confirmed_action)
+        out_of_scope = analysis.folder not in self.settings.spam.folders
+        action = analysis.configured_action
+        if not out_of_scope and action is not None and action.action.value in {"move", "delete"}:
+            self.push_screen(ApplyConfirmation(analysis), self._confirmed_action)
+            return
+        description = self._action_center_description(analysis)
+        warning = (
+            f"Automation is disabled for {analysis.folder} because it is not configured in spam.folders. "
+            "You may inspect rules or draft a rule, but this UI will not expand the automation scope."
+            if out_of_scope
+            else None
+        )
+        keep_label = (
+            "Apply KEEP / leave the message unchanged"
+            if analysis.decision_source == "rule"
+            else "Apply KEEP / persist classification"
+        )
+        self.push_screen(
+            ActionCenterScreen(description, scope_warning=warning, keep_label=keep_label),
+            self._action_center_selected,
+        )
+
+    def _action_center_description(self, analysis: MessageAnalysis) -> str:
+        outcome = analysis.outcome.value.upper() if analysis.outcome else "-"
+        verdict = analysis.verdict.name if analysis.verdict is not None else "not available"
+        action = analysis.configured_action
+        configured = action.action.value.upper() if action is not None else "not configured"
+        if action is not None and action.destination:
+            configured += f" -> {action.destination}"
+        effect = "no move/delete" if action and action.action.value == "keep" else "mailbox action available"
+        if analysis.rule_id:
+            return (
+                f"Decision source: deterministic routing rule\n  Rule: {analysis.rule_id}\n"
+                f"  Action: {configured}\n  Effect: {effect}\n\nWhat do you want to do?"
+            )
+        return (
+            f"Classification\n  Outcome: {outcome}\n  Verdict: {verdict}\n\n"
+            f"Outcome policy\n  Configured {outcome} action: {configured}\n"
+            f"  Effect: {effect}\n\n"
+            "What do you want to do?"
+        )
+
+    def _action_center_selected(self, choice: str) -> None:
+        if choice == "keep":
+            if self._analysis is not None:
+                self.push_screen(ApplyConfirmation(self._analysis), self._confirmed_action)
+        elif choice == "create-rule":
+            self._open_rule_editor()
+        elif choice == "rules":
+            self.action_rules()
+        elif choice == "policy":
+            self._open_outcome_policy()
+
+    def action_rules(self) -> None:
+        if self.rule_service is None:
+            self._set_status("Rule management is unavailable.")
+            return
+        try:
+            rules = self.rule_service.load()
+        except Exception as exc:
+            self._set_status(f"Could not load rules: {type(exc).__name__}")
+            return
+        self.rules = rules
+        self.push_screen(RuleCenterScreen(rules), self._rule_center_selected)
+
+    def _open_outcome_policy(self) -> None:
+        if self.settings is None or self.settings_service is None:
+            self._set_status("Outcome policy editing is unavailable.")
+            return
+        self.push_screen(OutcomePolicyScreen(self.settings), self._outcome_policy_selected)
+
+    def _outcome_policy_selected(self, outcome: SpamOutcome | None) -> None:
+        if outcome is None or self.settings is None:
+            return
+        folders = tuple(
+            folder.name
+            for folder in self.folders
+            if folder.selectable
+            and folder.name not in self.settings.spam.folders
+            and (self.settings.config_store is None or folder.name != self.settings.config_store.folder)
+        )
+        action = getattr(self.settings.spam.actions, outcome.value)
+        self.push_screen(
+            OutcomeActionEditorScreen(outcome, action, folders),
+            lambda result: self._outcome_action_selected(outcome, result, folders),
+        )
+
+    def _outcome_action_selected(
+        self,
+        outcome: SpamOutcome,
+        result: tuple[Any, bool] | None,
+        destinations: tuple[str, ...],
+    ) -> None:
+        if result is None:
+            self._set_status("Outcome policy edit cancelled. No changes made.")
+            return
+        action, explicit_delete = result
+        if action.action.value == "move" and action.destination not in destinations:
+            self._set_status(f"Destination {action.destination} is not an available policy destination.")
+            return
+        if action.action.value == "delete":
+            if outcome is not SpamOutcome.SPAM or not explicit_delete:
+                self._set_status("DELETE requires explicit global SPAM policy confirmation.")
+                return
+            self.push_screen(
+                DeletePolicyConfirmation(),
+                lambda confirmed: self._delete_policy_confirmed(outcome, action, confirmed),
+            )
+            return
+        self.run_worker(
+            self._save_outcome_policy(outcome, action),
+            group="settings-mutation",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    def _delete_policy_confirmed(self, outcome: SpamOutcome, action: Any, confirmed: bool) -> None:
+        if not confirmed:
+            self._set_status("Global DELETE policy change cancelled. No changes made.")
+            return
+        self.run_worker(
+            self._save_outcome_policy(outcome, action),
+            group="settings-mutation",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _save_outcome_policy(self, outcome: SpamOutcome, action: Any) -> None:
+        try:
+            if self.settings_service is None:
+                raise RuntimeError("settings service unavailable")
+            result = await asyncio.to_thread(self.settings_service.set_spam_action, outcome, action)
+            self.settings = result.settings
+            for service in (self.analysis_service, self.action_service):
+                if service is not None and hasattr(service, "set_settings"):
+                    service.set_settings(result.settings)
+            await self._reanalyze_current_message()
+            before = _format_action(result.previous_action)
+            after = _format_action(result.action)
+            self._activity.append(f"Policy changed: {outcome.value.upper()} {before} -> {after}")
+            self._render_activity()
+            self._set_status(f"Policy changed: {outcome.value.upper()} {before} -> {after}.")
+        except Exception as exc:
+            self._set_status(f"Policy save failed: {type(exc).__name__}.")
+
+    def _open_rule_editor(self, rule: MailRule | None = None) -> None:
+        if self.rule_service is None or self.settings is None:
+            self._set_status("Rule management is unavailable.")
+            return
+        detail = self._detail
+        message = detail.item.message if detail is not None else None
+        screen = RuleEditorScreen(
+            rule=rule,
+            message=message,
+            current_folder=self._selected_folder,
+            existing_ids=tuple(item.id for item in self.rules.rules),
+            source_folders=self.settings.spam.folders,
+        )
+        self.push_screen(screen, lambda result: self._rule_editor_saved(result, rule.id if rule else None))
+
+    def _rule_editor_saved(self, result: tuple[MailRule, bool] | None, existing_id: str | None) -> None:
+        if result is None:
+            self._set_status("Rule edit cancelled. No changes made.")
+            return
+        rule, apply_current = result
+        destinations = {folder.name for folder in self.folders if folder.selectable}
+        if rule.action.action.value == "move" and rule.action.destination not in destinations:
+            self._set_status(f"Destination {rule.action.destination} is not an available folder.")
+            return
+        self.run_worker(
+            self._save_rule(rule, existing_id=existing_id, apply_current=apply_current),
+            group="rule-mutation",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _save_rule(self, rule: MailRule, *, existing_id: str | None, apply_current: bool) -> None:
+        try:
+            if self.rule_service is None:
+                raise RuntimeError("rule service unavailable")
+            if existing_id is not None:
+                result = await asyncio.to_thread(self.rule_service.update, existing_id, rule)
+            else:
+                result = await asyncio.to_thread(self.rule_service.add, rule)
+            self._replace_rules(result.rules)
+            await self._reanalyze_current_message()
+            self._activity.append(f"Rule {'updated' if existing_id else 'saved'}: {rule.id}")
+            self._render_activity()
+            if apply_current:
+                if self._analysis is None or self._analysis.rule_id != rule.id:
+                    self._set_status("Rule saved, but it is not the winning rule for the current message.")
+                    return
+                self._set_status(f"Rule saved: {rule.id}. Confirm the exact message action.")
+                self.push_screen(ApplyConfirmation(self._analysis), self._confirmed_action)
+            else:
+                self._set_status(f"Saved rule {rule.id}. Current message analysis refreshed.")
+            if not apply_current:
+                self.action_rules()
+        except Exception as exc:
+            self._set_status(f"Rule save failed: {type(exc).__name__}.")
+
+    def _rule_center_selected(self, selection: tuple[str, str | None]) -> None:
+        action, rule_id = selection
+        if action == "close":
+            return
+        if action == "new":
+            self._open_rule_editor()
+            return
+        rule = next((item for item in self.rules.rules if item.id == rule_id), None)
+        if rule is None:
+            self._set_status("Select a rule first.")
+            return
+        if action == "edit":
+            self._open_rule_editor(rule)
+        elif action == "detail":
+            detail = self._detail
+            message = detail.item.message if detail else None
+            winning = self.rules.first_match(detail.folder, message) if message and detail else None
+            matches = bool(message and detail and detail.folder in rule.source_folders and rule.match.matches(message))
+            self.push_screen(
+                RuleDetailScreen(
+                    rule,
+                    self.rules.rules.index(rule) + 1,
+                    len(self.rules.rules),
+                    matches_current=matches,
+                    winning=winning is not None and winning.id == rule.id,
+                ),
+                lambda _: self.action_rules(),
+            )
+        elif action == "remove":
+            self.push_screen(
+                RuleDeleteConfirmation(rule),
+                lambda confirm: self._remove_rule_confirmed(rule.id, confirm),
+            )
+        elif action == "test":
+            self.run_worker(self._test_rule(rule), group="rule-test", exclusive=True, exit_on_error=False)
+        else:
+            self.run_worker(
+                self._mutate_rule(action, rule.id),
+                group="rule-mutation",
+                exclusive=True,
+                exit_on_error=False,
+            )
+
+    def _remove_rule_confirmed(self, rule_id: str, confirmed: bool) -> None:
+        if confirmed:
+            self.run_worker(
+                self._mutate_rule("remove", rule_id),
+                group="rule-mutation",
+                exclusive=True,
+                exit_on_error=False,
+            )
+        else:
+            self._set_status("Rule removal cancelled. No changes made.")
+
+    async def _mutate_rule(self, action: str, rule_id: str) -> None:
+        try:
+            if self.rule_service is None:
+                raise RuntimeError("rule service unavailable")
+            rule = next(item for item in self.rules.rules if item.id == rule_id)
+            if action == "toggle":
+                result = await asyncio.to_thread(self.rule_service.set_enabled, rule_id, not rule.enabled)
+            elif action == "up":
+                result = await asyncio.to_thread(self.rule_service.move, rule_id, -1)
+            elif action == "down":
+                result = await asyncio.to_thread(self.rule_service.move, rule_id, 1)
+            elif action == "remove":
+                result = await asyncio.to_thread(self.rule_service.remove, rule_id)
+            else:
+                return
+            if result.changed_rule_id is None:
+                self._set_status(result.detail)
+                return
+            self._replace_rules(result.rules)
+            await self._reanalyze_current_message()
+            self._activity.append(result.detail)
+            self._render_activity()
+            self._set_status(result.detail)
+            self.action_rules()
+        except Exception as exc:
+            self._set_status(f"Rule change failed: {type(exc).__name__}.")
+
+    async def _test_rule(self, rule: MailRule) -> None:
+        if self.rule_test_service is None:
+            self._set_status("Rule testing is unavailable in this session.")
+            return
+        try:
+            result = await asyncio.to_thread(self.rule_test_service.test, rule, limit=50)
+            lines = [f"Rule test: {rule.id}", f"Scanned: {result.scanned}", f"Matches: {len(result.matches)}", ""]
+            lines.extend(f"{item.folder} UID {item.uid}  {item.sender}  {item.subject}" for item in result.matches)
+            lines.append("\nRead-only. No messages changed.")
+            self.push_screen(RuleTestResultScreen("\n".join(lines)))
+        except Exception as exc:
+            self._set_status(f"Rule test failed: {type(exc).__name__}.")
+
+    def _replace_rules(self, rules: RuleSet) -> None:
+        self.rules = rules
+        for service in (self.analysis_service, self.action_service):
+            if service is not None and hasattr(service, "set_rules"):
+                service.set_rules(rules)
+
+    async def _reanalyze_current_message(self) -> None:
+        detail = self._detail
+        if detail is None or detail.item.message is None or self.analysis_service is None:
+            return
+        state = detail.persisted_state.outcome if detail.persisted_state else None
+        self._analysis = await asyncio.to_thread(
+            self.analysis_service.analyze,
+            detail.folder,
+            detail.item.message,
+            persisted_outcome=state,
+            prefer_rules=True,
+        )
+        self._render_analysis(self._analysis)
+
+    def _render_activity(self) -> None:
+        self.query_one("#activity", Static).update("Activity\n" + "\n".join(self._activity[-20:]))
 
     def _confirmed_action(self, confirmed: bool) -> None:
         if confirmed and not self._action_running:
@@ -919,7 +1356,7 @@ class MailReviewApp(App[None]):
         detail = self._detail
         if analysis is None or detail is None or self.action_service is None:
             return
-        self._set_status("Applying configured action in a background thread…")
+        self._set_status("Applying confirmed mailbox action in a background thread…")
         started = time.monotonic()
         try:
             receipt: ActionReceipt = await asyncio.to_thread(
@@ -1098,6 +1535,8 @@ def run(config: Path) -> None:
         password = resolve_credential(settings.imap).password
         mail_service = MailService(settings, password)
         analysis_service = AnalysisService(settings, rules)
+        rule_service = RuleService(rules_path_for_config(config), source_folders=settings.spam.folders)
+        rule_test_service = RuleTestService(settings, password)
         image_analysis_service = ImageAnalysisService()
         remote_image_loader = RemoteImageLoader()
         action_service = ActionService(settings, password, rules)
@@ -1106,6 +1545,8 @@ def run(config: Path) -> None:
             mail_service=mail_service,
             settings=settings,
             rules=rules,
+            rule_service=rule_service,
+            rule_test_service=rule_test_service,
             analysis_service=analysis_service,
             action_service=action_service,
             image_analysis_service=image_analysis_service,

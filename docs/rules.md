@@ -89,7 +89,15 @@ imapledger rule show mailer-daemon-gmx-net
 imapledger rule remove mailer-daemon-gmx-net
 ```
 
-`remove` asks for confirmation with a default of no. Pass `--yes` to remove without the prompt. There are no commands in this release for manually adding, editing, enabling, or disabling rules.
+`remove` asks for confirmation with a default of no. Pass `--yes` to remove without the prompt. The CLI currently has no commands for manually adding, editing, enabling, or disabling rules. The interactive TUI provides those operations without using Jev.
+
+## Manage rules in the TUI
+
+Run `imapledger ui` and press `R` to open the Rule Center. Rules are ordered by priority; the first enabled matching rule wins. Create and edit screens use structured matcher fields, source folders, and actions. Manual creation does not invoke Jev or require it to be installed. Sources remain a non-empty subset of `spam.folders`; MOVE destinations must already exist and cannot be configured source folders. Routing rules support KEEP and MOVE only, never DELETE.
+
+Saving a rule writes the local rules file atomically and reloads it into the running session. Save-only does not apply the rule to a message. The separate save-and-apply flow saves first, re-resolves the selected folder and UID, and asks for confirmation before applying only to that exact message. It does not create folders or change `spam.folders`.
+
+The Rule Center can test a rule against a bounded, read-only message window. Testing does not classify or mutate messages. The Action Center, opened with `a`, also links to global outcome policy settings. Those settings apply to future explicit actions, not immediately to stored messages. A global SPAM DELETE policy requires a separate warning and confirmation; it does not delete mail when saved.
 
 ## Test a rule read-only
 

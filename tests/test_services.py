@@ -34,6 +34,28 @@ def test_analysis_service_uses_persisted_state_without_classifier():
     assert result.signals is None
 
 
+def test_analysis_service_explicit_rule_precedence_overrides_persisted_state() -> None:
+    rule = MailRule(
+        id="known-sender",
+        enabled=True,
+        source_folders=("Spam",),
+        action=MessageAction(_settings().spam.actions.not_spam.action),
+        match=RuleMatch(from_address="sender@example.org"),
+    )
+    service = AnalysisService(
+        _settings(),
+        RuleSet(),
+        classifier_factory=lambda **kwargs: (_ for _ in ()).throw(AssertionError("classifier must not run")),
+    )
+    service.set_rules(RuleSet((rule,)))
+
+    result = service.analyze("Spam", _message(), persisted_outcome=SpamOutcome.REVIEW, prefer_rules=True)
+
+    assert result.decision_source == "rule"
+    assert result.rule_id == "known-sender"
+    assert result.persisted_outcome is SpamOutcome.REVIEW
+
+
 def test_analysis_service_checks_deterministic_rules_before_classifier():
     rule = MailRule(
         id="known-sender",

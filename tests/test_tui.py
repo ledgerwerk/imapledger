@@ -7,16 +7,28 @@ from dataclasses import replace
 from pathlib import Path
 
 from imapledger.action_service import ActionReceipt
-from imapledger.analysis_service import MessageAnalysis
+from imapledger.analysis_service import AnalysisService, MessageAnalysis
 from imapledger.classification_state import SpamOutcome
-from imapledger.config import ActionKind, ImapSettings, MessageAction, Settings, SpamActions, SpamSettings
+from imapledger.config import (
+    ActionKind,
+    ImapSettings,
+    MessageAction,
+    Settings,
+    SpamActions,
+    SpamSettings,
+    load_settings,
+    write_settings,
+)
 from imapledger.image_analysis import ImageAnalysisReport, ImageAssessment, ImageRecommendation
 from imapledger.mail_service import MessageDetail, MessagePage
 from imapledger.mailbox import FolderInfo, MailboxItem, MessageSort
 from imapledger.message import MailImage, MailSummary, RemoteImageRef, parse_message
 from imapledger.policy import SpamVerdict
-from imapledger.rules import RuleSet
-from imapledger.tui.app import MailReviewApp
+from imapledger.rule_service import RuleService
+from imapledger.rules import MailRule, RuleMatch, RuleSet
+from imapledger.settings_service import SettingsService
+from imapledger.tui.app import ApplyConfirmation, MailReviewApp
+from imapledger.tui.rule_screens import ActionCenterScreen, RuleCenterScreen
 
 SETTINGS = Settings(
     imap=ImapSettings(host="imap.example.org", username="user@example.org"),
@@ -78,17 +90,29 @@ class FakeMailService:
 
 
 class FakeAnalysisService:
+    def __init__(self, outcome: SpamOutcome = SpamOutcome.REVIEW) -> None:
+        self.settings = SETTINGS
+        self.outcome = outcome
+
+    def set_settings(self, settings: Settings) -> None:
+        self.settings = settings
+
     def analyze(self, folder, message, **kwargs):
+        verdict = {
+            SpamOutcome.SPAM: SpamVerdict.DELETE,
+            SpamOutcome.NOT_SPAM: SpamVerdict.KEEP,
+            SpamOutcome.REVIEW: SpamVerdict.REVIEW,
+        }[self.outcome]
         return MessageAnalysis(
             folder=folder,
             uid=message.uid,
             persisted_outcome=kwargs.get("persisted_outcome"),
             rule_id=None,
-            outcome=SpamOutcome.REVIEW,
-            verdict=SpamVerdict.REVIEW,
+            outcome=self.outcome,
+            verdict=verdict,
             signals=None,
             reasons=("needs-review",),
-            configured_action=SETTINGS.spam.actions.review,
+            configured_action=getattr(self.settings.spam.actions, self.outcome.value),
             decision_source="semantic",
         )
 
@@ -155,7 +179,11 @@ class ImageMailService(FakeMailService):
 class FakeActionService:
     def __init__(self):
         self.calls = []
+        self.settings = SETTINGS
         self.fail = False
+
+    def set_settings(self, settings: Settings) -> None:
+        self.settings = settings
 
     def apply(self, analysis, *, uidvalidity, confirmed_by_user):
         self.calls.append((analysis, uidvalidity, confirmed_by_user))
@@ -164,7 +192,7 @@ class FakeActionService:
             uidvalidity=uidvalidity,
             uid=analysis.uid,
             requested_action=analysis.configured_action,
-            outcome=analysis.outcome.value,
+            outcome=analysis.outcome.value if analysis.outcome else None,
             decision_source=analysis.decision_source,
             applied=not self.fail,
             confirmed=not self.fail,
@@ -197,7 +225,15 @@ async def _browse_classify_apply():
         await pilot.press("c")
         await pilot.pause()
         assert app._analysis is not None
+        analysis_text = str(app.query_one("#analysis", Static).render())
+        assert "Source: semantic classifier" in analysis_text
+        assert "Outcome: REVIEW" in analysis_text
+        assert "Verdict: REVIEW" in analysis_text
+        assert "Configured REVIEW action: KEEP" in analysis_text
+        assert "Effect: no move/delete" in analysis_text
         await pilot.press("a")
+        await pilot.pause()
+        await pilot.click("#keep")
         await pilot.pause()
         folder_list_calls_before_action = len(mail.folder_list_modes)
         await pilot.click("#apply")
@@ -213,6 +249,8 @@ async def _browse_classify_apply():
         await pilot.press("c")
         await pilot.pause()
         await pilot.press("a")
+        await pilot.pause()
+        await pilot.click("#keep")
         await pilot.pause()
         await pilot.click("#apply")
         await pilot.pause()
@@ -708,3 +746,302 @@ async def _remote_image_loading_requires_explicit_confirmation():
 
 def test_remote_images_require_confirmation_and_cancel_is_default():
     asyncio.run(_remote_image_loading_requires_explicit_confirmation())
+
+
+async def _action_center_and_rule_center_are_local(tmp_path: Path) -> None:
+
+    mail = FakeMailService()
+    rules_path = tmp_path / "rules.toml"
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=mail,
+        settings=SETTINGS,
+        rules=RuleSet(),
+        rule_service=RuleService(rules_path, source_folders=("Spam",)),
+        analysis_service=FakeAnalysisService(),
+        action_service=FakeActionService(),
+    )
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+        await app._open_message("Spam", 9)
+        app._analysis = MessageAnalysis(
+            folder="Spam",
+            uid=9,
+            persisted_outcome=None,
+            rule_id=None,
+            outcome=SpamOutcome.SPAM,
+            verdict=SpamVerdict.DELETE,
+            signals=None,
+            reasons=("strong-phishing-or-scam",),
+            configured_action=SETTINGS.spam.actions.spam,
+            decision_source="semantic",
+        )
+        await pilot.press("a")
+        await pilot.pause()
+        assert isinstance(app.screen, ActionCenterScreen)
+        assert "Outcome: SPAM" in app.screen.description
+        assert "Verdict: DELETE" in app.screen.description
+        assert "Configured SPAM action: KEEP" in app.screen.description
+        assert "no move/delete" in app.screen.description
+        app.screen.query_one("#create-rule")
+        await pilot.press("escape")
+        await pilot.press("R")
+        await pilot.pause()
+        assert isinstance(app.screen, RuleCenterScreen)
+        assert mail.requested_folders == []
+        assert not rules_path.exists()
+
+
+def test_action_center_explains_classifier_policy_mismatch_and_rule_center_is_local(tmp_path: Path) -> None:
+    asyncio.run(_action_center_and_rule_center_are_local(tmp_path))
+
+
+async def _create_rule_save_only_does_not_apply_mail(tmp_path: Path) -> None:
+    mail = FakeMailService()
+    actions = FakeActionService()
+    rule_path = tmp_path / "rules.toml"
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=mail,
+        settings=SETTINGS,
+        rules=RuleSet(),
+        rule_service=RuleService(rule_path, source_folders=("Spam",)),
+        analysis_service=FakeAnalysisService(),
+        action_service=actions,
+    )
+
+    async with app.run_test(size=(110, 36)) as pilot:
+        await pilot.pause()
+        await app._open_message("Spam", 9)
+        await pilot.press("c")
+        await pilot.pause()
+        await pilot.press("a")
+        await pilot.pause()
+        await pilot.click("#create-rule")
+        await pilot.pause()
+        assert app.screen.__class__.__name__ == "RuleEditorScreen"
+        app.screen.query_one("#rule-editor").scroll_end()
+        await pilot.pause()
+        await pilot.click("#save")
+        await pilot.pause(0.1)
+        assert [rule.id for rule in RuleService(rule_path, source_folders=("Spam",)).load().rules] == [
+            "sender-example-org"
+        ]
+        assert actions.calls == []
+        assert "Saved rule" in str(app.query_one("#status").render())
+
+
+def test_create_rule_save_only_persists_without_mail_action(tmp_path: Path) -> None:
+    asyncio.run(_create_rule_save_only_does_not_apply_mail(tmp_path))
+
+
+async def _create_rule_save_and_apply_requires_confirmation(tmp_path: Path) -> None:
+    from textual.widgets import Input
+
+    mail = FakeMailService()
+    actions = FakeActionService()
+    rule_path = tmp_path / "rules.toml"
+    rule_service = RuleService(rule_path, source_folders=("Spam",))
+    analysis_service = AnalysisService(
+        SETTINGS,
+        RuleSet(),
+        classifier_factory=lambda **kwargs: (_ for _ in ()).throw(AssertionError()),
+    )
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=mail,
+        settings=SETTINGS,
+        rules=RuleSet(),
+        rule_service=rule_service,
+        analysis_service=FakeAnalysisService(),
+        action_service=actions,
+    )
+
+    async with app.run_test(size=(110, 36)) as pilot:
+        await pilot.pause()
+        await app._open_message("Spam", 9)
+        await pilot.press("c")
+        await pilot.pause()
+        app.analysis_service = analysis_service
+        await pilot.press("a")
+        await pilot.pause()
+        assert isinstance(app.screen, ActionCenterScreen)
+        await pilot.click("#create-rule")
+        await pilot.pause()
+        app.screen.query_one("#rule-action", Input).value = "move"
+        app.screen.query_one("#rule-destination", Input).value = "INBOX"
+        await pilot.click("#save-apply")
+        await pilot.pause(0.1)
+        assert [rule.id for rule in rule_service.load().rules] == ["sender-example-org"]
+        assert isinstance(app.screen, ApplyConfirmation)
+        assert app._analysis.rule_id == "sender-example-org"
+        assert app._analysis.decision_source == "rule"
+        analysis_text = str(app.query_one("#analysis").render())
+        assert "Source: deterministic rule" in analysis_text
+        assert "Classifier: not run" in analysis_text
+        assert "MOVE UID 9 from Spam to INBOX" in analysis_text
+        assert actions.calls == []
+        confirmation_text = str(app.screen.query_one("#confirm-box").children[1].render())
+        assert "MOVE UID 9 from Spam to INBOX" in confirmation_text
+        await pilot.click("#apply")
+        await pilot.pause(0.1)
+        assert len(actions.calls) == 1
+        assert actions.calls[0][0].rule_id == "sender-example-org"
+        assert actions.calls[0][2] is True
+
+
+def test_create_rule_save_and_apply_persists_before_confirmation(tmp_path: Path) -> None:
+    asyncio.run(_create_rule_save_and_apply_requires_confirmation(tmp_path))
+
+
+async def _rule_center_toggle_and_cancel_remove(tmp_path: Path) -> None:
+    mail = FakeMailService()
+    rule_path = tmp_path / "rules.toml"
+    rule_service = RuleService(rule_path, source_folders=("Spam",))
+    rule_service.add(
+        MailRule(
+            id="sender-rule",
+            enabled=True,
+            source_folders=("Spam",),
+            action=MessageAction(ActionKind.KEEP),
+            match=RuleMatch(from_address="sender@example.org"),
+        )
+    )
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=mail,
+        settings=SETTINGS,
+        rules=rule_service.load(),
+        rule_service=rule_service,
+        analysis_service=FakeAnalysisService(),
+        action_service=FakeActionService(),
+    )
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+        await pilot.press("R")
+        await pilot.pause()
+        await pilot.press("space")
+        await pilot.pause(0.1)
+        assert not rule_service.load().rules[0].enabled
+        await pilot.press("d")
+        await pilot.pause()
+        assert app.screen.__class__.__name__ == "RuleDeleteConfirmation"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert [rule.id for rule in rule_service.load().rules] == ["sender-rule"]
+
+
+def test_rule_center_toggle_and_cancel_remove(tmp_path: Path) -> None:
+    asyncio.run(_rule_center_toggle_and_cancel_remove(tmp_path))
+
+
+async def _out_of_scope_action_center_disables_mailbox_action() -> None:
+    app = MailReviewApp(Path("unused.toml"), settings=SETTINGS)
+    async with app.run_test(size=(100, 32)) as pilot:
+        app.push_screen(ActionCenterScreen("Review", scope_warning="Automation unavailable."))
+        await pilot.pause()
+        assert not app.screen.query("#keep")
+        assert app.screen.query("#create-rule")
+        assert app.screen.query("#rules")
+
+
+def test_out_of_scope_action_center_does_not_offer_mailbox_action() -> None:
+    asyncio.run(_out_of_scope_action_center_disables_mailbox_action())
+
+
+async def _outcome_policy_change_refreshes_runtime(tmp_path: Path) -> None:
+    mail = FakeMailService()
+    actions = FakeActionService()
+    analysis = FakeAnalysisService(SpamOutcome.SPAM)
+    config_path = tmp_path / "config.toml"
+    write_settings(SETTINGS, config_path)
+    app = MailReviewApp(
+        config_path,
+        mail_service=mail,
+        settings=SETTINGS,
+        rules=RuleSet(),
+        settings_service=SettingsService(config_path),
+        analysis_service=analysis,
+        action_service=actions,
+    )
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+        await app._open_message("Spam", 9)
+        app._analysis = analysis.analyze("Spam", MESSAGE)
+        await pilot.press("a")
+        await pilot.pause()
+        await pilot.click("#policy")
+        await pilot.pause()
+        await pilot.click("#spam")
+        await pilot.pause()
+        from textual.widgets import Input
+
+        app.screen.query_one("#outcome-action", Input).value = "move"
+        app.screen.query_one("#outcome-destination", Input).value = "INBOX"
+        await pilot.click("#save")
+        await pilot.pause(0.1)
+
+        expected = MessageAction(ActionKind.MOVE, "INBOX")
+        assert load_settings(config_path).spam.actions.spam == expected
+        assert app.settings.spam.actions.spam == expected
+        assert analysis.settings.spam.actions.spam == expected
+        assert actions.settings.spam.actions.spam == expected
+        assert app._analysis.configured_action == expected
+        await pilot.press("a")
+        await pilot.pause()
+        assert isinstance(app.screen, ApplyConfirmation)
+        assert actions.calls == []
+        await pilot.press("escape")
+
+
+def test_outcome_policy_updates_config_and_runtime_without_applying_message(tmp_path: Path) -> None:
+    asyncio.run(_outcome_policy_change_refreshes_runtime(tmp_path))
+
+
+async def _delete_outcome_policy_requires_two_explicit_confirmations(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_settings(SETTINGS, config_path)
+    app = MailReviewApp(
+        config_path,
+        settings=SETTINGS,
+        settings_service=SettingsService(config_path),
+    )
+    before = config_path.read_bytes()
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+        app._open_outcome_policy()
+        await pilot.pause()
+        await pilot.click("#spam")
+        await pilot.pause()
+        from textual.widgets import Input
+
+        app.screen.query_one("#outcome-action", Input).value = "delete"
+        await pilot.click("#save")
+        await pilot.pause()
+        assert app.screen.__class__.__name__ == "OutcomeActionEditorScreen"
+        assert config_path.read_bytes() == before
+        await pilot.click("#save-delete")
+        await pilot.pause()
+        assert app.screen.__class__.__name__ == "DeletePolicyConfirmation"
+        assert config_path.read_bytes() == before
+        await pilot.press("enter")
+        await pilot.pause()
+        assert config_path.read_bytes() == before
+        app._open_outcome_policy()
+        await pilot.pause()
+        await pilot.click("#spam")
+        await pilot.pause()
+        app.screen.query_one("#outcome-action", Input).value = "delete"
+        await pilot.click("#save-delete")
+        await pilot.pause()
+        await pilot.click("#confirm")
+        await pilot.pause(0.1)
+        assert load_settings(config_path).spam.actions.spam.action is ActionKind.DELETE
+
+
+def test_delete_outcome_policy_is_global_and_cancelled_without_config_change(tmp_path: Path) -> None:
+    asyncio.run(_delete_outcome_policy_requires_two_explicit_confirmations(tmp_path))
