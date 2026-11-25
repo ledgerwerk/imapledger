@@ -208,6 +208,10 @@ class Settings:
                 raise ConfigError(f"config_store.folder must not be spam.actions.{outcome} destination")
 
 
+def action_for_outcome(settings: Settings, outcome: SpamOutcome) -> MessageAction:
+    return getattr(settings.spam.actions, outcome.value)
+
+
 def default_config_path() -> Path:
     base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return base / "imapledger" / "config.toml"

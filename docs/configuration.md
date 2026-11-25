@@ -136,7 +136,7 @@ max_file_bytes = 1048576
 
 The folder must already exist. Snapshot messages are readable email, not encrypted secret storage.
 
-## Multi-folder routing example
+## Batch clean scope and category action example
 
 This configuration scans two source folders and routes spam and not-spam outcomes to existing destination folders:
 
@@ -200,9 +200,9 @@ Supported values are `none` and `imap-keywords`. `imapledger init` selects `imap
 
 The selected mailbox must advertise persistent custom keywords through `PERMANENTFLAGS` (`\\*` or the exact keyword). `doctor` reports persistence support, and `clean --apply` checks it before classification whenever a configured outcome may be kept. See [Persistent classification state](state.md) for marker semantics, command usage, privacy, and failure behavior.
 
-## Learned routing rules
+## Optional advanced routing filters
 
-Routing rules are stored separately from this configuration in `rules.toml` beside the selected config file. The default path follows the same XDG configuration directory as `config.toml`. A rule source must be one of the configured `spam.folders`; rules cannot add folders to the scan. Rule move destinations must exist and cannot be configured source folders.
+Optional advanced routing filters remain stored separately in the compatible `rules.toml` file beside the selected config file. The default path follows the same XDG configuration directory as `config.toml`. These filters are used by batch `clean` and explicit `explain`; they do not replace global category actions in manual classification. A filter source must be one of the configured `spam.folders`; filters cannot add folders to the scan. Move destinations must exist and cannot be configured source folders.
 
 The versioned format is:
 
@@ -221,17 +221,18 @@ match = { from_address = "mailer-daemon@gmx.net" }
 
 Rules support only `keep` and `move`. Matcher fields are combined with AND, and the first enabled match in file order wins. Supported fields are `from_address`, `from_domain`, `return_path`, `return_path_domain`, `list_id`, `auto_submitted`, `subject`, and `subject_prefix`. The file is strictly validated and written atomically with restrictive permissions. See [Learned routing rules](rules.md) for matching details and the command workflow.
 
-## Outcome actions
+## Global classification actions
 
-The existing policy verdicts are kept for compatibility. Routing maps them separately:
+The existing policy verdicts are kept for compatibility. They map to three global classification categories and their configured actions:
 
-| Policy verdict       | Routing outcome | Config table              |
-| -------------------- | --------------- | ------------------------- |
-| `SpamVerdict.DELETE` | spam            | `[spam.actions.spam]`     |
-| `SpamVerdict.KEEP`   | not-spam        | `[spam.actions.not_spam]` |
-| `SpamVerdict.REVIEW` | review          | `[spam.actions.review]`   |
+| Policy verdict       | Classification category | Config table              |
+| -------------------- | ----------------------- | ------------------------- |
+| `SpamVerdict.DELETE` | spam                    | `[spam.actions.spam]`     |
+| `SpamVerdict.KEEP`   | not-spam                | `[spam.actions.not_spam]` |
+| `SpamVerdict.REVIEW` | review                  | `[spam.actions.review]`   |
 
-A configured not-spam action runs only for `SpamVerdict.KEEP`; `REVIEW` is a separate outcome and follows `[spam.actions.review]`.
+These actions are global category mappings, not per-folder rules. `imapledger mail classify --apply` and the TUI `a` action can apply the selected category's configured action to one message in any selectable mailbox folder. They retain exact-folder and UID confirmation and safety checks. The `spam.folders` list limits unattended batch `clean` only. Optional advanced routing filters stay in the compatible `rules.toml` file and remain separate from manual classification.
+The NOT_SPAM action maps to `SpamVerdict.KEEP`; `REVIEW` is separate and follows `[spam.actions.review]`.
 An action table accepts `keep`, `move`, or `delete`:
 
 - `keep` leaves the message in its current source folder.

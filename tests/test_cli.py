@@ -101,6 +101,8 @@ def test_clean_help_exposes_verbose_and_debug_options():
 
     assert "final configured" in result.output
     assert "action as it" in result.output
+    assert "category actions" in result.output
+    assert "spam.folders" in result.output
 
 
 class CleanFakeMailbox:
@@ -1356,6 +1358,7 @@ def test_clean_visits_multiple_folders_in_order_with_one_password_and_classifier
     assert len(state["prompts"]) == 1
     assert len(state["classifier_instances"]) == len(state["classifier_contexts"]) == 1
     assert [folder for folder, _, _ in state["clean_calls"]] == ["INBOX.Junk", "INBOX.Spam"]
+    assert {mailbox.folder for mailbox in state["mailboxes"]} == set(settings.spam.folders)
     assert all(classifier is state["classifier_instances"][0] for _, classifier, _ in state["clean_calls"])
     assert all(actual == selection for _, _, actual in state["clean_calls"])
     assert state["clean_calls"][0][2] is state["clean_calls"][1][2]

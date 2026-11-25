@@ -26,6 +26,7 @@ from .config import (
     Settings,
     SpamActions,
     SpamSettings,
+    action_for_outcome,
     default_config_path,
     load_imap_settings,
     load_settings,
@@ -72,12 +73,12 @@ from .rules import (
     write_rules,
 )
 
-app = typer.Typer(no_args_is_help=True, help="Security-scoped IMAP automation.")
+app = typer.Typer(no_args_is_help=True, help="Security-scoped IMAP mail classification and cleaning.")
 config_app = typer.Typer(help="Inspect imapledger configuration.")
 app.add_typer(config_app, name="config")
 auth_app = typer.Typer(help="Store and inspect IMAP credentials.")
 app.add_typer(auth_app, name="auth")
-rule_app = typer.Typer(help="Learn and manage deterministic message routing rules.")
+rule_app = typer.Typer(help="Manage optional advanced routing filters for batch clean.")
 app.add_typer(rule_app, name="rule")
 state_app = typer.Typer(help="Inspect and reset persisted classification state.")
 app.add_typer(state_app, name="state")
@@ -906,7 +907,7 @@ def clean(
     apply: bool = typer.Option(
         False,
         "--apply",
-        help="Execute the configured actions. Without this flag, run read-only.",
+        help="Apply category actions to selected messages in configured spam.folders.",
     ),
     reclassify: bool = typer.Option(
         False,
@@ -939,7 +940,7 @@ def clean(
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
     debug: bool = typer.Option(False, "--debug", help="Print a traceback without exception payloads"),
 ) -> None:
-    """Classify configured source folders and optionally apply their configured actions."""
+    """Classify only spam.folders and optionally apply global category actions."""
     try:
         settings = load_settings(config)
     except ConfigError as exc:
@@ -1330,6 +1331,7 @@ def explain(
                 message,
                 persisted_outcome=state.outcome,
                 reclassify=reclassify,
+                use_routing_filters=True,
             )
             evidence = analysis.evidence
             if evidence is None:
@@ -1445,11 +1447,13 @@ def mail_show(
             console.print(f"Body truncated at max_body_chars={settings.spam.max_body_chars}.", markup=False)
         if message.has_attachments:
             console.print(f"Attachments: {message.attachment_count} (not opened by imapledger)", markup=False)
-        if folder in settings.spam.folders and detail.persisted_state and detail.persisted_state.outcome:
-            action = getattr(settings.spam.actions, detail.persisted_state.outcome.value)
+        if detail.persisted_state and detail.persisted_state.outcome:
+            outcome = detail.persisted_state.outcome
+            action = action_for_outcome(settings, outcome)
+            console.print(f"Persisted category: {outcome.value.upper()}", markup=False)
             console.print(f"Configured action: {_action_description(action)}", markup=False)
-        elif folder not in settings.spam.folders:
-            console.print("Automation unavailable: folder is not configured in spam.folders.", markup=False)
+        clean_scope = "enabled" if folder in settings.spam.folders else "disabled"
+        console.print(f"Batch clean for this folder: {clean_scope}", markup=False)
     except Exception as exc:
         _print_failure(exc, debug=False, command="mail show")
         raise typer.Exit(1) from exc
@@ -1461,16 +1465,13 @@ def mail_show(
 @mail_app.command("classify")
 def mail_classify(
     uid: int = typer.Argument(..., help="Folder-scoped message UID"),
-    folder: str = typer.Option(..., "--folder", help="Configured source folder"),
-    apply: bool = typer.Option(False, "--apply", help="Apply the configured action after classification"),
+    folder: str = typer.Option(..., "--folder", help="Any selectable mailbox folder containing the UID"),
+    apply: bool = typer.Option(False, "--apply", help="Apply the category's configured action to this exact message"),
     reclassify: bool = typer.Option(False, "--reclassify", help="Ignore persisted state and classify again"),
     config: Path = typer.Option(default_config_path(), "--config"),  # noqa: B008
 ) -> None:
-    """Classify one message without mutation unless --apply is supplied."""
+    """Classify one message in any folder; --apply uses its configured category action."""
     settings = _load_auth_settings(config)
-    if folder not in settings.spam.folders:
-        err_console.print(f"Automation unavailable: {folder} is not configured in spam.folders.", markup=False)
-        raise typer.Exit(2)
     try:
         rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
     except RuleError as exc:
@@ -1489,6 +1490,7 @@ def mail_classify(
             message,
             persisted_outcome=persisted,
             reclassify=reclassify,
+            use_routing_filters=False,
         )
         console.print(f"Outcome: {analysis.outcome.value.upper() if analysis.outcome else 'RULE'}", markup=False)
         console.print(f"Decision source: {analysis.decision_source}", markup=False)
@@ -1501,7 +1503,7 @@ def mail_classify(
         if not apply:
             console.print("Result: Not applied (preview)", markup=False)
             return
-        receipt = ActionService(settings, password, rules).apply(
+        receipt = ActionService(settings, password).apply(
             analysis,
             uidvalidity=detail.uidvalidity,
             confirmed_by_user=True,

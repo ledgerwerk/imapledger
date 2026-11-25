@@ -11,8 +11,9 @@ imapledger doctor
 imapledger config show
 ```
 
-`clean` is a dry run by default. It connects read-only to each configured source folder, classifies the selected messages, and reports planned actions such as `WOULD MOVE` or `WOULD DELETE`. It performs no mutations. Supply `--apply` to execute the actions configured for spam, not-spam, and review outcomes.
+`clean` is a dry run by default. It connects read-only to each folder in `spam.folders`, classifies the selected messages, and reports planned actions such as `WOULD MOVE` or `WOULD DELETE`. It performs no mutations. Supply `--apply` to execute the configured SPAM, NOT_SPAM, and REVIEW category actions for those messages.
 
+`spam.folders` is the complete scope for unattended batch cleaning. `clean` does not scan INBOX or any other unconfigured folder. Manual `mail classify --apply` and the TUI action can apply a configured category action to one explicitly selected message in any selectable folder, after exact-folder and UID confirmation.
 Credential-consuming commands resolve the configured source once per invocation. The default `prompt` source uses hidden input once, and the resolved password is reused across source folders. Keyring and vault sources retrieve stored credentials without prompting for the IMAP password.
 
 ## Source ordering and message selection
@@ -49,11 +50,11 @@ With `[spam.state].backend = "imap-keywords"`, `clean` skips previously marked m
 
 See [Persistent classification state](state.md) for the keyword support requirements, status and reset commands, read-only explanation behavior, review queue, and failure handling.
 
-## Routing rule precedence
+## Optional advanced routing filters in batch clean
 
-`clean` loads the separate `rules.toml` beside the selected config file. It checks the first enabled rule whose configured source folder and AND-combined matcher fields match the message before constructing a spam assessment. A match uses only the rule's `keep` or `move` action, bypasses spam classification for that message, and is reported as `Rule=<id>` without a spam verdict. Non-matching messages continue through the existing spam classifier and policy.
+For compatibility, `clean` can use optional advanced routing filters stored in the separate `rules.toml` beside the selected config file. It checks the first enabled filter whose configured source folder and AND-combined matcher fields match before constructing a spam assessment. A match uses only the filter's `keep` or `move` action, bypasses spam classification for that message, and is reported as `Rule=<id>` without a spam verdict. Non-matching messages continue through the configured category classifier and action.
 
-Rules apply only to source folders already listed in `spam.folders`; they cannot broaden the scan. A malformed rule file or out-of-scope source fails before mailbox processing. During dry-run, rule actions remain plans and no mailbox mutation occurs. With `clean --apply`, a rule move is applied to that exact UID immediately, before the next message is processed. Enabled rule move destinations are allow-listed and included in read-only preflight. Rule counts are reported separately from spam, not-spam, and review counts.
+Filters apply only to source folders already listed in `spam.folders`; they cannot broaden the batch scan. A malformed rule file or out-of-scope source fails before mailbox processing. During dry-run, rule actions remain plans and no mailbox mutation occurs. With `clean --apply`, a rule move is applied to that exact UID immediately, before the next message is processed. Enabled rule move destinations are allow-listed and included in read-only preflight. Rule counts are reported separately from spam, not-spam, and review counts.
 
 Use [`Learned routing rules`](rules.md) for the learning, storage, management, and read-only testing commands.
 

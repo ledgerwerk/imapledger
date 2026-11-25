@@ -49,7 +49,7 @@ def test_analysis_service_explicit_rule_precedence_overrides_persisted_state() -
     )
     service.set_rules(RuleSet((rule,)))
 
-    result = service.analyze("Spam", _message(), persisted_outcome=SpamOutcome.REVIEW, prefer_rules=True)
+    result = service.analyze("Spam", _message(), persisted_outcome=SpamOutcome.REVIEW, use_routing_filters=True)
 
     assert result.decision_source == "rule"
     assert result.rule_id == "known-sender"
@@ -70,7 +70,7 @@ def test_analysis_service_checks_deterministic_rules_before_classifier():
         classifier_factory=lambda **kwargs: (_ for _ in ()).throw(AssertionError("classifier must not run")),
     )
 
-    result = service.analyze("Spam", _message())
+    result = service.analyze("Spam", _message(), use_routing_filters=True)
 
     assert result.decision_source == "rule"
     assert result.rule_id == "known-sender"

@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 from imapledger import cli
 from imapledger.action_service import ActionReceipt
 from imapledger.analysis_service import MessageAnalysis
+from imapledger.classification_state import SpamOutcome
 from imapledger.config import ImapSettings, Settings, SpamSettings
 from imapledger.mail_service import MessageDetail, MessagePage
 from imapledger.mailbox import MailboxItem, MessageSort
@@ -78,17 +79,18 @@ def test_mail_classify_is_preview_only_without_apply(monkeypatch):
             pass
 
         def analyze(self, folder, message, **kwargs):
+            assert kwargs["use_routing_filters"] is False
             return MessageAnalysis(
                 folder,
                 message.uid,
                 None,
                 None,
-                None,
+                SpamOutcome.REVIEW,
                 SpamVerdict.REVIEW,
                 None,
                 ("needs-review",),
                 SETTINGS.spam.actions.review,
-                decision_source="rule",
+                decision_source="semantic",
             )
 
     monkeypatch.setattr(cli, "AnalysisService", FakeAnalysisService)
@@ -106,24 +108,26 @@ def test_mail_classify_apply_reports_confirmed_action(monkeypatch):
             pass
 
         def analyze(self, folder, message, **kwargs):
+            assert kwargs["use_routing_filters"] is False
             return MessageAnalysis(
                 folder,
                 message.uid,
                 None,
                 None,
-                None,
+                SpamOutcome.REVIEW,
                 SpamVerdict.REVIEW,
                 None,
                 (),
                 SETTINGS.spam.actions.review,
-                decision_source="rule",
+                decision_source="semantic",
             )
 
     class FakeActionService:
-        def __init__(self, settings, password, rules):
+        def __init__(self, settings, password):
             pass
 
         def apply(self, analysis, *, uidvalidity, confirmed_by_user):
+            assert analysis.folder == "INBOX"
             assert uidvalidity == 42
             assert confirmed_by_user
             return ActionReceipt(
@@ -139,20 +143,18 @@ def test_mail_classify_apply_reports_confirmed_action(monkeypatch):
 
     monkeypatch.setattr(cli, "AnalysisService", FakeAnalysisService)
     monkeypatch.setattr(cli, "ActionService", FakeActionService)
-    result = CliRunner().invoke(cli.app, ["mail", "classify", "9", "--folder", "Spam", "--apply"])
+    result = CliRunner().invoke(cli.app, ["mail", "classify", "9", "--folder", "INBOX", "--apply"])
 
     assert result.exit_code == 0
     assert "Result: Applied and confirmed" in result.output
 
 
-def test_mail_classify_rejects_non_source_folder_before_connecting(monkeypatch):
-    _setup(monkeypatch)
+def test_mail_classify_help_describes_global_action_scope():
+    result = CliRunner().invoke(cli.app, ["mail", "classify", "--help"])
 
-    result = CliRunner().invoke(cli.app, ["mail", "classify", "9", "--folder", "INBOX"])
-
-    assert result.exit_code == 2
-    assert "not configured in spam.folders" in result.output
-    assert not FakeMailService.instances
+    assert result.exit_code == 0
+    assert "selectable mailbox folder" in result.output
+    assert "category's configured action" in result.output
 
 
 def test_ui_is_explicit_and_root_no_args_prints_help():

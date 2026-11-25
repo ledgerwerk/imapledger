@@ -24,22 +24,23 @@ The console has three panes: folders and smart views, the message list, and mess
 | `i`                    | Explicitly analyze eligible embedded images                      |
 | `I`                    | Review and optionally load remote images after confirmation      |
 | `a`                    | Apply the configured action; a separate confirmation is required |
-| `R`                    | Open the Rule Center                                             |
+| `R`                    | Open global Classification Rules for SPAM, NOT_SPAM, and REVIEW  |
+| `F`                    | Open optional advanced Routing Filters                           |
 | `r`                    | Refresh                                                          |
 | `h` / `?`              | Open keyboard help (`h`, Escape, or `q` closes help)             |
 | `q`                    | Quit                                                             |
 
 Pane navigation follows the widget that currently has focus, including focus reached with the mouse. The focused pane has a highlighted border. The in-app help screen is available at any time with `h`.
 
-## Actions, policies, and routing rules
+## Classification actions and advanced routing filters
 
-Press `a` with a message selected to open the Action Center. The analysis panel distinguishes the semantic classifier's outcome and verdict from the configured outcome policy, a deterministic routing-rule match, and the mailbox action. A verdict is not itself a mail operation. The Action Center lets you choose KEEP, MOVE, or DELETE for the current message, or edit global SPAM, NOT_SPAM, and REVIEW actions.
+Press `a` with a message selected to apply the configured action for its SPAM, NOT_SPAM, or REVIEW category. The analysis panel distinguishes the classification category from the classifier's verdict and shows the configured action. Advanced routing filters are separate from category classification and are not part of the manual apply flow.
 
-Applying an action always requires a separate confirmation that names the folder and exact UID. MOVE shows its destination. DELETE is permanent and warns about UID EXPUNGE. Choosing or editing policy does not act on messages; a global SPAM DELETE change affects only later explicit apply operations and requires its own additional confirmation. MOVE destinations are existing folders; the TUI does not create folders or expand `spam.folders`.
+Applying a category action requires confirmation naming the exact folder and UID. It works for a deliberately selected message in any selectable mailbox folder, regardless of `spam.folders`. MOVE shows its destination. DELETE is permanent and warns about UID EXPUNGE. Saving an action does not change existing mail. SPAM DELETE changes the global action for future SPAM classifications and has its own confirmation. MOVE destinations must already exist.
 
-Press `R` to open the Rule Center. It supports structured rule creation and editing, enable/disable, priority reordering, details, bounded read-only testing, and confirmed removal. Rules are local and deterministic, use only KEEP or MOVE, and never use Jev for manual creation or testing. Rule source folders must remain within configured `spam.folders`, and MOVE destinations must already exist and cannot be configured source folders.
+Press `R` to open Classification Rules. Edit the global action for each category, SPAM, NOT_SPAM, and REVIEW. The screen also lists automatic clean folders and explains that they limit unattended batch processing only. Saving an action updates configuration and the running session without mutating mail.
 
-Saving rule changes reloads them into the running session and refreshes analysis of the selected message. Save-only changes local rule configuration but does not mutate mail. Save-and-apply is a separate operation: after saving, the TUI re-resolves the selected folder and UID and requests confirmation before applying only to that message. Rule tests are read-only and bounded.
+Press `F` to open optional advanced Routing Filters. These preserve the existing `rules.toml` format and support structured rule creation, editing, enable/disable, priority reordering, details, bounded read-only testing, and confirmed removal. They remain scoped to configured `spam.folders` and are used by batch `clean`, not by manual classification or `mail classify`. Rules use KEEP or MOVE only, and MOVE destinations must already exist.
 
 ## Image inventory and visual analysis
 

@@ -5,7 +5,7 @@ from typing import Any
 
 from .classification_state import SpamOutcome
 from .classifier import PyJevSpamClassifier, SemanticSpamSignals
-from .config import MessageAction, Settings
+from .config import MessageAction, Settings, action_for_outcome
 from .evidence import MessageEvidence, build_message_evidence
 from .message import MailMessage
 from .policy import SpamVerdict
@@ -57,17 +57,17 @@ class AnalysisService:
         persisted_outcome: SpamOutcome | None = None,
         reclassify: bool = False,
         use_persisted_state: bool = True,
-        prefer_rules: bool = False,
+        use_routing_filters: bool = False,
     ) -> MessageAnalysis:
         settings = self._settings
-        rule = self._rules.first_match(folder, message)
+        rule = self._rules.first_match(folder, message) if use_routing_filters else None
         if (
             persisted_outcome is not None
             and not reclassify
             and use_persisted_state
-            and not (prefer_rules and rule is not None)
+            and not (use_routing_filters and rule is not None)
         ):
-            action = getattr(settings.spam.actions, persisted_outcome.value)
+            action = action_for_outcome(settings, persisted_outcome)
             return MessageAnalysis(
                 folder=folder,
                 uid=message.uid,
@@ -120,7 +120,7 @@ class AnalysisService:
             verdict=decision.verdict,
             signals=assessment.signals,
             reasons=decision.reasons,
-            configured_action=getattr(settings.spam.actions, outcome.value),
+            configured_action=action_for_outcome(settings, outcome),
             model=getattr(assessment, "model", None),
             request_id=getattr(assessment, "request_id", None),
             evidence=assessment.evidence,

@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from imapledger.action_service import ActionService
 from imapledger.analysis_service import MessageAnalysis
-from imapledger.classification_state import SpamOutcome
-from imapledger.config import ActionKind, ImapSettings, MessageAction, Settings, SpamActions, SpamSettings
+from imapledger.classification_state import ClassificationStateBackend, SpamOutcome
+from imapledger.config import (
+    ActionKind,
+    ClassificationStateSettings,
+    ImapSettings,
+    MessageAction,
+    Settings,
+    SpamActions,
+    SpamSettings,
+)
 from imapledger.mailbox import DeleteResult, MailboxSnapshot, MoveResult
 from imapledger.policy import SpamVerdict
-from imapledger.rules import RuleSet
 
 
-def _settings() -> Settings:
+def _settings(*, state_backend=ClassificationStateBackend.NONE) -> Settings:
     return Settings(
         imap=ImapSettings(host="imap.example.org", username="user@example.org"),
         spam=SpamSettings(
@@ -22,6 +30,7 @@ def _settings() -> Settings:
                 spam=MessageAction(ActionKind.MOVE, "Trash"),
                 not_spam=MessageAction(ActionKind.KEEP),
             ),
+            state=ClassificationStateSettings(state_backend),
         ),
     )
 
@@ -48,6 +57,7 @@ class FakeMailbox:
         self.moves = []
         self.deletes = []
         self.entered = False
+        self.state_writes = []
 
     def __enter__(self):
         self.entered = True
@@ -67,8 +77,11 @@ class FakeMailbox:
         self.deletes.append(uid)
         return DeleteResult((uid,))
 
+    def set_classification_keyword(self, uid, *, keyword, peer_keywords):
+        self.state_writes.append((uid, keyword, peer_keywords))
 
-def _service(mailbox, preflight=None):
+
+def _service(mailbox, preflight=None, *, settings=None):
     checks = []
 
     def run_preflight(*args, **kwargs):
@@ -76,9 +89,8 @@ def _service(mailbox, preflight=None):
         return SimpleNamespace(ok=True, errors=())
 
     service = ActionService(
-        _settings(),
+        settings or _settings(),
         "secret",
-        RuleSet(),
         mailbox_factory=lambda **kwargs: mailbox,
         preflight=preflight or run_preflight,
     )
@@ -111,17 +123,87 @@ def test_action_service_applies_only_configured_move_and_returns_confirmed_recei
     assert checks[0]["requires_delete"] is False
 
 
-def test_action_service_rejects_stale_snapshot_and_non_source_folder():
-    mailbox = FakeMailbox(uidvalidity=43)
-    service, _ = _service(mailbox)
+def test_action_service_rejects_stale_uidvalidity_and_missing_uid():
+    stale_mailbox = FakeMailbox(uidvalidity=43)
+    service, _ = _service(stale_mailbox)
 
     receipt = service.apply(_analysis(), uidvalidity=42, confirmed_by_user=True)
 
     assert not receipt.applied
     assert "UIDVALIDITY changed" in receipt.detail
+    assert stale_mailbox.moves == []
+
+    missing_mailbox = FakeMailbox(uids=frozenset())
+    service, _ = _service(missing_mailbox)
+    receipt = service.apply(_analysis(folder="INBOX"), uidvalidity=42, confirmed_by_user=True)
+
+    assert not receipt.applied
+    assert "UID is no longer" in receipt.detail
+    assert missing_mailbox.moves == []
+
+
+def test_action_service_allows_confirmed_classification_action_from_any_folder():
+    mailbox = FakeMailbox()
+    service, _ = _service(mailbox)
+
+    receipt = service.apply(_analysis(folder="INBOX"), uidvalidity=42, confirmed_by_user=True)
+
+    assert receipt.applied
+    assert receipt.destination == "Trash"
+    assert mailbox.moves == [(9, "Trash")]
+
+
+def test_action_service_applies_review_move_from_any_folder():
+    defaults = _settings()
+    review_action = MessageAction(ActionKind.MOVE, "Review")
+    settings = replace(
+        defaults,
+        spam=replace(
+            defaults.spam,
+            actions=replace(defaults.spam.actions, review=review_action),
+        ),
+    )
+    analysis = replace(
+        _analysis(folder="Archive"),
+        outcome=SpamOutcome.REVIEW,
+        configured_action=review_action,
+    )
+    mailbox = FakeMailbox()
+    service, _ = _service(mailbox, settings=settings)
+
+    receipt = service.apply(analysis, uidvalidity=42, confirmed_by_user=True)
+
+    assert receipt.applied and receipt.confirmed
+    assert mailbox.moves == [(9, "Review")]
+
+
+def test_action_service_persists_not_spam_keep_state_from_any_folder():
+    settings = _settings(state_backend=ClassificationStateBackend.IMAP_KEYWORDS)
+    analysis = replace(
+        _analysis(folder="Archive"),
+        outcome=SpamOutcome.NOT_SPAM,
+        configured_action=settings.spam.actions.not_spam,
+    )
+    mailbox = FakeMailbox()
+    service, _ = _service(mailbox, settings=settings)
+
+    receipt = service.apply(analysis, uidvalidity=42, confirmed_by_user=True)
+
+    assert receipt.applied and receipt.confirmed
+    assert mailbox.state_writes[0][:2] == (9, "imapledger-v1-notspam")
     assert mailbox.moves == []
-    with pytest.raises(ValueError, match="not configured as a source"):
-        service.apply(_analysis(folder="INBOX"), uidvalidity=42, confirmed_by_user=True)
+    assert mailbox.deletes == []
+
+
+def test_action_service_same_folder_move_is_confirmed_noop():
+    mailbox = FakeMailbox()
+    service, _ = _service(mailbox)
+
+    receipt = service.apply(_analysis(folder="Trash"), uidvalidity=42, confirmed_by_user=True)
+
+    assert receipt.applied and receipt.confirmed
+    assert "already resides" in receipt.detail
+    assert mailbox.moves == []
 
 
 def test_action_service_rejects_unconfigured_action():
@@ -158,7 +240,6 @@ def test_action_service_uses_delete_capability_preflight_and_uidplus_path():
     service = ActionService(
         settings,
         "secret",
-        RuleSet(),
         mailbox_factory=lambda **kwargs: mailbox,
         preflight=preflight,
     )

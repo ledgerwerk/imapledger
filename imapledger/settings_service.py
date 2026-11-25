@@ -22,10 +22,13 @@ class SettingsService:
     def load(self) -> Settings:
         return load_settings(self.path)
 
-    def set_spam_action(self, outcome: SpamOutcome, action: MessageAction) -> PolicyMutationResult:
+    def set_classification_action(self, outcome: SpamOutcome, action: MessageAction) -> PolicyMutationResult:
         current = self.load()
         previous = getattr(current.spam.actions, outcome.value)
         updated = replace_spam_action(current, outcome=outcome, action=action)
         if updated != current:
             write_settings(updated, self.path, overwrite=True)
         return PolicyMutationResult(updated, outcome, previous, action)
+
+    def set_spam_action(self, outcome: SpamOutcome, action: MessageAction) -> PolicyMutationResult:
+        return self.set_classification_action(outcome, action)

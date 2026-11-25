@@ -5,47 +5,12 @@ from typing import Any
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, Label, ListItem, ListView, Static
+from textual.widgets import Button, Checkbox, Input, Label, ListItem, ListView, Select, Static
 
 from ..classification_state import SpamOutcome
 from ..config import ActionKind, MessageAction, Settings
 from ..rule_candidates import build_rule_candidates
 from ..rules import MATCH_FIELDS, MailRule, RuleMatch, RuleSet, describe_match, generate_rule_id, validate_rule_id
-
-
-class ActionCenterScreen(ModalScreen[str]):
-    BINDINGS = [("escape", "cancel", "Cancel")]
-
-    def __init__(
-        self,
-        description: str,
-        *,
-        scope_warning: str | None = None,
-        keep_label: str = "Apply KEEP / persist classification",
-    ) -> None:
-        super().__init__()
-        self.description = description
-        self.scope_warning = scope_warning
-        self.keep_label = keep_label
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="action-center"):
-            yield Static("Message action", markup=False)
-            yield Static(self.description, markup=False)
-            if self.scope_warning:
-                yield Static(self.scope_warning, markup=False)
-            if self.scope_warning is None:
-                yield Button(self.keep_label, id="keep")
-            yield Button("Create routing rule from this message", id="create-rule")
-            yield Button("Change SPAM outcome policy", id="policy")
-            yield Button("Open rule manager", id="rules")
-            yield Button("Cancel", id="cancel")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id or "cancel")
-
-    def action_cancel(self) -> None:
-        self.dismiss("cancel")
 
 
 class RuleCenterScreen(ModalScreen[tuple[str, str | None]]):
@@ -74,7 +39,7 @@ class RuleCenterScreen(ModalScreen[tuple[str, str | None]]):
     def compose(self) -> ComposeResult:
         enabled = sum(rule.enabled for rule in self.rules.rules)
         with Vertical(id="rule-center"):
-            yield Static(f"Rules · {len(self.rules.rules)} rules · {enabled} enabled", markup=False)
+            yield Static(f"Routing Filters · {len(self.rules.rules)} filters · {enabled} enabled", markup=False)
             yield ListView(
                 *[
                     ListItem(Label(f"{index}. {'✓' if rule.enabled else '✗'} {rule.id}  {describe_match(rule.match)}"))
@@ -82,7 +47,7 @@ class RuleCenterScreen(ModalScreen[tuple[str, str | None]]):
                 ],
                 id="rule-list",
             )
-            yield Static("Rules are evaluated top to bottom; first match wins.", markup=False)
+            yield Static("Routing filters are evaluated top to bottom; first match wins.", markup=False)
             with Horizontal():
                 yield Button("New", id="new")
                 yield Button("Edit", id="edit")
@@ -183,8 +148,8 @@ class RuleEditorScreen(ModalScreen[tuple[MailRule, bool] | None]):
         action = existing.action if existing else MessageAction(ActionKind.KEEP)
         with Vertical(id="rule-editor-box"):
             with VerticalScroll(id="rule-editor"):
-                yield Static("Edit routing rule" if existing else "New routing rule", markup=False)
-                yield Label("Rule ID")
+                yield Static("Edit routing filter" if existing else "New routing filter", markup=False)
+                yield Label("Filter ID")
                 yield Input(suggested_id, placeholder="lowercase-id", id="rule-id")
                 yield Label("Source folders (comma-separated, configured spam.folders only)")
                 yield Input(", ".join(source), id="rule-sources")
@@ -198,7 +163,7 @@ class RuleEditorScreen(ModalScreen[tuple[MailRule, bool] | None]):
                     markup=False,
                 )
                 yield Checkbox("I understand this matcher is broad/fragile", id="broad-ack")
-                yield Label("Action: keep or move")
+                yield Label("Filter action: keep or move")
                 yield Input(action.action.value, id="rule-action")
                 yield Label("Destination for move")
                 yield Input(action.destination or "", placeholder="existing folder name", id="rule-destination")
@@ -243,7 +208,7 @@ class RuleEditorScreen(ModalScreen[tuple[MailRule, bool] | None]):
                 raise ValueError("Acknowledge the broad/fragile matcher warning before saving.")
         action_name = self.query_one("#rule-action", Input).value.strip().lower()
         if action_name not in {"keep", "move"}:
-            raise ValueError("Routing rule action must be keep or move.")
+            raise ValueError("Routing filter action must be keep or move.")
         destination = self.query_one("#rule-destination", Input).value.strip() or None
         action = MessageAction(ActionKind(action_name), destination)
         return MailRule(rule_id, True if self.rule is None else self.rule.enabled, sources, action, match)
@@ -267,7 +232,7 @@ class RuleDeleteConfirmation(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="rule-remove-confirmation"):
-            yield Static(f"Remove rule {self.rule.id}?\n{describe_match(self.rule.match)}", markup=False)
+            yield Static(f"Remove routing filter {self.rule.id}?\n{describe_match(self.rule.match)}", markup=False)
             yield Button("Cancel", id="cancel")
             yield Button("Remove", id="remove", variant="error")
 
@@ -298,7 +263,7 @@ class RuleDetailScreen(ModalScreen[None]):
         if rule.action.destination:
             action += f" -> {rule.action.destination}"
         yield Static(
-            f"Rule\n  ID: {rule.id}\n  Enabled: {'yes' if rule.enabled else 'no'}\n"
+            f"Routing Filter\n  ID: {rule.id}\n  Enabled: {'yes' if rule.enabled else 'no'}\n"
             f"  Priority: {self.priority} / {self.total}\n\nSources\n  {', '.join(rule.source_folders)}\n\n"
             f"Match\n  {describe_match(rule.match)}\n\nAction\n  {action}\n\n"
             f"Matches selected message: {'yes' if self.matches_current else 'no'}\n"
@@ -310,26 +275,31 @@ class RuleDetailScreen(ModalScreen[None]):
         self.dismiss()
 
 
-class OutcomePolicyScreen(ModalScreen[SpamOutcome | None]):
-    BINDINGS = [("escape", "cancel", "Cancel")]
+class ClassificationRulesScreen(ModalScreen[SpamOutcome | None]):
+    BINDINGS = [("escape", "cancel", "Close")]
 
     def __init__(self, settings: Settings) -> None:
         super().__init__()
         self.settings = settings
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="outcome-policy"):
+        with Vertical(id="classification-rules"):
+            yield Static("Classification Rules", markup=False)
             yield Static(
-                "What should happen after semantic classification?\n"
-                "Routing rules are separate and run before classification.",
+                "These rules define what happens after classification.\n"
+                "They apply to explicitly classified messages in any mailbox folder.",
                 markup=False,
             )
+            yield Static("Category       Action     Destination", markup=False)
             for outcome in SpamOutcome:
                 action = getattr(self.settings.spam.actions, outcome.value)
-                label = action.action.value.upper()
-                if action.destination:
-                    label += f" -> {action.destination}"
-                yield Button(f"{outcome.value.upper()}  {label}  [Edit]", id=outcome.value)
+                yield Button(
+                    f"{outcome.value.upper():12} {action.action.value.upper():9} {action.destination or '-'}  Edit",
+                    id=outcome.value,
+                )
+            folders = ", ".join(self.settings.spam.folders)
+            yield Static(f"Automatic clean folders:\n  {folders}", markup=False)
+            yield Static("The automatic clean folder list controls batch processing only.", markup=False)
             yield Button("Close", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -342,7 +312,7 @@ class OutcomePolicyScreen(ModalScreen[SpamOutcome | None]):
         self.dismiss(None)
 
 
-class OutcomeActionEditorScreen(ModalScreen[tuple[MessageAction, bool] | None]):
+class ClassificationRuleEditorScreen(ModalScreen[tuple[MessageAction, bool] | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
 
     def __init__(self, outcome: SpamOutcome, action: MessageAction, destinations: tuple[str, ...]) -> None:
@@ -353,20 +323,37 @@ class OutcomeActionEditorScreen(ModalScreen[tuple[MessageAction, bool] | None]):
 
     def compose(self) -> ComposeResult:
         action = self.action
-        yield Static(f"{self.outcome.value.upper()} outcome action", markup=False)
-        yield Static("Actions: keep, move" + (", delete" if self.outcome is SpamOutcome.SPAM else ""), markup=False)
-        yield Input(action.action.value, id="outcome-action")
-        yield Static("Available destination folders: " + ", ".join(self.destinations), markup=False)
-        yield Input(action.destination or "", placeholder="existing destination folder", id="outcome-destination")
+        options = [("KEEP", ActionKind.KEEP.value), ("MOVE", ActionKind.MOVE.value)]
+        if self.outcome is SpamOutcome.SPAM:
+            options.append(("DELETE", ActionKind.DELETE.value))
+        destination_options = [(folder, folder) for folder in self.destinations]
+        destination_value = action.destination if action.destination in self.destinations else Select.NULL
+        yield Static("Edit classification rule", markup=False)
+        yield Static(f"When category is: {self.outcome.value.upper()}", markup=False)
+        yield Label("Action")
+        yield Select(options, value=action.action.value, allow_blank=False, id="outcome-action")
+        yield Label("Destination for MOVE")
+        yield Select(
+            destination_options,
+            prompt="Choose an existing folder",
+            value=destination_value,
+            allow_blank=True,
+            id="outcome-destination",
+        )
         yield Static(
-            "DELETE changes the policy for every future SPAM classification in configured source folders. "
-            "It is not limited to this sender or message.",
+            "Applies to any explicitly classified message, regardless of current folder.\n"
+            "Batch clean remains limited to configured automatic clean folders.",
+            markup=False,
+        )
+        yield Static(
+            "DELETE changes the global action for future SPAM classifications. "
+            "Saving the rule does not delete existing mail.",
             id="delete-policy-warning",
             markup=False,
         )
-        yield Button("Save policy", id="save")
+        yield Button("Save", id="save")
         if self.outcome is SpamOutcome.SPAM:
-            yield Button("Confirm global DELETE policy", id="save-delete", variant="error")
+            yield Button("Save DELETE rule", id="save-delete", variant="error")
         yield Button("Cancel", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -374,15 +361,19 @@ class OutcomeActionEditorScreen(ModalScreen[tuple[MessageAction, bool] | None]):
             self.dismiss(None)
             return
         try:
-            kind = ActionKind(self.query_one("#outcome-action", Input).value.strip().lower())
+            selected_action = self.query_one("#outcome-action", Select).value
+            if selected_action is Select.NULL:
+                raise ValueError("Choose a classification action.")
+            kind = ActionKind(selected_action)
             if kind is ActionKind.DELETE and self.outcome is not SpamOutcome.SPAM:
-                raise ValueError("DELETE is supported only for the SPAM outcome.")
-            destination = self.query_one("#outcome-destination", Input).value.strip() or None
-            action = MessageAction(kind, destination)
+                raise ValueError("DELETE is supported only for the SPAM category.")
+            selected_destination = self.query_one("#outcome-destination", Select).value
+            destination = selected_destination if isinstance(selected_destination, str) else None
+            action = MessageAction(kind, destination if kind is ActionKind.MOVE else None)
             if kind is ActionKind.DELETE and event.button.id != "save-delete":
-                raise ValueError("Use the explicit global DELETE confirmation action to save this policy.")
+                raise ValueError("Use the explicit global DELETE confirmation action to save this rule.")
             if kind is not ActionKind.DELETE and event.button.id == "save-delete":
-                raise ValueError("The global DELETE confirmation is available only for DELETE.")
+                raise ValueError("The DELETE confirmation is available only for a DELETE rule.")
         except ValueError as exc:
             self.query_one("#delete-policy-warning", Static).update(str(exc))
             return
@@ -398,12 +389,12 @@ class DeletePolicyConfirmation(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="delete-policy-confirmation"):
             yield Static(
-                "This changes the policy for every future message classified SPAM in configured source folders. "
+                "This changes the global action for future messages classified SPAM in any folder. "
                 "It is not limited to the current sender or message. Continue with DELETE?",
                 markup=False,
             )
             yield Button("Cancel", id="cancel")
-            yield Button("Apply global DELETE policy", id="confirm", variant="error")
+            yield Button("Save global DELETE action", id="confirm", variant="error")
 
     def on_mount(self) -> None:
         self.query_one("#cancel", Button).focus()

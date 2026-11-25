@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from imapledger.action_service import ActionReceipt
-from imapledger.analysis_service import AnalysisService, MessageAnalysis
+from imapledger.analysis_service import MessageAnalysis
 from imapledger.classification_state import SpamOutcome
 from imapledger.config import (
     ActionKind,
@@ -28,7 +28,7 @@ from imapledger.rule_service import RuleService
 from imapledger.rules import MailRule, RuleMatch, RuleSet
 from imapledger.settings_service import SettingsService
 from imapledger.tui.app import ApplyConfirmation, MailReviewApp
-from imapledger.tui.rule_screens import ActionCenterScreen, RuleCenterScreen
+from imapledger.tui.rule_screens import ClassificationRulesScreen, RuleCenterScreen
 
 SETTINGS = Settings(
     imap=ImapSettings(host="imap.example.org", username="user@example.org"),
@@ -227,13 +227,11 @@ async def _browse_classify_apply():
         assert app._analysis is not None
         analysis_text = str(app.query_one("#analysis", Static).render())
         assert "Source: semantic classifier" in analysis_text
-        assert "Outcome: REVIEW" in analysis_text
+        assert "Category: REVIEW" in analysis_text
         assert "Verdict: REVIEW" in analysis_text
-        assert "Configured REVIEW action: KEEP" in analysis_text
-        assert "Effect: no move/delete" in analysis_text
+        assert "REVIEW → KEEP" in analysis_text
+        assert "a Apply KEEP" in analysis_text
         await pilot.press("a")
-        await pilot.pause()
-        await pilot.click("#keep")
         await pilot.pause()
         folder_list_calls_before_action = len(mail.folder_list_modes)
         await pilot.click("#apply")
@@ -249,8 +247,6 @@ async def _browse_classify_apply():
         await pilot.press("c")
         await pilot.pause()
         await pilot.press("a")
-        await pilot.pause()
-        await pilot.click("#keep")
         await pilot.pause()
         await pilot.click("#apply")
         await pilot.pause()
@@ -748,7 +744,8 @@ def test_remote_images_require_confirmation_and_cancel_is_default():
     asyncio.run(_remote_image_loading_requires_explicit_confirmation())
 
 
-async def _action_center_and_rule_center_are_local(tmp_path: Path) -> None:
+async def _classification_rules_and_filters_have_distinct_shortcuts(tmp_path: Path) -> None:
+    from textual.widgets import Static
 
     mail = FakeMailService()
     rules_path = tmp_path / "rules.toml"
@@ -764,9 +761,9 @@ async def _action_center_and_rule_center_are_local(tmp_path: Path) -> None:
 
     async with app.run_test(size=(100, 32)) as pilot:
         await pilot.pause()
-        await app._open_message("Spam", 9)
+        await app._open_message("INBOX", 9)
         app._analysis = MessageAnalysis(
-            folder="Spam",
+            folder="INBOX",
             uid=9,
             persisted_outcome=None,
             rule_id=None,
@@ -779,120 +776,65 @@ async def _action_center_and_rule_center_are_local(tmp_path: Path) -> None:
         )
         await pilot.press("a")
         await pilot.pause()
-        assert isinstance(app.screen, ActionCenterScreen)
-        assert "Outcome: SPAM" in app.screen.description
-        assert "Verdict: DELETE" in app.screen.description
-        assert "Configured SPAM action: KEEP" in app.screen.description
-        assert "no move/delete" in app.screen.description
-        app.screen.query_one("#create-rule")
+        assert isinstance(app.screen, ApplyConfirmation)
+        confirmation = str(app.screen.query_one("#confirm-box").children[1].render())
+        assert "Category: SPAM" in confirmation
+        assert "Rule: SPAM -> KEEP" in confirmation
+        assert "Source: INBOX" in confirmation
+        assert "UID: 9" in confirmation
+        assert "Action: KEEP" in confirmation
+        assert "This changes only the selected message." in confirmation
         await pilot.press("escape")
         await pilot.press("R")
         await pilot.pause()
-        assert isinstance(app.screen, RuleCenterScreen)
+        assert isinstance(app.screen, ClassificationRulesScreen)
+        for category in ("#spam", "#not_spam", "#review"):
+            assert app.screen.query_one(category)
+        screen_text = "\n".join(str(widget.render()) for widget in app.screen.query(Static))
+        assert "any mailbox folder" in screen_text
+        assert "Automatic clean folders" in screen_text
+        assert not app.screen.query("#rule-list")
         assert mail.requested_folders == []
+        await pilot.press("escape")
+        await pilot.press("F")
+        await pilot.pause()
+        assert isinstance(app.screen, RuleCenterScreen)
+        assert "Routing Filters" in str(app.screen.query_one("#rule-center").children[0].render())
         assert not rules_path.exists()
 
 
-def test_action_center_explains_classifier_policy_mismatch_and_rule_center_is_local(tmp_path: Path) -> None:
-    asyncio.run(_action_center_and_rule_center_are_local(tmp_path))
+def test_classification_rules_and_routing_filters_have_distinct_shortcuts(tmp_path: Path) -> None:
+    asyncio.run(_classification_rules_and_filters_have_distinct_shortcuts(tmp_path))
 
 
-async def _create_rule_save_only_does_not_apply_mail(tmp_path: Path) -> None:
-    mail = FakeMailService()
+async def _classification_action_flow_does_not_offer_routing_filter_creation() -> None:
     actions = FakeActionService()
-    rule_path = tmp_path / "rules.toml"
     app = MailReviewApp(
         Path("unused.toml"),
-        mail_service=mail,
+        mail_service=FakeMailService(),
         settings=SETTINGS,
-        rules=RuleSet(),
-        rule_service=RuleService(rule_path, source_folders=("Spam",)),
-        analysis_service=FakeAnalysisService(),
+        analysis_service=FakeAnalysisService(SpamOutcome.SPAM),
         action_service=actions,
     )
 
-    async with app.run_test(size=(110, 36)) as pilot:
+    async with app.run_test(size=(100, 32)) as pilot:
         await pilot.pause()
-        await app._open_message("Spam", 9)
+        await app._open_message("INBOX", 9)
         await pilot.press("c")
         await pilot.pause()
+        assert app._analysis.outcome is SpamOutcome.SPAM
         await pilot.press("a")
         await pilot.pause()
-        await pilot.click("#create-rule")
-        await pilot.pause()
-        assert app.screen.__class__.__name__ == "RuleEditorScreen"
-        app.screen.query_one("#rule-editor").scroll_end()
-        await pilot.pause()
-        await pilot.click("#save")
-        await pilot.pause(0.1)
-        assert [rule.id for rule in RuleService(rule_path, source_folders=("Spam",)).load().rules] == [
-            "sender-example-org"
-        ]
-        assert actions.calls == []
-        assert "Saved rule" in str(app.query_one("#status").render())
-
-
-def test_create_rule_save_only_persists_without_mail_action(tmp_path: Path) -> None:
-    asyncio.run(_create_rule_save_only_does_not_apply_mail(tmp_path))
-
-
-async def _create_rule_save_and_apply_requires_confirmation(tmp_path: Path) -> None:
-    from textual.widgets import Input
-
-    mail = FakeMailService()
-    actions = FakeActionService()
-    rule_path = tmp_path / "rules.toml"
-    rule_service = RuleService(rule_path, source_folders=("Spam",))
-    analysis_service = AnalysisService(
-        SETTINGS,
-        RuleSet(),
-        classifier_factory=lambda **kwargs: (_ for _ in ()).throw(AssertionError()),
-    )
-    app = MailReviewApp(
-        Path("unused.toml"),
-        mail_service=mail,
-        settings=SETTINGS,
-        rules=RuleSet(),
-        rule_service=rule_service,
-        analysis_service=FakeAnalysisService(),
-        action_service=actions,
-    )
-
-    async with app.run_test(size=(110, 36)) as pilot:
-        await pilot.pause()
-        await app._open_message("Spam", 9)
-        await pilot.press("c")
-        await pilot.pause()
-        app.analysis_service = analysis_service
-        await pilot.press("a")
-        await pilot.pause()
-        assert isinstance(app.screen, ActionCenterScreen)
-        await pilot.click("#create-rule")
-        await pilot.pause()
-        app.screen.query_one("#rule-action", Input).value = "move"
-        app.screen.query_one("#rule-destination", Input).value = "INBOX"
-        await pilot.click("#save-apply")
-        await pilot.pause(0.1)
-        assert [rule.id for rule in rule_service.load().rules] == ["sender-example-org"]
         assert isinstance(app.screen, ApplyConfirmation)
-        assert app._analysis.rule_id == "sender-example-org"
-        assert app._analysis.decision_source == "rule"
-        analysis_text = str(app.query_one("#analysis").render())
-        assert "Source: deterministic rule" in analysis_text
-        assert "Classifier: not run" in analysis_text
-        assert "MOVE UID 9 from Spam to INBOX" in analysis_text
+        confirmation = str(app.screen.query_one("#confirm-box").children[1].render())
+        assert "Category: SPAM" in confirmation
+        assert "Source: INBOX" in confirmation
+        assert "Create routing rule from this message" not in confirmation
         assert actions.calls == []
-        confirmation_text = str(app.screen.query_one("#confirm-box").children[1].render())
-        assert "MOVE UID 9 from Spam to INBOX" in confirmation_text
-        await pilot.click("#apply")
-        await pilot.pause(0.1)
-        assert len(actions.calls) == 1
-        assert actions.calls[0][0].rule_id == "sender-example-org"
-        assert actions.calls[0][2] is True
 
 
-def test_create_rule_save_and_apply_persists_before_confirmation(tmp_path: Path) -> None:
-    asyncio.run(_create_rule_save_and_apply_requires_confirmation(tmp_path))
+def test_classification_action_flow_does_not_offer_routing_filter_creation() -> None:
+    asyncio.run(_classification_action_flow_does_not_offer_routing_filter_creation())
 
 
 async def _rule_center_toggle_and_cancel_remove(tmp_path: Path) -> None:
@@ -920,7 +862,7 @@ async def _rule_center_toggle_and_cancel_remove(tmp_path: Path) -> None:
 
     async with app.run_test(size=(100, 32)) as pilot:
         await pilot.pause()
-        await pilot.press("R")
+        await pilot.press("F")
         await pilot.pause()
         await pilot.press("space")
         await pilot.pause(0.1)
@@ -937,24 +879,44 @@ def test_rule_center_toggle_and_cancel_remove(tmp_path: Path) -> None:
     asyncio.run(_rule_center_toggle_and_cancel_remove(tmp_path))
 
 
-async def _out_of_scope_action_center_disables_mailbox_action() -> None:
-    app = MailReviewApp(Path("unused.toml"), settings=SETTINGS)
-    async with app.run_test(size=(100, 32)) as pilot:
-        app.push_screen(ActionCenterScreen("Review", scope_warning="Automation unavailable."))
-        await pilot.pause()
-        assert not app.screen.query("#keep")
-        assert app.screen.query("#create-rule")
-        assert app.screen.query("#rules")
-
-
-def test_out_of_scope_action_center_does_not_offer_mailbox_action() -> None:
-    asyncio.run(_out_of_scope_action_center_disables_mailbox_action())
-
-
-async def _outcome_policy_change_refreshes_runtime(tmp_path: Path) -> None:
+async def _selected_message_apply_is_not_limited_to_clean_folders() -> None:
     mail = FakeMailService()
     actions = FakeActionService()
-    analysis = FakeAnalysisService(SpamOutcome.SPAM)
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=mail,
+        settings=SETTINGS,
+        analysis_service=FakeAnalysisService(SpamOutcome.SPAM),
+        action_service=actions,
+    )
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+        await app._open_message("INBOX", 9)
+        app._analysis = app.analysis_service.analyze("INBOX", MESSAGE)
+        await pilot.press("a")
+        await pilot.pause()
+        assert isinstance(app.screen, ApplyConfirmation)
+        confirmation = str(app.screen.query_one("#confirm-box").children[1].render())
+        assert "Category: SPAM" in confirmation
+        assert "Source: INBOX" in confirmation
+        assert "Automation unavailable" not in confirmation
+        await pilot.click("#apply")
+        await pilot.pause(0.1)
+        assert len(actions.calls) == 1
+        assert actions.calls[0][0].folder == "INBOX"
+        assert actions.calls[0][2] is True
+
+
+def test_selected_message_action_is_not_limited_to_clean_folders() -> None:
+    asyncio.run(_selected_message_apply_is_not_limited_to_clean_folders())
+
+
+async def _classification_rule_edit_refreshes_runtime(tmp_path: Path) -> None:
+    from textual.widgets import Select
+
+    mail = FakeMailService()
+    actions = FakeActionService()
+    analysis = FakeAnalysisService(SpamOutcome.REVIEW)
     config_path = tmp_path / "config.toml"
     write_settings(SETTINGS, config_path)
     app = MailReviewApp(
@@ -969,36 +931,37 @@ async def _outcome_policy_change_refreshes_runtime(tmp_path: Path) -> None:
 
     async with app.run_test(size=(100, 32)) as pilot:
         await pilot.pause()
-        await app._open_message("Spam", 9)
-        app._analysis = analysis.analyze("Spam", MESSAGE)
-        await pilot.press("a")
+        await app._open_message("INBOX", 9)
+        app._analysis = analysis.analyze("INBOX", MESSAGE)
+        await pilot.press("R")
         await pilot.pause()
-        await pilot.click("#policy")
+        await pilot.click("#review")
         await pilot.pause()
-        await pilot.click("#spam")
-        await pilot.pause()
-        from textual.widgets import Input
-
-        app.screen.query_one("#outcome-action", Input).value = "move"
-        app.screen.query_one("#outcome-destination", Input).value = "INBOX"
+        app.screen.query_one("#outcome-action", Select).value = "move"
+        app.screen.query_one("#outcome-destination", Select).value = "INBOX"
         await pilot.click("#save")
         await pilot.pause(0.1)
 
         expected = MessageAction(ActionKind.MOVE, "INBOX")
-        assert load_settings(config_path).spam.actions.spam == expected
-        assert app.settings.spam.actions.spam == expected
-        assert analysis.settings.spam.actions.spam == expected
-        assert actions.settings.spam.actions.spam == expected
+        assert load_settings(config_path).spam.actions.review == expected
+        assert app.settings.spam.actions.review == expected
+        assert analysis.settings.spam.actions.review == expected
+        assert actions.settings.spam.actions.review == expected
         assert app._analysis.configured_action == expected
+        assert actions.calls == []
         await pilot.press("a")
         await pilot.pause()
         assert isinstance(app.screen, ApplyConfirmation)
+        confirmation = str(app.screen.query_one("#confirm-box").children[1].render())
+        assert "Category: REVIEW" in confirmation
+        assert "Source: INBOX" in confirmation
+        assert "Action: MOVE" in confirmation
+        assert "Target: INBOX" in confirmation
         assert actions.calls == []
-        await pilot.press("escape")
 
 
-def test_outcome_policy_updates_config_and_runtime_without_applying_message(tmp_path: Path) -> None:
-    asyncio.run(_outcome_policy_change_refreshes_runtime(tmp_path))
+def test_classification_rule_updates_runtime_without_mutating_mail(tmp_path: Path) -> None:
+    asyncio.run(_classification_rule_edit_refreshes_runtime(tmp_path))
 
 
 async def _delete_outcome_policy_requires_two_explicit_confirmations(tmp_path: Path) -> None:
@@ -1017,12 +980,12 @@ async def _delete_outcome_policy_requires_two_explicit_confirmations(tmp_path: P
         await pilot.pause()
         await pilot.click("#spam")
         await pilot.pause()
-        from textual.widgets import Input
+        from textual.widgets import Select
 
-        app.screen.query_one("#outcome-action", Input).value = "delete"
+        app.screen.query_one("#outcome-action", Select).value = "delete"
         await pilot.click("#save")
         await pilot.pause()
-        assert app.screen.__class__.__name__ == "OutcomeActionEditorScreen"
+        assert app.screen.__class__.__name__ == "ClassificationRuleEditorScreen"
         assert config_path.read_bytes() == before
         await pilot.click("#save-delete")
         await pilot.pause()
@@ -1035,7 +998,7 @@ async def _delete_outcome_policy_requires_two_explicit_confirmations(tmp_path: P
         await pilot.pause()
         await pilot.click("#spam")
         await pilot.pause()
-        app.screen.query_one("#outcome-action", Input).value = "delete"
+        app.screen.query_one("#outcome-action", Select).value = "delete"
         await pilot.click("#save-delete")
         await pilot.pause()
         await pilot.click("#confirm")

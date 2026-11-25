@@ -1,6 +1,6 @@
 # imapledger
 
-imapledger is a security-scoped IMAP automation and configuration-ledger tool. It scans configured source folders, classifies messages using `pyjev` evidence, then maps deterministic policy outcomes to configured mailbox actions. The semantic model never receives an IMAP client and cannot select destinations or issue IMAP commands.
+imapledger is a security-scoped IMAP mail tool and configuration ledger. Unattended `clean` scans only the configured `spam.folders`; classification outcomes map to global SPAM, NOT_SPAM, and REVIEW actions. A user can manually apply a category action to one selected message in any selectable folder. The semantic model never receives an IMAP client and cannot select destinations or issue IMAP commands.
 
 ## Security model
 
@@ -39,7 +39,7 @@ imapledger folders \
   --username me@example.org
 ```
 
-Copy the exact IMAP name column into `spam.folders` or an action `destination`. The command uses IMAP `LIST` and aggregate `STATUS (MESSAGES UNSEEN)` counts. It does not select mailboxes or fetch message contents. `--no-counts` skips STATUS entirely. STATUS avoids a client-side scan through messages, although the server may do internal work to calculate mailbox counts.
+Use exact IMAP names for `spam.folders` and action destinations. `spam.folders` defines only the unattended batch-clean scope; it does not limit manual classification actions. The command uses IMAP `LIST` and aggregate `STATUS (MESSAGES UNSEEN)` counts. It does not select mailboxes or fetch message contents. `--no-counts` skips STATUS entirely. STATUS avoids a client-side scan through messages, although the server may do internal work to calculate mailbox counts.
 
 Create a configuration file with repeated source folders and explicit actions:
 
@@ -125,7 +125,7 @@ destination = "INBOX.NotSpam"
 action = "keep"
 ```
 
-The source folders are scanned in listed order. A `SpamVerdict.DELETE` maps to the spam outcome, `SpamVerdict.KEEP` maps to not-spam, and `SpamVerdict.REVIEW` maps to review. Configuration selects the action for each outcome. REVIEW defaults to keep. Skip and error results always keep. Delete is supported only for spam. Move destinations must already exist and cannot be any configured source folder.
+The source folders are scanned in listed order by `clean`. A `SpamVerdict.DELETE` maps to SPAM, `SpamVerdict.KEEP` maps to NOT_SPAM, and `SpamVerdict.REVIEW` maps to REVIEW. The `[spam.actions.*]` settings define global category actions. Manual actions apply to an explicitly selected message in any selectable folder; unattended `clean` remains limited to `spam.folders`. REVIEW defaults to keep. Skip and error results always keep. Delete is supported only for SPAM. Move destinations must already exist and cannot be any configured source folder.
 
 Mailbox names are exact and server-specific. Every configured source must exist and be selectable on the account. The `INBOX.Junk` and `INBOX.Spam` names above are examples, not universal names. `doctor` distinguishes missing sources from existing sources that cannot be selected.
 For the new plural `folders` schema, omitted action tables default to `keep`. Permanent deletion therefore requires an explicit `[spam.actions.spam]` entry. Legacy scalar `spam.folder` configurations retain the old spam-delete default when action tables are absent.
@@ -192,11 +192,11 @@ imapledger mail classify 43724 --folder INBOX.Junk
 imapledger mail classify 43724 --folder INBOX.Junk --apply
 ```
 
-`mail list` fetches bounded headers only. `mail show` reads bounded text without changing flags. `mail classify` is preview-only unless `--apply` is explicitly supplied; applying uses the configured action and the existing mailbox safety checks. Non-source folders can be inspected but cannot be automated. Bare `imapledger` continues to print help, including in non-interactive use.
+`mail list` fetches bounded headers only. `mail show` reads bounded text without changing flags. `mail classify` is preview-only unless `--apply` is explicitly supplied; applying uses the category's global action and existing exact-folder, UID, and mailbox safety checks. Classification can target a message from any selectable folder. This manual operation does not expand the `clean` scan scope. Bare `imapledger` continues to print help, including in non-interactive use.
 
-## Learned routing rules
+## Optional advanced routing filters
 
-Use a routing rule for a personal mailbox preference that should remain separate from spam classification. For example, learn a narrow rule from one explicitly scoped message UID:
+Use an optional advanced routing filter for a personal mailbox preference that should remain separate from global SPAM, NOT_SPAM, and REVIEW actions. Filters affect batch `clean`; they do not replace manual classification actions. For example, learn a narrow filter from one explicitly scoped message UID:
 
 ```bash
 imapledger rule learn 43627 --folder INBOX.Junk --move INBOX.Trash --preview
@@ -207,7 +207,7 @@ imapledger rule test mailer-daemon-gmx-net --limit 20
 
 Learning requires a configured source folder and an explicit move destination. Jev selects only from deterministic matcher candidates generated locally by imapledger; it cannot invent a matcher or destination. The message body is excluded from Jev's learning state by default. A proposal must pass local safety thresholds before it can be saved. `--preview` does not save, and the default save prompt is no. `--yes` confirms saving only. Moving the example message requires the separate `--apply-current` option.
 
-Saved rules run before spam classification and are matched locally. A matching rule bypasses classification for that message, while non-matches continue through the existing spam policy. Rules are limited to configured source folders and cannot change REVIEW behavior for other messages. `clean` remains read-only unless `--apply` is supplied. See [docs/rules.md](docs/rules.md) for the schema, precedence, and safety details.
+Optional advanced routing filters in the existing `rules.toml` format are used by batch `clean` and explicit `explain`, not by manual category actions. A matching filter bypasses classification for that message, while non-matches continue through the global category actions. Filters are limited to configured source folders and cannot broaden the scan. They are separate from manual classification actions. `clean` remains read-only unless `--apply` is supplied. See [docs/rules.md](docs/rules.md) for the schema, precedence, and safety details.
 
 ## Evidence and policy
 

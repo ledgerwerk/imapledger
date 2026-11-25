@@ -5,10 +5,9 @@ from typing import Any
 
 from .analysis_service import MessageAnalysis
 from .classification_state import ClassificationStateBackend, all_state_keywords, keyword_for_outcome
-from .config import ActionKind, MessageAction, Settings
+from .config import ActionKind, MessageAction, Settings, action_for_outcome
 from .mailbox import PartialDeleteError, PartialMoveError, ScopedMailbox
 from .preflight import preflight_source
-from .rules import RuleSet
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,25 +26,20 @@ class ActionReceipt:
 
 
 class ActionService:
-    """Apply only configured, freshly scoped one-message actions."""
+    """Apply one configured classification action to one exact selected message."""
 
     def __init__(
         self,
         settings: Settings,
         password: str,
-        rules: RuleSet,
         *,
         mailbox_factory: Any = ScopedMailbox,
         preflight: Any = preflight_source,
     ) -> None:
         self._settings = settings
         self._password = password
-        self._rules = rules
         self._mailbox_factory = mailbox_factory
         self._preflight = preflight
-
-    def set_rules(self, rules: RuleSet) -> None:
-        self._rules = rules
 
     def set_settings(self, settings: Settings) -> None:
         self._settings = settings
@@ -65,8 +59,6 @@ class ActionService:
         action = analysis.configured_action
         if action is None:
             raise ValueError("analysis does not contain a configured action")
-        if folder not in self._settings.spam.folders:
-            raise ValueError("automation is unavailable for a folder not configured as a source")
         if not self._is_configured_action(analysis, action):
             raise ValueError("refusing an action that is not configured for this message")
 
@@ -84,20 +76,7 @@ class ActionService:
         if not confirmed_by_user:
             return replace(receipt, detail="User confirmation is required; no changes made.")
 
-        destinations = tuple(
-            dict.fromkeys(
-                [
-                    configured.destination
-                    for configured in (
-                        self._settings.spam.actions.spam,
-                        self._settings.spam.actions.not_spam,
-                        self._settings.spam.actions.review,
-                    )
-                    if configured.action is ActionKind.MOVE and configured.destination is not None
-                ]
-                + [rule.action.destination for rule in self._rules.rules if rule.action.action is ActionKind.MOVE]
-            )
-        )
+        destinations = (action.destination,) if action.action is ActionKind.MOVE else ()
         requires_delete = action.action is ActionKind.DELETE
         state_keyword = None
         state_required = (
@@ -148,6 +127,16 @@ class ActionService:
                         detail="Message UID is no longer in the current mailbox snapshot; no changes made.",
                         state_keyword=state_keyword,
                     )
+                if action.action is ActionKind.MOVE and folder == action.destination:
+                    return replace(
+                        receipt,
+                        applied=True,
+                        confirmed=True,
+                        detail=(
+                            f"Message already resides in configured destination {action.destination}. "
+                            "No mailbox mutation required."
+                        ),
+                    )
                 if action.action is ActionKind.MOVE:
                     result = mailbox.move_uid(uid, action.destination)
                     confirmed = uid in result.moved
@@ -189,11 +178,6 @@ class ActionService:
             )
 
     def _is_configured_action(self, analysis: MessageAnalysis, action: MessageAction) -> bool:
-        if analysis.decision_source == "rule":
-            rule = next((item for item in self._rules.rules if item.id == analysis.rule_id), None)
-            return (
-                rule is not None and rule.enabled and analysis.folder in rule.source_folders and rule.action == action
-            )
         if analysis.outcome is None:
             return False
-        return getattr(self._settings.spam.actions, analysis.outcome.value) == action
+        return action == action_for_outcome(self._settings, analysis.outcome)

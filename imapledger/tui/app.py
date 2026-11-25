@@ -28,10 +28,9 @@ from ..rule_test_service import RuleTestService
 from ..rules import MailRule, RuleSet, load_rules, rules_path_for_config
 from ..settings_service import SettingsService
 from .rule_screens import (
-    ActionCenterScreen,
+    ClassificationRuleEditorScreen,
+    ClassificationRulesScreen,
     DeletePolicyConfirmation,
-    OutcomeActionEditorScreen,
-    OutcomePolicyScreen,
     RuleCenterScreen,
     RuleDeleteConfirmation,
     RuleDetailScreen,
@@ -93,29 +92,41 @@ class ApplyConfirmation(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         action = self.analysis.configured_action
         action_label = _format_action(action) if action is not None else "UNKNOWN"
-        current_action = MailReviewApp._current_action_label(self.analysis, action)
+        outcome = self.analysis.outcome or self.analysis.persisted_outcome
+        category = outcome.value.upper() if outcome is not None else "UNKNOWN"
+        action_kind = action.action.value.upper() if action is not None else "UNKNOWN"
+        target = (
+            action.destination
+            if action is not None and action.destination
+            else "permanent deletion"
+            if action is not None and action.action.value == "delete"
+            else self.analysis.folder
+        )
         warning = (
             "Permanently delete this exact message? UID EXPUNGE cannot be undone by imapledger."
             if action is not None and action.action.value == "delete"
-            else "Apply this action to the exact selected message?"
+            else "Apply this classification action to the exact selected message?"
         )
-        classification = (
-            self.analysis.outcome.value.upper()
-            if self.analysis.outcome is not None
-            else f"routing rule {self.analysis.rule_id}"
-            if self.analysis.rule_id
-            else "unavailable"
-        )
+        if action_kind == "DELETE":
+            apply_label = "Delete message"
+        elif action_kind == "MOVE":
+            apply_label = "Move message"
+        else:
+            apply_label = "Apply"
         with Vertical(id="confirm-box"):
             yield Static(warning, markup=False)
             yield Static(
-                f"Classification: {classification}\n"
-                f"Current action: {current_action}\n"
-                f"Folder: {self.analysis.folder}\nUID: {self.analysis.uid}",
+                f"Category: {category}\n"
+                f"Rule: {category} -> {action_label}\n\n"
+                f"Source: {self.analysis.folder}\n"
+                f"UID: {self.analysis.uid}\n"
+                f"Action: {action_kind}\n"
+                f"Target: {target}\n\n"
+                "This changes only the selected message.",
                 markup=False,
             )
             with Horizontal(id="confirm-buttons"):
-                yield Button("Apply", variant="error" if action_label.startswith("DELETE") else "primary", id="apply")
+                yield Button(apply_label, variant="error" if action_kind == "DELETE" else "primary", id="apply")
                 yield Button("Cancel", id="cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -269,22 +280,28 @@ class HelpScreen(ModalScreen[None]):
                     "  i               analyze embedded images only\n"
                     "  I               review remote-image loading (privacy-sensitive)\n\n"
                     "Actions\n"
-                    "  a               apply current action or open Action Center\n"
-                    "  R               open Rule Center\n"
-                    "  Outcome policy edits global SPAM/NOT_SPAM/REVIEW actions.\n"
-                    "  SPAM DELETE affects future apply operations, not saved mail.\n"
-                    "  Rule save-only never changes the current mailbox message.\n"
+                    "  a               apply the configured classification action to the selected message\n"
+                    "  R               open Classification Rules\n"
+                    "  F               open advanced Routing Filters\n"
+                    "  SPAM DELETE changes future SPAM actions, not existing mail.\n"
+                    "  Saving a classification rule changes configuration only.\n"
+                    "  Automatic clean folders limit batch clean only. Manual confirmed actions\n"
+                    "  can operate on a selected message in any folder.\n"
                     "  r               refresh\n\n"
-                    "Rules\n"
-                    "  j/k             move through rules\n"
-                    "  Enter           show selected rule\n"
-                    "  n/e             new/edit rule\n"
-                    "  Space           enable/disable rule\n"
+                    "Classification Rules\n"
+                    "  SPAM      KEEP / MOVE / DELETE\n"
+                    "  NOT_SPAM  KEEP / MOVE\n"
+                    "  REVIEW    KEEP / MOVE\n\n"
+                    "Routing Filters\n"
+                    "  j/k             move through filters\n"
+                    "  Enter           show selected filter\n"
+                    "  n/e             new/edit filter\n"
+                    "  Space           enable/disable filter\n"
                     "  t               bounded read-only test\n"
-                    "  d               remove rule\n"
-                    "  [ / ]           move rule priority\n\n"
-                    "Classifier verdict, configured outcome action, and routing rules are separate. "
-                    "Routing rules support KEEP/MOVE only.\n"
+                    "  d               remove filter\n"
+                    "  [ / ]           move filter priority\n\n"
+                    "Routing filters match message headers and are separate from classification\n"
+                    "categories. Filters support KEEP/MOVE only.\n"
                     "General\n"
                     "  h / ?           show help (h closes this page)\n"
                     "  Escape          close help\n"
@@ -309,7 +326,8 @@ class MailReviewApp(App[None]):
         Binding("c", "classify", "Classify"),
         Binding("C", "reclassify", "Reclassify"),
         Binding("a", "apply", "Action"),
-        Binding("R", "rules", "Rules"),
+        Binding("R", "classification_rules", "Classification Rules"),
+        Binding("F", "filters", "Routing Filters"),
         Binding("i", "analyze_images", "Analyze images"),
         Binding("I", "remote_images", "Remote images"),
         Binding("tab", "next_pane", "Next pane", priority=True),
@@ -880,47 +898,19 @@ class MailReviewApp(App[None]):
             )
 
     def _render_analysis(self, analysis: MessageAnalysis) -> None:
-        action = analysis.configured_action
-        action_label = _format_action(action) if action is not None else "not configured"
         lines = ["Analysis"]
-        if analysis.decision_source == "rule":
-            lines.extend(
-                (
-                    "  Source: deterministic rule",
-                    f"  Rule: {analysis.rule_id}",
-                    "  Classifier: not run",
-                    "",
-                    "Action",
-                    f"  {self._current_action_label(analysis, action)}",
-                    "",
-                    "Next",
-                    "  a Apply",
-                    "  R View/edit rule",
-                )
-            )
-        elif analysis.decision_source == "persisted-state":
-            outcome = analysis.persisted_outcome.value.upper() if analysis.persisted_outcome else "-"
-            lines.extend(
-                (
-                    "  Source: persisted state",
-                    f"  Stored outcome: {outcome}",
-                    "  Classifier: not run",
-                    "",
-                    "Policy",
-                    f"  Configured {outcome} action: {action_label}",
-                    f"  Effect: {self._action_effect(action)}",
-                    "",
-                    "Next",
-                    "  a Choose/apply message action",
-                    "  R Rules",
-                )
-            )
+        outcome = analysis.outcome or analysis.persisted_outcome
+        if analysis.decision_source == "persisted-state":
+            lines.append("  Source: persisted state")
+            lines.append(f"  Category: {outcome.value.upper() if outcome is not None else '-'}")
+            lines.append("  Classifier: not run")
+        elif analysis.decision_source == "rule":
+            lines.extend(("  Source: routing filter", f"  Filter: {analysis.rule_id}", "  Classification: not run"))
         elif analysis.verdict is not None:
-            outcome = analysis.outcome.value.upper() if analysis.outcome else "-"
             lines.extend(
                 (
                     "  Source: semantic classifier",
-                    f"  Outcome: {outcome}",
+                    f"  Category: {outcome.value.upper() if outcome is not None else '-'}",
                     f"  Verdict: {analysis.verdict.name}",
                 )
             )
@@ -932,23 +922,35 @@ class MailReviewApp(App[None]):
                     f"legitimate {analysis.signals.legitimate_expected:.2f}, "
                     f"delete {analysis.signals.delete_safe:.2f}"
                 )
+            lines.append(f"  Reasons: {', '.join(analysis.reasons) or '-'}")
+        else:
+            lines.extend(("  Source: none", "  Classifier: not run"))
+
+        if outcome is not None:
+            action = analysis.configured_action
+            action_label = _format_action(action) if action is not None else "not configured"
+            action_label = action_label.replace(" -> ", " ")
             lines.extend(
                 (
-                    f"  Reasons: {', '.join(analysis.reasons) or '-'}",
                     "",
-                    "Policy",
-                    f"  Configured {outcome} action: {action_label}",
-                    f"  Effect: {self._action_effect(action)}",
+                    "Classification rule",
+                    f"  {outcome.value.upper()} → {action_label}",
+                    "",
+                    "Scope",
+                    f"  Manual action: available in {analysis.folder}",
+                    (
+                        f"  Batch clean: {analysis.folder} is an automatic clean folder"
+                        if self.settings and analysis.folder in self.settings.spam.folders
+                        else f"  Batch clean: {analysis.folder} is not in the automatic clean folders"
+                    ),
                     "",
                     "Next",
-                    "  a Choose/apply message action",
-                    "  R Rules",
+                    f"  a Apply {action_label}" if action is not None else "  No action is configured",
+                    "  R Edit classification rules",
                 )
             )
         else:
-            lines.extend(("  Source: none", "  Classifier: not run"))
-        if self._selected_folder not in (self.settings.spam.folders if self.settings else ()):
-            lines.append("Automation unavailable: this folder is not configured in spam.folders.")
+            lines.extend(("", "Next", "  R Edit classification rules"))
         self.query_one("#analysis", Static).update("\n".join(lines))
 
     @staticmethod
@@ -1023,79 +1025,31 @@ class MailReviewApp(App[None]):
         if analysis is None:
             self._set_status("Classify this message first with c.")
             return
-        if self.settings is None:
-            self._set_status("Action services are unavailable.")
+        if analysis.configured_action is None:
+            self._set_status("No classification action is configured.")
             return
-        out_of_scope = analysis.folder not in self.settings.spam.folders
-        action = analysis.configured_action
-        if not out_of_scope and action is not None and action.action.value in {"move", "delete"}:
-            self.push_screen(ApplyConfirmation(analysis), self._confirmed_action)
-            return
-        description = self._action_center_description(analysis)
-        warning = (
-            f"Automation is disabled for {analysis.folder} because it is not configured in spam.folders. "
-            "You may inspect rules or draft a rule, but this UI will not expand the automation scope."
-            if out_of_scope
-            else None
-        )
-        keep_label = (
-            "Apply KEEP / leave the message unchanged"
-            if analysis.decision_source == "rule"
-            else "Apply KEEP / persist classification"
-        )
-        self.push_screen(
-            ActionCenterScreen(description, scope_warning=warning, keep_label=keep_label),
-            self._action_center_selected,
-        )
+        self.push_screen(ApplyConfirmation(analysis), self._confirmed_action)
 
-    def _action_center_description(self, analysis: MessageAnalysis) -> str:
-        outcome = analysis.outcome.value.upper() if analysis.outcome else "-"
-        verdict = analysis.verdict.name if analysis.verdict is not None else "not available"
-        action = analysis.configured_action
-        configured = action.action.value.upper() if action is not None else "not configured"
-        if action is not None and action.destination:
-            configured += f" -> {action.destination}"
-        effect = "no move/delete" if action and action.action.value == "keep" else "mailbox action available"
-        if analysis.rule_id:
-            return (
-                f"Decision source: deterministic routing rule\n  Rule: {analysis.rule_id}\n"
-                f"  Action: {configured}\n  Effect: {effect}\n\nWhat do you want to do?"
-            )
-        return (
-            f"Classification\n  Outcome: {outcome}\n  Verdict: {verdict}\n\n"
-            f"Outcome policy\n  Configured {outcome} action: {configured}\n"
-            f"  Effect: {effect}\n\n"
-            "What do you want to do?"
-        )
+    def action_classification_rules(self) -> None:
+        self._open_outcome_policy()
 
-    def _action_center_selected(self, choice: str) -> None:
-        if choice == "keep":
-            if self._analysis is not None:
-                self.push_screen(ApplyConfirmation(self._analysis), self._confirmed_action)
-        elif choice == "create-rule":
-            self._open_rule_editor()
-        elif choice == "rules":
-            self.action_rules()
-        elif choice == "policy":
-            self._open_outcome_policy()
-
-    def action_rules(self) -> None:
+    def action_filters(self) -> None:
         if self.rule_service is None:
-            self._set_status("Rule management is unavailable.")
+            self._set_status("Routing filter management is unavailable.")
             return
         try:
             rules = self.rule_service.load()
         except Exception as exc:
-            self._set_status(f"Could not load rules: {type(exc).__name__}")
+            self._set_status(f"Could not load routing filters: {type(exc).__name__}")
             return
         self.rules = rules
         self.push_screen(RuleCenterScreen(rules), self._rule_center_selected)
 
     def _open_outcome_policy(self) -> None:
         if self.settings is None or self.settings_service is None:
-            self._set_status("Outcome policy editing is unavailable.")
+            self._set_status("Classification Rules editing is unavailable.")
             return
-        self.push_screen(OutcomePolicyScreen(self.settings), self._outcome_policy_selected)
+        self.push_screen(ClassificationRulesScreen(self.settings), self._outcome_policy_selected)
 
     def _outcome_policy_selected(self, outcome: SpamOutcome | None) -> None:
         if outcome is None or self.settings is None:
@@ -1109,7 +1063,7 @@ class MailReviewApp(App[None]):
         )
         action = getattr(self.settings.spam.actions, outcome.value)
         self.push_screen(
-            OutcomeActionEditorScreen(outcome, action, folders),
+            ClassificationRuleEditorScreen(outcome, action, folders),
             lambda result: self._outcome_action_selected(outcome, result, folders),
         )
 
@@ -1120,15 +1074,15 @@ class MailReviewApp(App[None]):
         destinations: tuple[str, ...],
     ) -> None:
         if result is None:
-            self._set_status("Outcome policy edit cancelled. No changes made.")
+            self._set_status("Classification rule edit cancelled. No changes made.")
             return
         action, explicit_delete = result
         if action.action.value == "move" and action.destination not in destinations:
-            self._set_status(f"Destination {action.destination} is not an available policy destination.")
+            self._set_status(f"Destination {action.destination} is not an available classification destination.")
             return
         if action.action.value == "delete":
             if outcome is not SpamOutcome.SPAM or not explicit_delete:
-                self._set_status("DELETE requires explicit global SPAM policy confirmation.")
+                self._set_status("DELETE requires explicit global SPAM action confirmation.")
                 return
             self.push_screen(
                 DeletePolicyConfirmation(),
@@ -1157,7 +1111,7 @@ class MailReviewApp(App[None]):
         try:
             if self.settings_service is None:
                 raise RuntimeError("settings service unavailable")
-            result = await asyncio.to_thread(self.settings_service.set_spam_action, outcome, action)
+            result = await asyncio.to_thread(self.settings_service.set_classification_action, outcome, action)
             self.settings = result.settings
             for service in (self.analysis_service, self.action_service):
                 if service is not None and hasattr(service, "set_settings"):
@@ -1165,15 +1119,15 @@ class MailReviewApp(App[None]):
             await self._reanalyze_current_message()
             before = _format_action(result.previous_action)
             after = _format_action(result.action)
-            self._activity.append(f"Policy changed: {outcome.value.upper()} {before} -> {after}")
+            self._activity.append(f"Classification rule changed: {outcome.value.upper()} {before} -> {after}")
             self._render_activity()
-            self._set_status(f"Policy changed: {outcome.value.upper()} {before} -> {after}.")
+            self._set_status(f"Classification rule changed: {outcome.value.upper()} {before} -> {after}.")
         except Exception as exc:
-            self._set_status(f"Policy save failed: {type(exc).__name__}.")
+            self._set_status(f"Classification rule save failed: {type(exc).__name__}.")
 
     def _open_rule_editor(self, rule: MailRule | None = None) -> None:
         if self.rule_service is None or self.settings is None:
-            self._set_status("Rule management is unavailable.")
+            self._set_status("Routing filter management is unavailable.")
             return
         detail = self._detail
         message = detail.item.message if detail is not None else None
@@ -1223,7 +1177,7 @@ class MailReviewApp(App[None]):
             else:
                 self._set_status(f"Saved rule {rule.id}. Current message analysis refreshed.")
             if not apply_current:
-                self.action_rules()
+                self.action_filters()
         except Exception as exc:
             self._set_status(f"Rule save failed: {type(exc).__name__}.")
 
@@ -1253,7 +1207,7 @@ class MailReviewApp(App[None]):
                     matches_current=matches,
                     winning=winning is not None and winning.id == rule.id,
                 ),
-                lambda _: self.action_rules(),
+                lambda _: self.action_filters(),
             )
         elif action == "remove":
             self.push_screen(
@@ -1304,7 +1258,7 @@ class MailReviewApp(App[None]):
             self._activity.append(result.detail)
             self._render_activity()
             self._set_status(result.detail)
-            self.action_rules()
+            self.action_filters()
         except Exception as exc:
             self._set_status(f"Rule change failed: {type(exc).__name__}.")
 
@@ -1337,7 +1291,6 @@ class MailReviewApp(App[None]):
             detail.folder,
             detail.item.message,
             persisted_outcome=state,
-            prefer_rules=True,
         )
         self._render_analysis(self._analysis)
 
@@ -1539,7 +1492,7 @@ def run(config: Path) -> None:
         rule_test_service = RuleTestService(settings, password)
         image_analysis_service = ImageAnalysisService()
         remote_image_loader = RemoteImageLoader()
-        action_service = ActionService(settings, password, rules)
+        action_service = ActionService(settings, password)
         MailReviewApp(
             config,
             mail_service=mail_service,
