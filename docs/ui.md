@@ -6,7 +6,7 @@ Launch the terminal interface with:
 imapledger ui
 ```
 
-The console provides folder browsing, a message list, bounded plain-text message detail, and current-message routing analysis. It is primarily a rule-development and single-message test workbench. Reading a message uses the read-only `BODY.PEEK` path. HTML is not rendered and attachments are not opened.
+The console is the interactive frontend for mailbox operations, review, classification state, progress, diagnostics, rules, credentials, configuration, and the Config Ledger. It shares application operations with the CLI and does not shell out to CLI subprocesses. Launch is disconnected and does not resolve credentials; connect only when a mailbox operation is needed. Reading a message uses the read-only `BODY.PEEK` path. HTML is not rendered and attachments are not opened.
 
 ## Keyboard shortcuts
 
@@ -16,11 +16,20 @@ The console provides folder browsing, a message list, bounded plain-text message
 | Right / `L`            | Focus the next pane                                         |
 | Tab / Shift+Tab        | Cycle focus through panes                                   |
 | Up / Down or `k` / `j` | Move through folders or messages; scroll message detail     |
-| `g` / `G`, Home / End  | Move to the first or last item, or top or bottom of detail  |
+| Home / End             | Move to the first or last item or top or bottom of detail   |
 | PageUp / PageDown      | Page through the focused pane                               |
 | Enter                  | Open the selected folder or message                         |
+| `x`                    | Preview Clean 10 in the selected folder                     |
+| `X`                    | Open the modern Clean dialog for the selected folder        |
+| `B`                    | Advanced / Legacy Clean over configured `spam.folders`      |
+| `p` / `d` / `S`        | Inspect progress, diagnostics, and classification state     |
+| `s`                    | Open System for setup, connection, credentials, and config  |
+| `:`                    | Open Command Center and search available operations         |
+| `G`                    | Open Config Ledger                                          |
 | `c` / `C`              | Analyze or reanalyze the selected message; no mail is moved |
+| `e`                    | Explain the selected message                                |
 | `R`                    | Open the unified Rules workbench                            |
+| `l`                    | Learn a rule from the selected message                      |
 | `a`                    | Apply the current routing plan after confirmation           |
 | `i`                    | Explicitly analyze eligible embedded images                 |
 | `I`                    | Review and optionally load remote images after confirmation |
@@ -29,6 +38,18 @@ The console provides folder browsing, a message list, bounded plain-text message
 | `q`                    | Quit                                                        |
 
 The focused pane has a highlighted border. Pane navigation follows the widget currently holding focus, including focus reached with the mouse.
+
+## Folder operations and shared workflows
+
+`x` previews the oldest 10 messages in the selected real folder. `X` opens the modern routing Clean dialog with limit, offset, order, rule scope, and preview or apply options. Apply runs read-only preflight first and then asks for explicit confirmation of the exact folder scope. The job screen streams safe per-message outcomes and supports cooperative cancellation. Applying rechecks progress identity, UIDVALIDITY, and message fingerprints through the shared clean operation.
+
+`B` opens Advanced / Legacy Clean. This compatibility workflow operates on every configured `spam.folders` source and applies the configured SPAM, NOT_SPAM, and REVIEW actions. It is distinct from modern positional routing Clean. Preview is the default. Apply preflights every source and requires a second confirmation; destinations must already exist.
+
+`p` opens progress and stored errors, including explicit retry and reset confirmations. `d` runs read-only diagnostics. `S` inspects classification state and offers preview-first, scoped state resets. Review browsing, state changes, rule learning and migration, and clean operations use the same application operations as their CLI counterparts.
+
+`s` opens System. TUI startup remains disconnected. System supports local setup and effective-config inspection, explicit connect and disconnect, and credential set, delete, or vault-passphrase workflows. Secrets are not shown in forms or operation output.
+
+`:` opens Command Center, which searches the operation inventory and explains unavailable requirements. `G` opens Config Ledger for snapshots, diffs, pulls, and pushes. Pull previews bind the target and snapshot content hashes; overwriting local configuration requires explicit confirmation and a fresh preview.
 
 ## Analyze and apply the exact plan
 
@@ -50,7 +71,7 @@ Tests are read-only and show rule results, winner, and destination. Saving rule 
 
 ## Legacy classification actions
 
-Configurations that still use the legacy classification workflow retain category actions for SPAM, NOT_SPAM, and REVIEW. Applying those actions through the TUI is also confirmation-gated. The `spam.folders` list limits bare `clean` compatibility mode, not the explicit-folder routing pipeline. See [Cleaning and diagnostics](cleaning.md) and [Persistent state](state.md).
+Configurations that still use the legacy classification workflow retain category actions for SPAM, NOT_SPAM, and REVIEW. `B` exposes the deprecated bare-`clean` compatibility workflow over `spam.folders`; applying is preflighted and confirmation-gated. The source-folder list does not limit modern explicit-folder routing Clean. See [Cleaning and diagnostics](cleaning.md) and [Persistent state](state.md).
 
 ## Image inventory and visual analysis
 

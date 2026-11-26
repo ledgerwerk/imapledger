@@ -12,9 +12,16 @@ from rich.text import Text
 
 from .action_service import ActionService
 from .analysis_service import AnalysisService
+from .application.browsing import ReviewOperation, ReviewRequest
+from .application.clean import CleanOperation, CleanRequest
+from .application.doctor import DoctorOperation, DoctorRequest
+from .application.legacy_clean import LegacyCleanOperation, LegacyCleanRequest
+from .application.progress import ProgressOperation
+from .application.rules import RuleMigrationOperation
+from .application.state import StateOperation, StateResetRequest
 from .classification_state import all_state_keywords
 from .classifier import PyJevSpamClassifier
-from .cleaner import CleanReport, MessageResult, SpamCleaner
+from .cleaner import CleanReport, MessageResult
 from .config import (
     ActionKind,
     AuthSource,
@@ -57,16 +64,13 @@ from .mailbox import (
     MailboxSnapshot,
     MessageSelection,
     MessageSort,
-    ProcessingMailbox,
     ScopedMailbox,
 )
-from .preflight import preflight_source
-from .processing_engine import ProcessedMessage, ProcessingEngine, ProcessingError
-from .progress_store import ProgressStore, ProgressStoreError, account_identity_key, default_progress_path
+from .processing_engine import ProcessedMessage, ProcessingError
+from .progress_store import ProgressStoreError, default_progress_path
 from .routing_config import (
     RoutingConfigError,
     load_routing_rules,
-    migrate_legacy_rules,
     routing_rules_path_for_config,
 )
 from .rule_candidates import build_rule_candidates
@@ -397,8 +401,10 @@ def rule_migrate(
         err_console.print("Usage error: --preview and --apply cannot be combined.")
         raise typer.Exit(2)
     path = routing_rules_path_for_config(config)
+    operation = RuleMigrationOperation(path)
     try:
-        result = migrate_legacy_rules(path, apply=apply)
+        preview_result = operation.preview()
+        result = operation.apply(preview_result) if apply else preview_result.result
     except RoutingConfigError as exc:
         err_console.print(f"Rules error: {exc}", markup=False)
         raise typer.Exit(2) from exc
@@ -842,19 +848,19 @@ def doctor(
         action.action is ActionKind.DELETE for action in (actions.spam, actions.not_spam, actions.review)
     )
     failed = False
-    failed = False
+    doctor_operation = DoctorOperation(settings, mailbox_factory=ScopedMailbox)
     try:
         for folder in settings.spam.folders:
             console.print(f"folder: {folder} (read-only)", markup=False)
-            result = preflight_source(
-                settings,
-                folder,
+            result = doctor_operation.run(
+                DoctorRequest(
+                    folder=folder,
+                    destinations=tuple(destinations),
+                    requires_delete=requires_delete,
+                    require_state_persistence=(settings.spam.state.backend is ClassificationStateBackend.IMAP_KEYWORDS),
+                    deep_probe=True,
+                ),
                 password=password,
-                destinations=destinations,
-                requires_delete=requires_delete,
-                require_state_persistence=(settings.spam.state.backend is ClassificationStateBackend.IMAP_KEYWORDS),
-                deep_probe=True,
-                mailbox_factory=ScopedMailbox,
                 event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
             )
             _print_state_preflight(result, clean_apply=False)
@@ -1044,153 +1050,79 @@ def clean(
     except RuleError as exc:
         err_console.print(f"[red]Rules error:[/red] {exc}")
         raise typer.Exit(2) from exc
+    operation = LegacyCleanOperation(settings, rules)
     try:
-        _validate_config_store_cleaning(settings, rules)
+        operation.validate_config()
     except ConfigError as exc:
         err_console.print(f"[red]Configuration error:[/red] {exc}")
         raise typer.Exit(2) from exc
-    password = _resolve_password(settings.imap)
-
-    excluded_keywords = (
-        all_state_keywords()
-        if settings.spam.state.backend is ClassificationStateBackend.IMAP_KEYWORDS and not reclassify
-        else ()
-    )
-    selection = MessageSelection(
+    request = LegacyCleanRequest(
+        apply=apply,
         limit=limit,
         offset=offset,
         sort=sort or MessageSort.NEWEST,
-        excluded_keywords=excluded_keywords,
-    )
-    actions = settings.spam.actions
-    destinations = _move_destinations(actions, rules)
-    allow_delete = any(
-        action.action is ActionKind.DELETE for action in (actions.spam, actions.not_spam, actions.review)
-    )
-    requires_state_persistence = settings.spam.state.backend is ClassificationStateBackend.IMAP_KEYWORDS and any(
-        action.action is ActionKind.KEEP for action in (actions.spam, actions.not_spam, actions.review)
+        reclassify=reclassify,
     )
 
-    if apply:
-        preflight_failed = False
-        for folder in settings.spam.folders:
-            result = preflight_source(
-                settings,
-                folder,
-                password=password,
-                destinations=destinations,
-                requires_delete=allow_delete,
-                require_state_persistence=requires_state_persistence,
-                deep_probe=False,
-                mailbox_factory=ScopedMailbox,
-                event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
-            )
-            state = "OK" if result.ok else "FAILED"
-            _print_state_preflight(result, clean_apply=True)
-            console.print(f"preflight {folder}: {state}", markup=False)
-            for capability in (b"MOVE", b"UIDPLUS"):
-                if capability in result.missing_capabilities:
-                    console.print(f"required capability {capability.decode()}: MISSING")
-            for destination, exists in result.destinations:
-                if exists is not None:
-                    state = "OK" if exists else "MISSING"
-                    console.print(f"destination {destination}: {state}", markup=False)
-            for error in result.errors:
-                _print_failure(error, debug=False, command="clean")
-            preflight_failed = preflight_failed or not result.ok
-        if preflight_failed:
-            console.print("apply aborted before classification/mutation")
-            raise typer.Exit(1)
-    reports: list[CleanReport] = []
-    failure: Exception | None = None
+    def on_folder_start(folder, total_messages, selected_count, unclassified_count, selection) -> None:
+        console.print(
+            _selection_summary(
+                folder=folder,
+                total_messages=total_messages,
+                selected_count=selected_count,
+                unclassified_count=unclassified_count,
+                selection=selection,
+            ),
+            markup=False,
+        )
+
+    def on_result(folder, row, position, total) -> None:
+        _print_result(row, folder=folder, position=position, total=total, apply=apply, verbose=verbose)
+
+    password = _resolve_password(settings.imap)
     try:
-        with PyJevSpamClassifier(
-            trusted_authserv_ids=settings.spam.trusted_authserv_ids,
-            trusted_provider_headers=settings.spam.trusted_provider_headers,
-        ) as classifier:
-            for folder in settings.spam.folders:
-                report: CleanReport | None = None
-                try:
-                    with ScopedMailbox(
-                        host=settings.imap.host,
-                        port=settings.imap.port,
-                        username=settings.imap.username,
-                        password=password,
-                        folder=folder,
-                        writable=apply,
-                        allowed_destinations=destinations,
-                        allow_delete=allow_delete,
-                        max_message_bytes=settings.spam.max_message_bytes,
-                        max_body_chars=settings.spam.max_body_chars,
-                        event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
-                    ) as mailbox:
-                        if apply and requires_state_persistence:
-                            mailbox.require_persistent_classification_state()
-                        if apply:
-                            for destination in destinations:
-                                if not mailbox.destination_exists(destination):
-                                    raise MailboxError(f"configured move destination does not exist: {destination}")
-                        console.print(
-                            _selection_summary(
-                                folder=mailbox.folder,
-                                total_messages=len(mailbox.snapshot().uids),
-                                selected_count=mailbox.selected_count(selection),
-                                unclassified_count=(
-                                    len(mailbox.candidate_uids(excluded_keywords=selection.excluded_keywords))
-                                    if selection.excluded_keywords
-                                    else None
-                                ),
-                                selection=selection,
-                            ),
-                            markup=False,
-                        )
-                        report = SpamCleaner(
-                            mailbox,
-                            classifier,
-                            policy=settings.spam.policy,
-                            actions=actions,
-                            rules=rules,
-                            **(
-                                {"state_backend": settings.spam.state.backend}
-                                if settings.spam.state.backend is not ClassificationStateBackend.NONE
-                                else {}
-                            ),
-                        ).run(
-                            apply=apply,
-                            **({"reclassify": True} if reclassify else {}),
-                            selection=selection,
-                            on_result=(
-                                lambda row, position, total, source_folder=mailbox.folder: _print_result(
-                                    row,
-                                    folder=source_folder,
-                                    position=position,
-                                    total=total,
-                                    apply=apply,
-                                    verbose=verbose,
-                                )
-                            )
-                            if progress
-                            else None,
-                        )
-                        reports.append(report)
-                        if progress:
-                            _print_summary(report)
-                        else:
-                            _print_report(report)
-                except Exception as exc:
-                    failure = exc
-                    break
-                if report is not None and report.mutation_error is not None:
-                    failure = report.mutation_error
-                    break
+        legacy_result = operation.run(
+            request,
+            password=password,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+            on_folder_start=on_folder_start,
+            on_result=on_result if progress else None,
+        )
     except Exception as exc:
-        failure = exc
+        _print_failure(exc, debug=debug, command="clean")
+        raise typer.Exit(1) from exc
+    finally:
+        password = ""
 
+    for result in legacy_result.preflight_results:
+        state = "OK" if result.ok else "FAILED"
+        _print_state_preflight(result, clean_apply=True)
+        console.print(f"preflight {result.folder}: {state}", markup=False)
+        for capability in (b"MOVE", b"UIDPLUS"):
+            if capability in result.missing_capabilities:
+                console.print(f"required capability {capability.decode()}: MISSING")
+        for destination, exists in result.destinations:
+            if exists is not None:
+                state = "OK" if exists else "MISSING"
+                console.print(f"destination {destination}: {state}", markup=False)
+        for error in result.errors:
+            _print_failure(error, debug=False, command="clean")
+
+    if legacy_result.preflight_failed:
+        console.print("apply aborted before classification/mutation")
+        raise typer.Exit(1)
+
+    reports = list(legacy_result.reports)
+    for report in reports:
+        if progress:
+            _print_summary(report)
+        else:
+            _print_report(report)
     if reports:
         _print_aggregate_summary(reports)
-    if failure is not None:
-        _print_failure(failure, debug=debug, command="clean")
-        raise typer.Exit(1) from failure
+    if legacy_result.failure is not None:
+        _print_failure(legacy_result.failure, debug=debug, command="clean")
+        raise typer.Exit(1) from legacy_result.failure
 
 
 def _routing_clean(
@@ -1219,55 +1151,32 @@ def _routing_clean(
         err_console.print(f"[red]Rules error:[/red] {exc}")
         raise typer.Exit(2) from exc
 
-    config_store_folder = settings.config_store.folder if settings.config_store is not None else None
+    request = CleanRequest(
+        folder=folder,
+        apply=apply,
+        limit=limit,
+        sort=sort.value,
+        rule_scope=rule,
+        new_run=new_run,
+        retry_errors=retry_errors,
+        progress_db=progress_db,
+    )
+    operation = CleanOperation(settings, rules)
     try:
-        rules.validate_destinations(folder, config_store_folder=config_store_folder)
+        operation.preflight(request)
     except ValueError as exc:
         err_console.print(f"[red]Rules error:[/red] {exc}")
         raise typer.Exit(2) from exc
-    if rule is None and rules.fallback_destination is None:
-        err_console.print("[red]Rules error:[/red] full routing requires rules.fallback_destination")
-        raise typer.Exit(2)
-    if rule is not None and not any(candidate.id == rule for candidate in rules.enabled_rules(folder)):
-        err_console.print(f"[red]Rules error:[/red] enabled rule not found for source {folder}: {rule}")
-        raise typer.Exit(2)
-
-    selected_rules = rules.enabled_rules(folder)
-    if rule is not None:
-        selected_rules = tuple(candidate for candidate in selected_rules if candidate.id == rule)
-    allowed_destinations = [candidate.destination for candidate in selected_rules]
-    if rule is None and rules.fallback_destination is not None:
-        allowed_destinations.append(rules.fallback_destination)
 
     password = ""
     try:
         password = _resolve_password(settings.imap)
-        store = ProgressStore(progress_db)
-        with ProcessingMailbox(
-            host=settings.imap.host,
-            port=settings.imap.port,
-            username=settings.imap.username,
+        result = operation.run(
+            request,
             password=password,
-            folder=folder,
-            writable=apply,
-            allowed_destinations=tuple(dict.fromkeys(allowed_destinations)),
-            max_message_bytes=settings.spam.max_message_bytes,
-            max_body_chars=settings.spam.max_body_chars,
             event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
-        ) as mailbox:
-            report = ProcessingEngine(
-                settings=settings,
-                rules=rules,
-                progress_store=store,
-            ).run(
-                mailbox,
-                apply=apply,
-                limit=limit,
-                rule_scope=rule,
-                sort_direction=sort.value,
-                new_run=new_run,
-                retry_errors=retry_errors,
-            )
+        )
+        report = result.report
     except (ProcessingError, ProgressStoreError, MailboxError) as exc:
         _print_failure(exc, debug=debug, command="clean")
         raise typer.Exit(1) from exc
@@ -1327,14 +1236,14 @@ def _print_processing_message(message: ProcessedMessage, *, preview: bool) -> No
     )
 
 
-def _progress_context(config: Path, progress_db: Path) -> tuple[ProgressStore, str]:
+def _progress_context(config: Path, progress_db: Path) -> ProgressOperation:
     try:
         settings = load_settings(config)
     except ConfigError as exc:
         err_console.print(f"[red]Configuration error:[/red] {exc}")
         raise typer.Exit(2) from exc
     try:
-        return ProgressStore(progress_db), account_identity_key(settings)
+        return ProgressOperation(settings, progress_db)
     except Exception as exc:
         _print_failure(exc, debug=False, command="progress")
         raise typer.Exit(1) from exc
@@ -1346,8 +1255,8 @@ def progress_list(
     progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database."),  # noqa: B008
 ) -> None:
     """List resumable runs for the configured IMAP account."""
-    store, account_key = _progress_context(config, progress_db)
-    runs = store.list_runs(account_key=account_key)
+    progress = _progress_context(config, progress_db)
+    runs = progress.list_runs()
     table = Table(title="Routing progress")
     for column in ("Folder", "Mode", "Scope", "Sort", "Status", "Cursor", "Scanned", "Errors", "Run"):
         table.add_column(column)
@@ -1374,8 +1283,8 @@ def progress_show(
     progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database."),  # noqa: B008
 ) -> None:
     """Show the most recent run for one source folder."""
-    store, account_key = _progress_context(config, progress_db)
-    runs = store.list_runs(account_key=account_key, source_folder=folder, limit=1000)
+    progress = _progress_context(config, progress_db)
+    runs = progress.list_runs(folder=folder, limit=1000)
     if not runs:
         console.print(f"No progress recorded for {folder}.", markup=False)
         return
@@ -1398,13 +1307,12 @@ def progress_errors(
     progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database."),  # noqa: B008
 ) -> None:
     """List retryable UID error codes from the most recent run with errors."""
-    store, account_key = _progress_context(config, progress_db)
-    runs = store.list_runs(account_key=account_key, source_folder=folder, limit=1000)
-    run = next((candidate for candidate in runs if candidate.error_count), None)
+    progress = _progress_context(config, progress_db)
+    run = progress.latest_run_with_errors(folder)
     if run is None:
         console.print(f"No stored errors for {folder}.", markup=False)
         return
-    for result in store.errors(run.id):
+    for result in progress.errors(run.id):
         console.print(f"folder={folder} uid={result.uid} error={result.error_code or 'unknown'}", markup=False)
 
 
@@ -1415,15 +1323,15 @@ def progress_reset(
     progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database."),  # noqa: B008
 ) -> None:
     """Delete all saved progress runs for one source folder after confirmation."""
-    store, account_key = _progress_context(config, progress_db)
-    runs = store.list_runs(account_key=account_key, source_folder=folder, limit=1000)
+    progress = _progress_context(config, progress_db)
+    runs = progress.list_runs(folder=folder, limit=1000)
     if not runs:
         console.print(f"No progress recorded for {folder}.", markup=False)
         return
     if not typer.confirm(f"Delete all progress runs for {folder}?", default=False):
         console.print("Progress reset cancelled.", markup=False)
         return
-    deleted = store.reset_folder(account_key, folder)
+    deleted = progress.reset_folder(folder)
     console.print(f"Deleted {deleted} progress run(s) for {folder}.", markup=False)
 
 
@@ -1441,37 +1349,22 @@ def state_status(
     password = _resolve_password(settings.imap)
     console.print("Classification state", markup=False)
     failed = False
+    operation = StateOperation(settings, mailbox_factory=ScopedMailbox)
     try:
         for folder in settings.spam.folders:
             try:
-                with ScopedMailbox(
-                    host=settings.imap.host,
-                    port=settings.imap.port,
-                    username=settings.imap.username,
+                result = operation.status(
+                    folder,
                     password=password,
-                    folder=folder,
-                    writable=False,
-                    max_message_bytes=settings.spam.max_message_bytes,
-                    max_body_chars=settings.spam.max_body_chars,
                     event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
-                ) as mailbox:
-                    snapshot = mailbox.snapshot()
-                    keywords = all_state_keywords()
-                    matches = {keyword: mailbox.search_keyword(keyword) for keyword in keywords}
-                    unclassified = mailbox.candidate_uids(excluded_keywords=keywords)
-                    marked_uids = set().union(*matches.values())
-                    conflicts = sum(
-                        sum(uid in matching_uids for matching_uids in matches.values()) > 1 for uid in marked_uids
-                    )
-                    console.print(
-                        f"folder={folder} uidvalidity={snapshot.uidvalidity} "
-                        f"backend={settings.spam.state.backend.value} "
-                        f"keyword_persistence={_keyword_persistence_label(settings.spam.state.backend, snapshot)} "
-                        f"total={len(snapshot.uids)} spam={len(matches[keywords[0]])} "
-                        f"notspam={len(matches[keywords[1]])} review={len(matches[keywords[2]])} "
-                        f"unclassified={len(unclassified)} conflicts={conflicts}",
-                        markup=False,
-                    )
+                )
+                console.print(
+                    f"folder={folder} uidvalidity={result.uidvalidity} "
+                    f"backend={result.backend.value} keyword_persistence={result.keyword_persistence} "
+                    f"total={result.total} spam={result.spam} notspam={result.notspam} review={result.review} "
+                    f"unclassified={result.unclassified} conflicts={result.conflicts}",
+                    markup=False,
+                )
             except Exception as exc:
                 failed = True
                 console.print(f"folder={folder} backend={settings.spam.state.backend.value} status=ERROR", markup=False)
@@ -1517,58 +1410,39 @@ def state_reset(
         err_console.print("Usage error: an unbounded reset requires --all.")
         raise typer.Exit(2)
 
-    folders = settings.spam.folders if all_folders else (folder,)
+    request = StateResetRequest(
+        folder=folder,
+        uid=uid,
+        reset_all=reset_all,
+        all_folders=all_folders,
+        apply=apply,
+    )
+    operation = StateOperation(settings, mailbox_factory=ScopedMailbox)
+    folders = operation.reset_folders(request)
     password = _resolve_password(settings.imap)
     failed = False
     try:
         for source_folder in folders:
             try:
-                with ScopedMailbox(
-                    host=settings.imap.host,
-                    port=settings.imap.port,
-                    username=settings.imap.username,
+                result = operation.reset_folder(
+                    source_folder,
+                    request,
                     password=password,
-                    folder=source_folder,
-                    writable=apply,
-                    max_message_bytes=settings.spam.max_message_bytes,
-                    max_body_chars=settings.spam.max_body_chars,
                     event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
-                ) as mailbox:
-                    uid_keywords: dict[int, list[str]] = {}
-                    if uid is not None:
-                        flags = mailbox.get_flags(uid)
-                        uid_keywords[uid] = list(_present_state_keywords(flags))
-                    else:
-                        for keyword in all_state_keywords():
-                            for matched_uid in mailbox.search_keyword(keyword):
-                                uid_keywords.setdefault(matched_uid, []).append(keyword)
-                    marker_count = sum(len(keywords) for keywords in uid_keywords.values())
-                    operation = "remove" if apply else "would remove"
-                    if uid is not None:
-                        markers = ",".join(uid_keywords[uid]) or "none"
-                        console.print(
-                            f"folder={source_folder} uid={uid} markers={markers} action={operation}",
-                            markup=False,
-                        )
-                    else:
-                        console.print(
-                            f"folder={source_folder} targeted_uids={len(uid_keywords)} "
-                            f"markers={marker_count} action={operation}",
-                            markup=False,
-                        )
-                    if apply:
-                        for target_uid in sorted(uid_keywords):
-                            for keyword in uid_keywords[target_uid]:
-                                mailbox.remove_keyword(target_uid, keyword)
-                            remaining = _present_state_keywords(mailbox.get_flags(target_uid))
-                            if remaining:
-                                raise ImapOperationError(
-                                    operation="imap_verify_keyword",
-                                    message="classification state remains after reset",
-                                    folder=source_folder,
-                                    selector=", ".join(remaining),
-                                    uids=(target_uid,),
-                                )
+                )
+                if uid is not None:
+                    markers = dict(result.markers).get(uid, ())
+                    console.print(
+                        f"folder={source_folder} uid={uid} markers={','.join(markers) or 'none'} "
+                        f"action={'remove' if apply else 'would remove'}",
+                        markup=False,
+                    )
+                else:
+                    console.print(
+                        f"folder={source_folder} targeted_uids={len(result.targeted_uids)} "
+                        f"markers={result.marker_count} action={'remove' if apply else 'would remove'}",
+                        markup=False,
+                    )
             except Exception as exc:
                 failed = True
                 _print_failure(exc, debug=False, command="state")
@@ -1879,52 +1753,33 @@ def review_list(
     if folder is not None and folder not in settings.spam.folders:
         err_console.print(f"Usage error: source folder is not configured: {folder}", markup=False)
         raise typer.Exit(2)
-    folders = (folder,) if folder is not None else settings.spam.folders
     password = _resolve_password(settings.imap)
     table = Table(title="Review queue")
     for column in ("Folder", "UID", "From", "Subject", "Date", "Message-ID"):
         table.add_column(column)
-    failed = False
+    operation = ReviewOperation(settings, mailbox_factory=ScopedMailbox)
+    request = ReviewRequest(folder=folder, limit=limit, offset=offset, sort=sort)
     try:
-        for source_folder in folders:
-            try:
-                with ScopedMailbox(
-                    host=settings.imap.host,
-                    port=settings.imap.port,
-                    username=settings.imap.username,
-                    password=password,
-                    folder=source_folder,
-                    writable=False,
-                    max_message_bytes=settings.spam.max_message_bytes,
-                    max_body_chars=settings.spam.max_body_chars,
-                    event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
-                ) as mailbox:
-                    uids = sorted(
-                        mailbox.search_keyword("imapledger-v1-review"),
-                        reverse=sort is MessageSort.NEWEST,
-                    )
-                    selected = uids[offset:]
-                    if limit is not None:
-                        selected = selected[:limit]
-                    for review_uid in selected:
-                        message = mailbox.fetch_headers(review_uid)
-                        if message is None:
-                            continue
-                        table.add_row(
-                            source_folder,
-                            str(review_uid),
-                            _safe_text(message.sender),
-                            _safe_text(message.subject),
-                            _safe_text(message.date),
-                            _safe_text(message.message_id),
-                        )
-            except Exception as exc:
-                failed = True
-                _print_failure(exc, debug=False, command="review")
+        page = operation.run(
+            request,
+            password=password,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+        )
+        for _, exc in page.errors:
+            _print_failure(exc, debug=False, command="review")
+        for source_folder, message in page.items:
+            table.add_row(
+                source_folder,
+                str(message.uid),
+                _safe_text(message.sender),
+                _safe_text(message.subject),
+                _safe_text(message.date),
+                _safe_text(message.message_id),
+            )
     finally:
         password = ""
     console.print(table, markup=False)
-    if failed:
+    if page.errors:
         raise typer.Exit(1)
 
 

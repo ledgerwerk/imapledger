@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .config import Settings
@@ -42,6 +43,7 @@ class ProcessingReport:
     retry_only: bool
     exhausted: bool
     stopped_on_ambiguous_move: bool = False
+    stopped_by_user: bool = False
 
 
 class ProcessingEngine:
@@ -68,7 +70,10 @@ class ProcessingEngine:
         sort_direction: SortDirection = "newest",
         new_run: bool = False,
         retry_errors: bool = False,
+        on_result: Callable[[ProcessedMessage, ProgressRun], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> ProcessingReport:
+        """Process UIDs in order. Result callbacks run on this thread and propagate exceptions."""
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
             raise ValueError("message limit must be a positive integer")
         if sort_direction not in {"oldest", "newest"}:
@@ -120,6 +125,8 @@ class ProcessingEngine:
                     sort_direction=sort_direction,
                     limit=limit,
                     metadata=metadata,
+                    on_result=on_result,
+                    should_stop=should_stop,
                 )
             run = self.progress_store.begin_run(
                 account_key=self.account_key,
@@ -139,6 +146,8 @@ class ProcessingEngine:
                 rule_scope=rule_scope,
                 apply=apply,
                 limit=limit,
+                on_result=on_result,
+                should_stop=should_stop,
             )
 
     def _scan(
@@ -150,11 +159,14 @@ class ProcessingEngine:
         rule_scope: str | None,
         apply: bool,
         limit: int | None,
+        on_result: Callable[[ProcessedMessage, ProgressRun], None] | None,
+        should_stop: Callable[[], bool] | None,
     ) -> ProcessingReport:
         messages: list[ProcessedMessage] = []
         processed = 0
         exhausted = False
         stopped = False
+        stopped_by_user = False
         while limit is None or processed < limit:
             remaining = PROCESSING_BATCH_SIZE if limit is None else min(PROCESSING_BATCH_SIZE, limit - processed)
             uids = mailbox.find_next_uids(
@@ -169,6 +181,10 @@ class ProcessingEngine:
                 break
             items = {item.uid: item for item in mailbox.fetch_items(uids, high_watermark_uid=run.high_watermark_uid)}
             for uid in uids:
+                if should_stop is not None and should_stop():
+                    stopped = True
+                    stopped_by_user = True
+                    break
                 item = items.get(uid, MailboxItem(uid, skip_reason="message disappeared before body fetch"))
                 result, run, stop = self._process_one(
                     mailbox,
@@ -180,6 +196,8 @@ class ProcessingEngine:
                 )
                 messages.append(result)
                 processed += 1
+                if on_result is not None:
+                    on_result(result, run)
                 if stop:
                     stopped = True
                     break
@@ -197,7 +215,8 @@ class ProcessingEngine:
             preview=not apply,
             retry_only=False,
             exhausted=exhausted,
-            stopped_on_ambiguous_move=stopped,
+            stopped_on_ambiguous_move=stopped and not stopped_by_user,
+            stopped_by_user=stopped_by_user,
         )
 
     def _process_one(
@@ -388,6 +407,8 @@ class ProcessingEngine:
         sort_direction: SortDirection,
         limit: int | None,
         metadata: MailboxRunMetadata,
+        on_result: Callable[[ProcessedMessage, ProgressRun], None] | None,
+        should_stop: Callable[[], bool] | None,
     ) -> ProcessingReport:
         candidates = self.progress_store.list_runs(
             account_key=self.account_key,
@@ -423,6 +444,15 @@ class ProcessingEngine:
         messages: list[ProcessedMessage] = []
         items = {item.uid: item for item in mailbox.fetch_items(uids, high_watermark_uid=run.high_watermark_uid)}
         for uid in uids:
+            if should_stop is not None and should_stop():
+                return ProcessingReport(
+                    run,
+                    tuple(messages),
+                    preview=False,
+                    retry_only=True,
+                    exhausted=False,
+                    stopped_by_user=True,
+                )
             result, run, stopped = self._process_one(
                 mailbox,
                 evaluator,
@@ -432,6 +462,8 @@ class ProcessingEngine:
                 apply=True,
             )
             messages.append(result)
+            if on_result is not None:
+                on_result(result, run)
             if stopped:
                 return ProcessingReport(
                     run,

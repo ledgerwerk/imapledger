@@ -72,6 +72,18 @@ class ConfigPullResult:
     diff: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ConfigPullPreview:
+    tool: str
+    version_id: str
+    target: Path
+    content_sha256: str
+    target_exists: bool
+    target_sha256: str | None
+    already_up_to_date: bool
+    diff: str
+
+
 class ConfigOverwriteConfirmationRequired(ConfigLedgerError):
     def __init__(self, target: Path, diff: str) -> None:
         super().__init__(f"confirmation is required before overwriting {target}")
@@ -231,6 +243,39 @@ class ConfigLedger:
             direction=DiffDirection(direction),
         )
 
+    def preview_pull(
+        self,
+        tool: str,
+        *,
+        version: str | None = None,
+        to: str | Path | None = None,
+    ) -> ConfigPullPreview:
+        snapshot = self._fetch_selected(tool, version)
+        target = self._resolve_target(snapshot.meta, to)
+        if target.exists() and not target.is_file():
+            raise ConfigLedgerError(f"pull target is not a regular file: {target}")
+        existing_text = _read_existing(target, self._settings.max_file_bytes) if target.exists() else None
+        remote_text = snapshot.content.decode("utf-8")
+        diff = ""
+        if existing_text is not None and existing_text != remote_text:
+            diff = render_config_diff(
+                local_text=existing_text,
+                remote_text=remote_text,
+                local_label=f"local:{target}",
+                remote_label=f"imap:{snapshot.meta.tool}@{snapshot.meta.version_id}",
+                direction=DiffDirection.LOCAL_TO_IMAP,
+            )
+        return ConfigPullPreview(
+            tool=snapshot.meta.tool,
+            version_id=snapshot.meta.version_id,
+            target=target,
+            content_sha256=snapshot.meta.content_sha256,
+            target_exists=existing_text is not None,
+            target_sha256=_sha256(existing_text.encode("utf-8")) if existing_text is not None else None,
+            already_up_to_date=existing_text == remote_text,
+            diff=diff,
+        )
+
     def pull(
         self,
         tool: str,
@@ -288,6 +333,45 @@ class ConfigLedger:
             already_up_to_date=False,
             cancelled=False,
             diff=diff,
+        )
+
+    def apply_pull(self, preview: ConfigPullPreview, *, confirm_overwrite: bool) -> ConfigPullResult:
+        snapshot = self._fetch_selected(preview.tool, preview.version_id)
+        if snapshot.meta.content_sha256 != preview.content_sha256:
+            raise ConfigLedgerError("stored snapshot changed since preview; preview again")
+        target = self._resolve_target(snapshot.meta, preview.target)
+        if target != preview.target:
+            raise ConfigLedgerError("pull target changed since preview; preview again")
+        if target.exists() and not target.is_file():
+            raise ConfigLedgerError(f"pull target is not a regular file: {target}")
+        existing_text = _read_existing(target, self._settings.max_file_bytes) if target.exists() else None
+        existing_sha256 = _sha256(existing_text.encode("utf-8")) if existing_text is not None else None
+        if (existing_text is not None) != preview.target_exists or existing_sha256 != preview.target_sha256:
+            raise ConfigLedgerError("local target changed since preview; preview again")
+        if preview.already_up_to_date:
+            return ConfigPullResult(
+                target=target,
+                version_id=preview.version_id,
+                written=False,
+                already_up_to_date=True,
+                cancelled=False,
+            )
+        if preview.target_exists and not confirm_overwrite:
+            raise ConfigOverwriteConfirmationRequired(target, preview.diff)
+
+        def confirm(current_target: Path, diff: str) -> bool:
+            if current_target != preview.target or not preview.target_exists or diff != preview.diff:
+                raise ConfigLedgerError("local target changed since preview; preview again")
+            latest_text = _read_existing(current_target, self._settings.max_file_bytes)
+            if _sha256(latest_text.encode("utf-8")) != preview.target_sha256:
+                raise ConfigLedgerError("local target changed since preview; preview again")
+            return True
+
+        return self.pull(
+            preview.tool,
+            version=preview.version_id,
+            to=preview.target,
+            confirm_overwrite=confirm if preview.target_exists else None,
         )
 
     def _history(self, tool: str) -> ConfigHistory:

@@ -262,6 +262,55 @@ def test_pull_requires_callback_for_differing_existing_target(tmp_path: Path) ->
     assert target.read_bytes() == b"local\n"
 
 
+def test_pull_preview_requires_consent_and_rejects_stale_local_content(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    target = _write_local(home, ".config/xyz/config.toml", b"local\n")
+    remote = _snapshot(b"remote\n")
+
+    with _service(tmp_path, dict((_stored(1, remote),)), home=home) as (service, _, _):
+        preview = service.preview_pull("xyz")
+        assert preview.target == target
+        assert preview.target_exists
+        assert preview.target_sha256 is not None
+        assert "-local\n+remote\n" in preview.diff
+        with pytest.raises(ConfigOverwriteConfirmationRequired):
+            service.apply_pull(preview, confirm_overwrite=False)
+
+        target.write_bytes(b"changed after preview\n")
+        with pytest.raises(ConfigLedgerError, match="changed since preview"):
+            service.apply_pull(preview, confirm_overwrite=True)
+
+    assert target.read_bytes() == b"changed after preview\n"
+
+
+def test_pull_preview_apply_writes_only_after_explicit_confirmation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    target = _write_local(home, ".config/xyz/config.toml", b"local\n")
+    remote = _snapshot(b"remote\n")
+
+    with _service(tmp_path, dict((_stored(1, remote),)), home=home) as (service, _, _):
+        preview = service.preview_pull("xyz")
+        result = service.apply_pull(preview, confirm_overwrite=True)
+
+    assert result.written
+    assert result.version_id == preview.version_id
+    assert target.read_bytes() == b"remote\n"
+
+
+def test_pull_preview_rejects_a_target_created_after_preview(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    remote = _snapshot(b"remote\n")
+
+    with _service(tmp_path, dict((_stored(1, remote),)), home=home) as (service, _, _):
+        preview = service.preview_pull("xyz")
+        preview.target.parent.mkdir(parents=True)
+        preview.target.write_bytes(b"new local content\n")
+        with pytest.raises(ConfigLedgerError, match="changed since preview"):
+            service.apply_pull(preview, confirm_overwrite=True)
+
+    assert preview.target.read_bytes() == b"new local content\n"
+
+
 def test_pull_to_override_and_outside_home_default_safety(tmp_path: Path) -> None:
     outside = Path("/etc/xyz/config.toml")
     remote = _snapshot(b"remote\n", default_path=str(outside))

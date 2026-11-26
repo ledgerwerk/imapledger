@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from textual.app import ComposeResult
@@ -7,6 +8,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, ListItem, ListView, Select, Static
 
+from ..application.rules import RuleLearningPreview, RuleMigrationPreview
 from ..classification_state import SpamOutcome
 from ..config import ActionKind, MessageAction, Settings
 from ..routing_models import RoutingRule, RuleType
@@ -437,6 +439,7 @@ class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
         ("d", "remove_rule", "Delete"),
         ("t", "test_rule", "Test selected"),
         ("T", "test_all", "Evaluate all"),
+        ("m", "migrate_rules", "Migrate legacy"),
     ]
     CSS = """
     RoutingRuleCenterScreen { align: center middle; }
@@ -477,6 +480,7 @@ class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
             with Horizontal():
                 yield Button("Test selected", id="test")
                 yield Button("Evaluate all", id="test-all")
+                yield Button("Migrate legacy rules…", id="migrate")
                 yield Button("Delete", id="remove")
                 yield Button("Save fallback", id="fallback")
                 yield Button("Close", id="close")
@@ -521,6 +525,9 @@ class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
 
     def action_test_all(self) -> None:
         self.dismiss(("test-all", None))
+
+    def action_migrate_rules(self) -> None:
+        self.dismiss(("migrate", None))
 
     def action_close(self) -> None:
         self.dismiss(("close", None))
@@ -648,3 +655,137 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
             match=match,
             source_folders=self.rule.source_folders if self.rule else (),
         )
+
+
+class RuleLearnDialog(ModalScreen[tuple[str, str | None] | None]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    RuleLearnDialog { align: center middle; }
+    #learn-rule-box { width: 72; height: auto; border: round $accent; padding: 1 2; background: $surface; }
+    #learn-rule-buttons { height: 3; align-horizontal: right; }
+    #learn-rule-buttons Button { margin-left: 1; }
+    """
+
+    def __init__(self, folder: str, uid: int, destinations: tuple[str, ...]) -> None:
+        super().__init__()
+        self.folder = folder
+        self.uid = uid
+        self.destinations = destinations
+
+    def compose(self) -> ComposeResult:
+        options = [(folder, folder) for folder in self.destinations]
+        with Vertical(id="learn-rule-box"):
+            yield Static(f"Learn a routing rule from {self.folder} UID {self.uid}", markup=False)
+            yield Label("Move destination")
+            yield Select(
+                options,
+                value=self.destinations[0] if self.destinations else Select.BLANK,
+                id="learn-destination",
+            )
+            yield Label("Optional rule ID")
+            yield Input(placeholder="generated from the selected matcher", id="learn-rule-id")
+            yield Static("A proposal is read-only. Only an automatically safe proposal can be saved.", markup=False)
+            with Horizontal(id="learn-rule-buttons"):
+                yield Button("Preview proposal", id="learn-preview", disabled=not bool(self.destinations))
+                yield Button("Cancel", id="learn-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "learn-cancel":
+            self.dismiss(None)
+            return
+        destination = self.query_one("#learn-destination", Select).value
+        if not isinstance(destination, str):
+            return
+        try:
+            name = self.query_one("#learn-rule-id", Input).value.strip() or None
+            if name is not None:
+                validate_rule_id(name)
+        except ValueError as exc:
+            self.query_one("#learn-rule-id", Input).placeholder = str(exc)
+            return
+        self.dismiss((destination, name))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class RuleLearnPreviewScreen(ModalScreen[bool]):
+    CSS = """
+    RuleLearnPreviewScreen { align: center middle; }
+    #learn-preview-box { width: 82; height: auto; border: round $accent; padding: 1 2; background: $surface; }
+    #learn-preview-buttons { height: 3; align-horizontal: right; }
+    #learn-preview-buttons Button { margin-left: 1; }
+    """
+
+    def __init__(self, folder: str, uid: int, destination: str, preview: RuleLearningPreview) -> None:
+        super().__init__()
+        self.folder = folder
+        self.uid = uid
+        self.destination = destination
+        self.preview = preview
+
+    def compose(self) -> ComposeResult:
+        proposal = self.preview.proposal
+        lines = [f"Source: {self.folder} UID {self.uid}", f"Status: {proposal.status}"]
+        if proposal.candidate is not None:
+            lines.extend(
+                (
+                    f"Candidate: {proposal.candidate.description}",
+                    f"Match: {describe_match(proposal.candidate.match)}",
+                )
+            )
+        if proposal.candidate_confidence is not None:
+            lines.append(f"Jev confidence: {proposal.candidate_confidence:.2f}")
+        if proposal.safe_probability is not None:
+            lines.append(f"Generalization safety: {proposal.safe_probability:.2f}")
+        if self.preview.rule is not None:
+            lines.extend((f"Proposed rule: {self.preview.rule.id}", f"Action: move to {self.destination}"))
+        else:
+            lines.append("No rule can be saved. This proposal did not meet the safe automatic thresholds.")
+        with Vertical(id="learn-preview-box"):
+            yield Static("\n".join(lines), markup=False)
+            with Horizontal(id="learn-preview-buttons"):
+                yield Button("Save rule", id="learn-save", disabled=self.preview.rule is None)
+                yield Button("Close", id="learn-close")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "learn-save")
+
+
+class RuleMigrationPreviewScreen(ModalScreen[bool]):
+    CSS = """
+    RuleMigrationPreviewScreen { align: center middle; }
+    #rule-migration-box { width: 88; height: 82%; border: round $warning; padding: 1 2; background: $surface; }
+    #rule-migration-buttons { height: 3; align-horizontal: right; }
+    #rule-migration-buttons Button { margin-left: 1; }
+    """
+
+    def __init__(self, path: Path, preview: RuleMigrationPreview) -> None:
+        super().__init__()
+        self.path = path
+        self.preview = preview
+
+    def compose(self) -> ComposeResult:
+        result = self.preview.result
+        lines = [
+            f"Rules file: {self.path}",
+            f"Schema: {result.source_schema} to 2",
+            f"Converted rules: {len(result.rules.rules)}",
+            f"Fallback: {result.rules.fallback_destination or '(not configured)'}",
+        ]
+        lines.extend(
+            f"{rule.id}: {rule.destination} from "
+            f"{', '.join(rule.source_folders) or 'all configured sources'}; "
+            f"match {describe_match(rule.match) if rule.match else '(none)'}"
+            for rule in result.rules.rules
+        )
+        lines.extend(result.warnings)
+        lines.append("Preview only. Applying writes the converted schema-2 rules to this file.")
+        with Vertical(id="rule-migration-box"):
+            yield Static("\n".join(lines), markup=False)
+            with Horizontal(id="rule-migration-buttons"):
+                yield Button("Apply migration", id="rule-migration-apply", variant="warning")
+                yield Button("Close", id="rule-migration-close")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "rule-migration-apply")

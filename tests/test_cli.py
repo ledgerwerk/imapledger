@@ -11,6 +11,8 @@ from typer.testing import CliRunner
 from vaultconfig.secrets import DEFAULT_MIN_PASSPHRASE_LENGTH, FileVault
 
 from imapledger import cli
+from imapledger.application import legacy_clean
+from imapledger.application.legacy_clean import LegacyCleanResult
 from imapledger.classifier import SemanticSpamSignals
 from imapledger.cleaner import CleanReport, MessageResult, SpamOutcome
 from imapledger.config import (
@@ -72,7 +74,7 @@ def test_clean_debug_error_is_phase_aware_and_hides_exception_payload(monkeypatc
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
     monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
-    monkeypatch.setattr(cli, "ScopedMailbox", FailingMailbox)
+    monkeypatch.setattr(legacy_clean, "ScopedMailbox", FailingMailbox)
 
     result = CliRunner().invoke(cli.app, ["clean", "--debug"])
 
@@ -158,24 +160,34 @@ def _configure_clean(monkeypatch, report, output):
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
     monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
-    monkeypatch.setattr(cli, "ScopedMailbox", lambda **kwargs: mailbox)
-    monkeypatch.setattr(cli, "PyJevSpamClassifier", CleanFakeClassifier)
 
-    class FakeCleaner:
-        def __init__(self, mailbox, classifier, *, policy, actions=None, rules=None):
+    class FakeLegacyCleanOperation:
+        def __init__(self, _settings, _rules):
             pass
 
-        def run(self, *, apply, selection, on_result, reclassify=False):
-            observed["apply"] = apply
+        def validate_config(self):
+            return None
+
+        def run(self, request, *, password, event_callback=None, on_folder_start=None, on_result=None):
+            selection = MessageSelection(
+                limit=request.limit,
+                offset=request.offset,
+                sort=request.sort,
+            )
+            observed["apply"] = request.apply
+            observed["reclassify"] = request.reclassify
             observed["selection"] = selection
             observed["on_result"] = on_result
-            observed["reclassify"] = reclassify
+            assert password == "secret"
+            selected_count = mailbox.selected_count(selection)
+            if on_folder_start is not None:
+                on_folder_start("Spam", len(mailbox.uids), selected_count, None, selection)
             if on_result is not None:
                 for position, row in enumerate(report.results, start=1):
-                    on_result(row, position, len(report.results))
-            return report
+                    on_result("Spam", row, position, len(report.results))
+            return LegacyCleanResult((report,), (), False)
 
-    monkeypatch.setattr(cli, "SpamCleaner", FakeCleaner)
+    monkeypatch.setattr(cli, "LegacyCleanOperation", FakeLegacyCleanOperation)
     return mailbox, observed
 
 
@@ -477,6 +489,12 @@ def _configure_doctor(monkeypatch, client, settings=None):
 
     monkeypatch.setattr(cli, "ScopedMailbox", mailbox_factory)
     monkeypatch.setattr(cli, "PyJevSpamClassifier", lambda: pytest.fail("doctor constructed classifier"))
+    monkeypatch.setattr(legacy_clean, "ScopedMailbox", mailbox_factory)
+    monkeypatch.setattr(
+        legacy_clean,
+        "PyJevSpamClassifier",
+        lambda **kwargs: pytest.fail("legacy clean constructed classifier"),
+    )
     return factory_options
 
 
@@ -1050,10 +1068,10 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
             return len(self.uids)
 
     class FakeCleaner:
-        def __init__(self, mailbox, classifier, *, policy, actions=None, rules=None):
+        def __init__(self, mailbox, classifier, *, policy, actions=None, rules=None, state_backend=None):
             pass
 
-        def run(self, *, apply, selection, on_result):
+        def run(self, *, apply, selection, on_result, reclassify=False):
             if on_result is not None:
                 for position, row in enumerate(report.results, start=1):
                     on_result(row, position, len(report.results))
@@ -1064,9 +1082,9 @@ def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
     monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
-    monkeypatch.setattr(cli, "ScopedMailbox", lambda **kwargs: Context())
-    monkeypatch.setattr(cli, "PyJevSpamClassifier", CleanFakeClassifier)
-    monkeypatch.setattr(cli, "SpamCleaner", FakeCleaner)
+    monkeypatch.setattr(legacy_clean, "ScopedMailbox", lambda **kwargs: Context())
+    monkeypatch.setattr(legacy_clean, "PyJevSpamClassifier", CleanFakeClassifier)
+    monkeypatch.setattr(legacy_clean, "SpamCleaner", FakeCleaner)
 
     result = CliRunner().invoke(cli.app, ["clean", "--apply"])
 
@@ -1204,7 +1222,7 @@ def _install_multi_clean(
             state["events"].append(("destination", self.folder, destination))
             return destination_exists
 
-    monkeypatch.setattr(cli, "ScopedMailbox", FakeMailbox)
+    monkeypatch.setattr(legacy_clean, "ScopedMailbox", FakeMailbox)
 
     class CountingClassifier:
         def __init__(self, **kwargs):
@@ -1218,16 +1236,16 @@ def _install_multi_clean(
         def __exit__(self, *args):
             return None
 
-    monkeypatch.setattr(cli, "PyJevSpamClassifier", CountingClassifier)
+    monkeypatch.setattr(legacy_clean, "PyJevSpamClassifier", CountingClassifier)
 
     class FakeCleaner:
-        def __init__(self, mailbox, classifier, *, policy, actions, rules=None):
+        def __init__(self, mailbox, classifier, *, policy, actions, rules=None, state_backend=None):
             self.mailbox = mailbox
             self.rules = rules
             self.classifier = classifier
             self.actions = actions
 
-        def run(self, *, apply, selection, on_result):
+        def run(self, *, apply, selection, on_result, reclassify=False):
             state["clean_calls"].append((self.mailbox.folder, self.classifier, selection))
             state["events"].append(("classify", self.mailbox.folder))
             report = (
@@ -1258,7 +1276,7 @@ def _install_multi_clean(
                     on_result(row, position, len(report.results))
             return report
 
-    monkeypatch.setattr(cli, "SpamCleaner", FakeCleaner)
+    monkeypatch.setattr(legacy_clean, "SpamCleaner", FakeCleaner)
     return state
 
 
@@ -1328,12 +1346,12 @@ def test_clean_apply_keeps_real_folder_provenance_with_selection_drift(monkeypat
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
     monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: rules)
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
-    monkeypatch.setattr(cli, "PyJevSpamClassifier", CleanFakeClassifier)
+    monkeypatch.setattr(legacy_clean, "PyJevSpamClassifier", CleanFakeClassifier)
 
     def mailbox_factory(**kwargs):
         return ScopedMailbox(**kwargs, client_factory=lambda *args, **options: client)
 
-    monkeypatch.setattr(cli, "ScopedMailbox", mailbox_factory)
+    monkeypatch.setattr(legacy_clean, "ScopedMailbox", mailbox_factory)
     result = CliRunner().invoke(cli.app, ["clean", "--limit", "2", "--apply"])
 
     rendered = output.getvalue()

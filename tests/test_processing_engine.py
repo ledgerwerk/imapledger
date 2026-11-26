@@ -252,3 +252,50 @@ def test_engine_rejects_destination_not_bound_to_configured_winner(tmp_path, mon
 def test_engine_account_key_uses_existing_account_identity_hash(tmp_path, monkeypatch) -> None:
     engine, _ = _engine(monkeypatch, tmp_path, _rules())
     assert engine.account_key == account_identity_key(_settings())
+
+
+def test_engine_streams_each_result_with_latest_run_counters(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = set()
+    _FakeEvaluator.matching_uids = {1}
+    engine, _ = _engine(monkeypatch, tmp_path, _rules())
+    mailbox = _FakeMailbox((1, 2), writable=True, destinations=("Invoices", "Archive"))
+    seen: list[tuple[int, int]] = []
+
+    report = engine.run(
+        mailbox,
+        apply=True,
+        limit=2,
+        sort_direction="oldest",
+        on_result=lambda message, run: seen.append((message.uid, run.scanned_count)),
+    )
+
+    assert tuple(uid for uid, _ in seen) == (1, 2)
+    assert tuple(count for _, count in seen) == (1, 2)
+    assert tuple(message.uid for message in report.messages) == tuple(uid for uid, _ in seen)
+
+
+def test_retry_streams_results_and_stops_safely_between_uids(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = {1, 2}
+    _FakeEvaluator.matching_uids = {1}
+    engine, store = _engine(monkeypatch, tmp_path, _rules())
+    mailbox = _FakeMailbox((1, 2), writable=True, destinations=("Invoices", "Archive"))
+    first = engine.run(mailbox, apply=True, sort_direction="oldest")
+    assert first.run.error_count == 2
+
+    _FakeEvaluator.failing_uids = set()
+    seen: list[int] = []
+    report = engine.run(
+        mailbox,
+        apply=True,
+        retry_errors=True,
+        sort_direction="oldest",
+        on_result=lambda message, _run: seen.append(message.uid),
+        should_stop=lambda: len(seen) == 1,
+    )
+
+    assert seen == [1]
+    assert [message.uid for message in report.messages] == [1]
+    assert report.stopped_by_user is True
+    assert report.stopped_on_ambiguous_move is False
+    assert report.run.status == "active"
+    assert store.get_result(report.run.id, 2).error_code == "RuntimeError"

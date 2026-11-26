@@ -6,6 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from imapledger import cli, config_store_cli
+from imapledger.application import doctor as doctor_operations
 from imapledger.config import (
     ActionKind,
     ConfigStoreSettings,
@@ -245,7 +246,7 @@ def test_doctor_checks_config_store_folder_read_only(monkeypatch, tmp_path, stor
     store_fake = ConfigStoreFakeClient(store_folders)
     monkeypatch.setattr(cli_module, "load_settings", lambda path: settings)
     monkeypatch.setattr(cli_module, "load_rules", lambda path, *, source_folders: RuleSet())
-    monkeypatch.setattr(cli_module, "preflight_source", lambda *args, **kwargs: source_result)
+    monkeypatch.setattr(doctor_operations, "preflight_source", lambda *args, **kwargs: source_result)
     monkeypatch.setattr(cli_module, "_resolve_password", lambda imap: "password")
     monkeypatch.setattr(
         cli_module,

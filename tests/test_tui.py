@@ -5,9 +5,11 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from imapledger.action_service import ActionReceipt
 from imapledger.analysis_service import MessageAnalysis
+from imapledger.application.clean import CleanRequest, CleanResult
 from imapledger.classification_state import SpamOutcome
 from imapledger.config import (
     ActionKind,
@@ -24,6 +26,9 @@ from imapledger.mail_service import MessageDetail, MessagePage
 from imapledger.mailbox import FolderInfo, MailboxItem, MessageSort
 from imapledger.message import MailImage, MailSummary, RemoteImageRef, parse_message
 from imapledger.policy import SpamVerdict
+from imapledger.preflight import SourcePreflightResult
+from imapledger.processing_engine import ProcessedMessage
+from imapledger.progress_store import ProgressStore, account_identity_key
 from imapledger.routing_action_service import RoutingActionReceipt
 from imapledger.routing_config import write_routing_rules
 from imapledger.routing_models import EvaluationState, RoutingPlan, RoutingRule, RuleEvaluation, RuleType
@@ -32,7 +37,18 @@ from imapledger.routing_rule_service import RoutingRuleService
 from imapledger.rule_service import RuleService
 from imapledger.rules import MailRule, RuleMatch, RuleSet
 from imapledger.settings_service import SettingsService
-from imapledger.tui.app import ApplyConfirmation, MailReviewApp
+from imapledger.tui.app import (
+    ApplyConfirmation,
+    CleanApplyConfirmation,
+    CleanDialog,
+    CleanJobScreen,
+    CleanPreflightScreen,
+    DoctorScreen,
+    MailReviewApp,
+    ProgressErrorsScreen,
+    ProgressResetConfirmation,
+    ProgressScreen,
+)
 from imapledger.tui.rule_screens import ClassificationRulesScreen, RoutingRuleCenterScreen, RuleCenterScreen
 
 SETTINGS = Settings(
@@ -59,6 +75,8 @@ class FakeMailService:
         self.release = None
         self.block_folder = None
         self.requested_folders = []
+        self.requested_pages = []
+        self.page_has_next = False
         self.count_total = 1
         self.fail_load = True
 
@@ -72,8 +90,9 @@ class FakeMailService:
     def refresh_folder_counts(self, folders):
         return {folder: (1, 0) for folder in folders}
 
-    def list_messages(self, folder, *, limit, offset):
+    def list_messages(self, folder, *, limit, offset, sort=MessageSort.NEWEST):
         self.requested_folders.append(folder)
+        self.requested_pages.append((folder, limit, offset, sort))
         if folder == "Fail" and self.fail_load:
             raise RuntimeError("sensitive server error")
         if folder == self.block_folder or folder == "Slow":
@@ -82,7 +101,7 @@ class FakeMailService:
                 self.release.wait(timeout=5)
             else:
                 time.sleep(self.slow_delay)
-        return MessagePage(folder, 42, offset, limit, 1, MessageSort.NEWEST, (SUMMARY,), False, False)
+        return MessagePage(folder, 42, offset, limit, 1, sort, (SUMMARY,), offset > 0, self.page_has_next)
 
     def review_messages(self, *, limit, offset):
         return (("Spam", SUMMARY),)
@@ -387,39 +406,38 @@ def test_folder_worker_failure_does_not_terminate_tui():
     asyncio.run(_folder_worker_failure_is_recoverable())
 
 
-def test_tui_resolves_credentials_before_textual_run(monkeypatch):
-    from types import SimpleNamespace
-
+def test_tui_starts_session_without_resolving_credentials_before_textual_run(monkeypatch):
     from imapledger.tui import app as tui_module
-
-    def resolve_credential(settings):
-        order.append("credential")
-        return SimpleNamespace(password="secret")
 
     order = []
 
-    class Service:
-        def __init__(self, *args, **kwargs):
-            pass
+    class Session:
+        def __init__(self, config):
+            self.config = config
+            order.append("session")
+
+        def load_local(self):
+            order.append("local")
 
         def close(self):
-            pass
+            order.append("close")
 
-    monkeypatch.setattr(tui_module, "load_settings", lambda path: order.append("settings") or SETTINGS)
-    monkeypatch.setattr(
-        tui_module,
-        "load_routing_rules",
-        lambda *args, **kwargs: order.append("rules") or tui_module.RoutingRuleSet(),
-    )
-    monkeypatch.setattr(tui_module, "resolve_credential", resolve_credential)
-    monkeypatch.setattr(tui_module, "MailService", Service)
-    monkeypatch.setattr(tui_module, "RoutingActionService", Service)
-    monkeypatch.setattr(tui_module, "RoutingAnalysisService", Service)
-    monkeypatch.setattr(MailReviewApp, "run", lambda self: order.append("run"))
+    monkeypatch.setattr(tui_module, "AppSession", Session)
+    monkeypatch.setattr(tui_module, "ImageAnalysisService", lambda: object())
+    monkeypatch.setattr(tui_module, "RemoteImageLoader", lambda: object())
+
+    class App:
+        def __init__(self, *args, **kwargs):
+            order.append("app")
+
+        def run(self):
+            order.append("run")
+
+    monkeypatch.setattr(tui_module, "MailReviewApp", App)
 
     tui_module.run(Path("unused.toml"))
 
-    assert order == ["settings", "rules", "credential", "run"]
+    assert order == ["session", "local", "app", "run", "close"]
 
 
 async def _folder_activation_clears_stale_rows_and_count_refresh_preserves_state():
@@ -1110,3 +1128,549 @@ async def _routing_analysis_is_read_only_and_uses_the_unified_rules_screen(tmp_p
 
 def test_routing_analysis_is_read_only_and_uses_the_unified_rules_screen(tmp_path: Path) -> None:
     asyncio.run(_routing_analysis_is_read_only_and_uses_the_unified_rules_screen(tmp_path))
+
+
+def test_clean_ten_uses_preview_defaults_and_streams_job_rows(monkeypatch) -> None:
+    class FakeCleanOperation:
+        requests: list[object] = []
+
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def preflight(self, request):
+            return SimpleNamespace(destinations=("Archive",))
+
+        def run(self, request, *, password, on_result, should_stop):
+            self.requests.append(request)
+            message = ProcessedMessage(217691, "fallback", destination="Archive")
+            on_result(message, SimpleNamespace())
+            report = SimpleNamespace(
+                run=SimpleNamespace(id="run-1", scanned_count=0, cursor_uid=None, high_watermark_uid=217691),
+                messages=(message,),
+                preview=True,
+                stopped_by_user=False,
+                stopped_on_ambiguous_move=False,
+            )
+            return CleanResult(report, ())
+
+    monkeypatch.setattr("imapledger.tui.app.CleanOperation", FakeCleanOperation)
+    FakeCleanOperation.requests.clear()
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        routing_rules=RoutingRuleSet(),
+        password="test-password",
+    )
+
+    async def scenario() -> None:
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await app._select_folder("INBOX")
+            await pilot.press("x")
+            await pilot.pause(0.2)
+            assert FakeCleanOperation.requests
+            request = FakeCleanOperation.requests[0]
+            assert request.folder == "INBOX"
+            assert request.limit == 10
+            assert request.apply is False
+            assert request.sort == "oldest"
+            assert isinstance(app.screen, CleanJobScreen)
+            table = app.screen.query_one("#clean-job-table")
+            assert table.row_count == 1
+            assert table.get_row_at(0)[1] == "fallback"
+            assert "Preview only" in str(app.screen.query_one("#clean-job-error").render())
+
+    asyncio.run(scenario())
+
+
+def test_clean_fallback_preflight_offers_rules_and_single_rule(monkeypatch) -> None:
+    class MissingFallbackOperation:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def preflight(self, _request):
+            raise ValueError("full routing requires rules.fallback_destination")
+
+    monkeypatch.setattr("imapledger.tui.app.CleanOperation", MissingFallbackOperation)
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        routing_rules=RoutingRuleSet(),
+        password="test-password",
+    )
+
+    async def scenario() -> None:
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await app._select_folder("INBOX")
+            await pilot.press("x")
+            await pilot.pause()
+            assert isinstance(app.screen, CleanPreflightScreen)
+            assert "No fallback destination is configured" in app.screen.detail
+            assert app.screen.query_one("#clean-one-rule")
+
+    asyncio.run(scenario())
+
+
+def test_clean_worker_remains_responsive_and_cancels_between_results(monkeypatch) -> None:
+    started = threading.Event()
+
+    class BlockingCleanOperation:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def preflight(self, _request):
+            return SimpleNamespace(destinations=("Archive",))
+
+        def run(self, _request, *, password, on_result, should_stop):
+            started.set()
+            while not should_stop():
+                time.sleep(0.005)
+            report = SimpleNamespace(
+                run=SimpleNamespace(id="run-2", scanned_count=0, cursor_uid=None, high_watermark_uid=0),
+                messages=(),
+                preview=True,
+                stopped_by_user=True,
+                stopped_on_ambiguous_move=False,
+            )
+            return CleanResult(report, ())
+
+    monkeypatch.setattr("imapledger.tui.app.CleanOperation", BlockingCleanOperation)
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        routing_rules=RoutingRuleSet(),
+        password="test-password",
+    )
+
+    async def scenario() -> None:
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await app._select_folder("INBOX")
+            await pilot.press("x")
+            assert await asyncio.to_thread(started.wait, 1)
+            assert isinstance(app.screen, CleanJobScreen)
+            await pilot.click("#clean-job-cancel")
+            await pilot.pause(0.1)
+            summary = str(app.screen.query_one("#clean-job-summary").render())
+            assert "cancelled/stopped by user" in summary
+
+    asyncio.run(scenario())
+
+
+def test_clean_dialog_defaults_and_updates_cli_equivalent() -> None:
+    app = MailReviewApp(Path("unused.toml"))
+
+    async def scenario() -> None:
+        async with app.run_test(size=(100, 32)) as pilot:
+            screen = CleanDialog("INBOX")
+            app.push_screen(screen)
+            await pilot.pause()
+            request = screen._request()
+            assert request.folder == "INBOX"
+            assert request.limit == 10
+            assert request.apply is False
+            assert request.sort == "oldest"
+            command = str(screen.query_one("#clean-command").render())
+            assert "imapledger clean INBOX --limit 10 --sort oldest" in command
+            await pilot.click("#clean-apply")
+            await pilot.pause()
+            assert "--apply" in str(screen.query_one("#clean-command").render())
+            await pilot.click("#clean-cancel")
+
+    asyncio.run(scenario())
+
+
+def test_clean_apply_preflights_and_confirms_before_writable_run(monkeypatch) -> None:
+    class FakeCleanOperation:
+        run_requests: list[object] = []
+
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def preflight(self, _request):
+            return SimpleNamespace(destinations=("Archive",))
+
+        def run(self, request, *, password, on_result, should_stop):
+            self.run_requests.append(request)
+            message = ProcessedMessage(217691, "match", destination="Archive", applied=True, confirmed=True)
+            run = SimpleNamespace(
+                id="run-3",
+                scanned_count=1,
+                match_count=1,
+                moved_count=1,
+                no_match_count=0,
+                error_count=0,
+            )
+            on_result(message, run)
+            report = SimpleNamespace(
+                run=SimpleNamespace(id="run-3", scanned_count=1, cursor_uid=217691, high_watermark_uid=217691),
+                messages=(message,),
+                preview=False,
+                stopped_by_user=False,
+                stopped_on_ambiguous_move=False,
+            )
+            return CleanResult(report, ("INBOX", "Archive"))
+
+    preflights: list[object] = []
+
+    def fake_preflight(*args, **kwargs):
+        preflights.append((args, kwargs))
+        return SimpleNamespace(ok=True, opened=True, missing_capabilities=(), destinations=(), errors=())
+
+    monkeypatch.setattr("imapledger.tui.app.CleanOperation", FakeCleanOperation)
+    monkeypatch.setattr("imapledger.tui.app.preflight_source", fake_preflight)
+    FakeCleanOperation.run_requests.clear()
+    mail = FakeMailService()
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=mail,
+        settings=SETTINGS,
+        routing_rules=RoutingRuleSet(),
+        password="test-password",
+    )
+
+    async def scenario() -> None:
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            app._begin_clean(CleanRequest(folder="INBOX", limit=10, apply=True))
+            await pilot.pause(0.1)
+            assert preflights
+            assert isinstance(app.screen, CleanApplyConfirmation)
+            assert not FakeCleanOperation.run_requests
+            confirmation = str(app.screen.query_one("Static").render())
+            assert "Source: INBOX" in confirmation
+            assert "Possible destinations: Archive" in confirmation
+            assert "best-effort, not transactional" in confirmation
+            await pilot.click("#clean-confirm-apply")
+            await pilot.pause(0.2)
+            assert FakeCleanOperation.run_requests[0].apply is True
+            assert isinstance(app.screen, CleanJobScreen)
+            assert app.screen.query_one("#clean-job-table").row_count == 1
+            assert mail.folder_list_modes.count(False) >= 2
+
+    asyncio.run(scenario())
+
+
+def test_tui_progress_workspace_requires_confirmation_to_reset(monkeypatch, tmp_path) -> None:
+    database = tmp_path / "progress.sqlite3"
+    monkeypatch.setattr("imapledger.application.progress.default_progress_path", lambda: database)
+    store = ProgressStore(database)
+    run = store.begin_run(
+        account_key=account_identity_key(SETTINGS),
+        source_folder="INBOX",
+        uidvalidity=42,
+        high_watermark_uid=12,
+        rules_fingerprint="fingerprint-a",
+        mode="full",
+        rule_scope=None,
+        sort_direction="oldest",
+    )
+    store.record_result(run.id, uid=9, outcome="error", error_code="RuntimeError")
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        routing_rules=RoutingRuleSet(),
+        password="test-password",
+    )
+
+    async def scenario() -> None:
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, ProgressScreen)
+            assert "1 stored error(s)" in str(app.screen.query_one("#progress-errors").render())
+            await pilot.click("#progress-view-errors")
+            await pilot.pause()
+            assert isinstance(app.screen, ProgressErrorsScreen)
+            error_row = " ".join(str(cell) for cell in app.screen.query_one("#progress-error-table").get_row_at(0))
+            assert "9" in error_row and "RuntimeError" in error_row
+            await pilot.click("#progress-errors-close")
+            await pilot.pause()
+            assert isinstance(app.screen, ProgressScreen)
+            await pilot.click("#progress-reset")
+            await pilot.pause()
+            assert isinstance(app.screen, ProgressResetConfirmation)
+            assert "Folder: INBOX" in str(app.screen.query_one("Static").render())
+            await pilot.click("#progress-reset-confirm")
+            await pilot.pause(0.3)
+            assert isinstance(app.screen, ProgressScreen)
+            assert "No progress runs" in str(app.screen.query_one("#progress-detail").render())
+
+    asyncio.run(scenario())
+
+
+def test_tui_doctor_displays_safe_error_types_only(monkeypatch) -> None:
+    result = SourcePreflightResult(
+        folder="Spam",
+        opened=False,
+        probe=None,
+        capabilities=frozenset(),
+        missing_capabilities=(),
+        destinations=(),
+        errors=(RuntimeError("credential-secret-must-not-render"),),
+    )
+
+    class FakeDoctorOperation:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def run(self, *_: object, **__: object) -> SourcePreflightResult:
+            return result
+
+    monkeypatch.setattr("imapledger.tui.app.DoctorOperation", FakeDoctorOperation)
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        routing_rules=RoutingRuleSet(),
+        password="test-password",
+    )
+
+    async def scenario() -> None:
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            await pilot.press("d")
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, DoctorScreen)
+            row = " ".join(str(cell) for cell in app.screen.query_one("#doctor-table").get_row_at(0))
+            assert "RuntimeError" in row
+            assert "credential-secret-must-not-render" not in row
+
+    asyncio.run(scenario())
+
+
+def test_tui_mail_controls_page_sort_and_review_filter() -> None:
+    from imapledger.application.browsing import ReviewPage
+
+    class FakeReviewOperation:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def run(self, request, *, password, **kwargs):
+            self.requests.append(request)
+            return ReviewPage(
+                folder=request.folder,
+                limit=request.limit,
+                offset=request.offset,
+                sort=request.sort,
+                total=0,
+                items=(),
+                has_previous=request.offset > 0,
+                has_next=False,
+            )
+
+    mail = FakeMailService()
+    mail.page_has_next = True
+    review = FakeReviewOperation()
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=mail,
+        review_operation=review,
+        settings=SETTINGS,
+        routing_rules=RoutingRuleSet(),
+    )
+
+    async def scenario() -> None:
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            await app._select_folder("Spam")
+            await pilot.click("#mail-next")
+            await pilot.pause(0.1)
+            assert app._page_offset == 50
+            assert mail.requested_pages[-1][2] == 50
+            await pilot.click("#mail-sort")
+            await pilot.pause(0.1)
+            assert app._page_sort is MessageSort.OLDEST
+            assert app._page_offset == 0
+            clicked_size = await pilot.click("#mail-size")
+            assert clicked_size
+            await pilot.pause(0.1)
+            assert app._page_limit == 100
+
+            await app._select_folder("Review")
+            await pilot.click("#review-filter")
+            await pilot.pause(0.1)
+            assert review.requests[-1].folder == "Spam"
+            assert app._list_folder == "Review"
+
+    asyncio.run(scenario())
+
+
+def test_tui_explain_analysis_cannot_be_applied() -> None:
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        analysis_service=FakeAnalysisService(SpamOutcome.REVIEW),
+        routing_rules=RoutingRuleSet(),
+    )
+
+    async def scenario() -> None:
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            await app._open_message("Spam", 9)
+            await pilot.press("e")
+            await pilot.pause(0.1)
+            assert app._analysis_read_only is True
+            await pilot.press("a")
+            await pilot.pause()
+            assert not isinstance(app.screen, ApplyConfirmation)
+
+    asyncio.run(scenario())
+
+
+def test_tui_state_reset_requires_preview_and_explicit_apply(monkeypatch) -> None:
+    from textual.widgets import Input
+
+    from imapledger.application.state import StateFolderStatus, StateResetResult
+    from imapledger.classification_state import ClassificationStateBackend
+    from imapledger.tui.app import StateResetDialog, StateResetPreviewScreen, StateScreen
+
+    class FakeStateOperation:
+        calls = []
+
+        def __init__(self, settings) -> None:
+            self.settings = settings
+
+        def status(self, folder, *, password, **kwargs):
+            return StateFolderStatus(folder, 42, ClassificationStateBackend.NONE, "NOT CONFIGURED", 3, 1, 1, 1, 0, 0)
+
+        def reset_folders(self, request):
+            return (request.folder,) if not request.all_folders else self.settings.spam.folders
+
+        def reset_folder(self, folder, request, *, password, **kwargs):
+            self.calls.append((folder, request.uid, request.apply, password))
+            return StateResetResult(folder, ((request.uid or 9, ("$imapledger-spam",)),), request.apply)
+
+    monkeypatch.setattr("imapledger.tui.app.StateOperation", FakeStateOperation)
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        password="session-secret",
+        routing_rules=RoutingRuleSet(),
+    )
+    FakeStateOperation.calls.clear()
+
+    async def scenario() -> None:
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            await pilot.press("S")
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, StateScreen)
+            await pilot.click("#state-reset")
+            await pilot.pause()
+            assert isinstance(app.screen, StateResetDialog)
+            app.screen.query_one("#state-reset-uid", Input).value = "12"
+            await pilot.click("#state-reset-apply")
+            await pilot.click("#state-reset-preview")
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, StateResetPreviewScreen)
+            assert "Exact UID: 12" in str(app.screen.query_one("Static").render())
+            await pilot.click("#state-reset-confirm")
+            await pilot.pause(0.3)
+            assert isinstance(app.screen, StateScreen)
+
+    asyncio.run(scenario())
+    assert FakeStateOperation.calls == [
+        ("Spam", 12, False, "session-secret"),
+        ("Spam", 12, True, "session-secret"),
+    ]
+
+
+def test_tui_rule_migration_previews_before_writing(tmp_path: Path) -> None:
+    from imapledger.tui.rule_screens import RuleMigrationPreviewScreen
+
+    config_path = tmp_path / "config.toml"
+    rules_path = tmp_path / "rules.toml"
+    source = (
+        '[rules]\nschema = 1\n\n[[rules.rule]]\nid = "learned"\n'
+        'enabled = true\nsource_folders = ["Spam"]\naction = "move"\n'
+        'destination = "Archive"\nmatch = { from_domain = "example.net" }\n'
+    )
+    rules_path.write_text(source, encoding="utf-8")
+    app = MailReviewApp(
+        config_path,
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        routing_rule_service=RoutingRuleService(rules_path),
+        routing_rules=RoutingRuleSet(),
+    )
+
+    async def scenario() -> None:
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            await pilot.press("R")
+            await pilot.pause()
+            assert isinstance(app.screen, RoutingRuleCenterScreen)
+            await pilot.click("#migrate")
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, RuleMigrationPreviewScreen)
+            assert "learned" in str(app.screen.query_one("Static").render())
+            assert rules_path.read_text(encoding="utf-8") == source
+            await pilot.click("#rule-migration-apply")
+            await pilot.pause(0.3)
+            assert "schema = 2" in rules_path.read_text(encoding="utf-8")
+            assert isinstance(app.screen, RoutingRuleCenterScreen)
+
+    asyncio.run(scenario())
+
+
+def test_tui_rule_learning_requires_preview_then_explicit_save(tmp_path: Path, monkeypatch) -> None:
+    from imapledger.application.rules import RuleLearningPreview
+    from imapledger.routing_models import RoutingRule
+    from imapledger.rule_candidates import build_rule_candidates
+    from imapledger.rule_learning import RuleProposal
+    from imapledger.tui.rule_screens import RuleLearnDialog, RuleLearnPreviewScreen
+
+    path = tmp_path / "rules.toml"
+    write_routing_rules(RoutingRuleSet(), path)
+    service = RoutingRuleService(path)
+    candidate = next(item for item in build_rule_candidates(MESSAGE) if item.id == "from_address_exact")
+    proposal = RuleProposal(candidate, "auto", 0.96, 0.98, "model", "request")
+
+    def fake_propose(self, message, *, folder, destination, existing_rules, name=None):
+        rule = RoutingRule(
+            id=name or "learned-sender",
+            enabled=True,
+            type=RuleType.HEADER,
+            destination=destination,
+            match=candidate.match,
+            source_folders=(folder,),
+        )
+        return RuleLearningPreview(proposal, rule, existing_rules)
+
+    monkeypatch.setattr("imapledger.application.rules.RuleLearningOperation.propose", fake_propose)
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        routing_rules=RoutingRuleSet(),
+        routing_rule_service=service,
+        analysis_service=FakeAnalysisService(),
+    )
+
+    async def scenario() -> None:
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            await app._open_message("Spam", 9)
+            await pilot.press("l")
+            await pilot.pause()
+            assert isinstance(app.screen, RuleLearnDialog)
+            await pilot.click("#learn-preview")
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, RuleLearnPreviewScreen)
+            assert "learned-sender" in str(app.screen.query_one("Static").render())
+            assert service.load().rules == ()
+            await pilot.click("#learn-save")
+            await pilot.pause(0.3)
+            assert service.load().rules[0].id == "learned-sender"
+            assert isinstance(app.screen, RoutingRuleCenterScreen)
+
+    asyncio.run(scenario())
