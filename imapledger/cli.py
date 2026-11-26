@@ -57,9 +57,18 @@ from .mailbox import (
     MailboxSnapshot,
     MessageSelection,
     MessageSort,
+    ProcessingMailbox,
     ScopedMailbox,
 )
 from .preflight import preflight_source
+from .processing_engine import ProcessedMessage, ProcessingEngine, ProcessingError
+from .progress_store import ProgressStore, ProgressStoreError, account_identity_key, default_progress_path
+from .routing_config import (
+    RoutingConfigError,
+    load_routing_rules,
+    migrate_legacy_rules,
+    routing_rules_path_for_config,
+)
 from .rule_candidates import build_rule_candidates
 from .rule_learning import RuleProposal, learn_rule_proposal
 from .rules import (
@@ -82,6 +91,8 @@ rule_app = typer.Typer(help="Manage optional advanced routing filters for batch 
 app.add_typer(rule_app, name="rule")
 state_app = typer.Typer(help="Inspect and reset persisted classification state.")
 app.add_typer(state_app, name="state")
+progress_app = typer.Typer(help="Inspect, retry, and reset resumable routing progress.")
+app.add_typer(progress_app, name="progress")
 review_app = typer.Typer(help="Inspect the persisted review queue.")
 app.add_typer(review_app, name="review")
 mail_app = typer.Typer(help="Browse and analyze mailbox messages.")
@@ -373,6 +384,33 @@ def auth_change_passphrase(
         err_console.print(f"Credential error: {exc}", markup=False)
         raise typer.Exit(2) from exc
     console.print("Changed encrypted credential vault passphrase.", markup=False)
+
+
+@rule_app.command("migrate")
+def rule_migrate(
+    apply: bool = typer.Option(False, "--apply", help="Write the schema-2 conversion to rules.toml."),
+    preview: bool = typer.Option(False, "--preview", help="Preview the conversion without writing."),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """Explicitly migrate schema-1 header rules to schema 2."""
+    if apply and preview:
+        err_console.print("Usage error: --preview and --apply cannot be combined.")
+        raise typer.Exit(2)
+    path = routing_rules_path_for_config(config)
+    try:
+        result = migrate_legacy_rules(path, apply=apply)
+    except RoutingConfigError as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    console.print(f"rules: {path}", markup=False)
+    console.print(f"schema: {result.source_schema} -> 2", markup=False)
+    console.print(f"converted rules: {len(result.rules.rules)}", markup=False)
+    if result.rules.fallback_destination is None:
+        console.print("No fallback was inferred. Configure rules.fallback_destination before full clean.", markup=False)
+    console.print(
+        "Migration applied." if apply else "Preview only. Re-run with --apply to write schema-2 rules.",
+        markup=False,
+    )
 
 
 @rule_app.command("list")
@@ -782,6 +820,10 @@ def doctor(
         raise typer.Exit(2) from exc
     console.print("config: OK")
 
+    if not settings.spam.folders:
+        err_console.print("Configuration error: doctor requires at least one spam.folders source.", markup=False)
+        raise typer.Exit(2)
+
     try:
         rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
     except RuleError as exc:
@@ -904,49 +946,99 @@ def doctor(
 
 @app.command()
 def clean(
+    folder: str | None = typer.Argument(
+        None,
+        help="Source folder for resumable routing. Omit to use the compatibility workflow.",
+    ),  # noqa: B008
     apply: bool = typer.Option(
         False,
         "--apply",
-        help="Apply category actions to selected messages in configured spam.folders.",
+        help="Apply routing actions. Preview is the default.",
     ),
     reclassify: bool = typer.Option(
         False,
         "--reclassify",
-        help="Ignore stored classification state and classify selected messages again.",
+        help="Ignore stored classification state in the compatibility workflow.",
     ),
     limit: int | None = typer.Option(
         None,
         "--limit",
         min=1,
-        help="Classify at most this many messages per source after sorting and applying --offset.",
+        help="Process at most this many messages.",
     ),
     offset: int = typer.Option(
         0,
         "--offset",
         min=0,
-        help="Skip this many messages independently in each source after sorting.",
+        help="Compatibility workflow only: skip messages after sorting.",
     ),
-    sort: MessageSort = typer.Option(  # noqa: B008
-        MessageSort.NEWEST,
+    sort: MessageSort | None = typer.Option(  # noqa: B008
+        None,
         "--sort",
-        help="Order by mailbox-local UID arrival order, not the message Date header.",
+        help="UID order, default oldest for resumable routing and newest for compatibility mode.",
     ),
+    rule: str | None = typer.Option(None, "--rule", help="Evaluate only this enabled routing rule."),
+    new_run: bool = typer.Option(False, "--new-run", help="Supersede active progress and start a fresh scan."),
+    retry_errors: bool = typer.Option(False, "--retry-errors", help="Retry stored errors from the matching run."),
     progress: bool = typer.Option(  # noqa: B008
         True,
         "--progress/--no-progress",
-        help="Stream each classification and final configured action as it completes.",
+        help="Print each completed UID evaluation, final configured routing actions, and counters.",
     ),
+    progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database."),  # noqa: B008
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
     debug: bool = typer.Option(False, "--debug", help="Print a traceback without exception payloads"),
 ) -> None:
-    """Classify only spam.folders and optionally apply global category actions."""
+    """Process routing and display the final configured action as it completes.
+
+    Compatibility mode applies category actions to spam.folders.
+    """
+    if folder is not None:
+        if new_run and retry_errors:
+            err_console.print("Usage error: --new-run cannot be combined with --retry-errors.")
+            raise typer.Exit(2)
+        if retry_errors and not apply:
+            err_console.print("Usage error: --retry-errors requires --apply.")
+            raise typer.Exit(2)
+        if reclassify or offset:
+            err_console.print("Usage error: --reclassify and --offset are only available without a source folder.")
+            raise typer.Exit(2)
+        _routing_clean(
+            folder,
+            apply=apply,
+            limit=limit,
+            sort=sort or MessageSort.OLDEST,
+            rule=rule,
+            new_run=new_run,
+            retry_errors=retry_errors,
+            progress=progress,
+            progress_db=progress_db,
+            config=config,
+            verbose=verbose,
+            debug=debug,
+        )
+        return
+    if rule is not None or new_run or retry_errors:
+        err_console.print("Usage error: --rule, --new-run, and --retry-errors require a source folder argument.")
+        raise typer.Exit(2)
+    console.print(
+        "Deprecation warning: bare `clean` is deprecated. Use `imapledger clean FOLDER` for semantic routing.",
+        markup=False,
+    )
     try:
         settings = load_settings(config)
     except ConfigError as exc:
         err_console.print(f"[red]Configuration error:[/red] {exc}")
         raise typer.Exit(2) from exc
 
+    if not settings.spam.folders:
+        err_console.print(
+            "Configuration error: bare `clean` requires spam.folders; "
+            "use `clean FOLDER` for an explicit routing source.",
+            markup=False,
+        )
+        raise typer.Exit(2)
     try:
         rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
     except RuleError as exc:
@@ -964,7 +1056,12 @@ def clean(
         if settings.spam.state.backend is ClassificationStateBackend.IMAP_KEYWORDS and not reclassify
         else ()
     )
-    selection = MessageSelection(limit=limit, offset=offset, sort=sort, excluded_keywords=excluded_keywords)
+    selection = MessageSelection(
+        limit=limit,
+        offset=offset,
+        sort=sort or MessageSort.NEWEST,
+        excluded_keywords=excluded_keywords,
+    )
     actions = settings.spam.actions
     destinations = _move_destinations(actions, rules)
     allow_delete = any(
@@ -1094,6 +1191,240 @@ def clean(
     if failure is not None:
         _print_failure(failure, debug=debug, command="clean")
         raise typer.Exit(1) from failure
+
+
+def _routing_clean(
+    folder: str,
+    *,
+    apply: bool,
+    limit: int | None,
+    sort: MessageSort,
+    rule: str | None,
+    new_run: bool,
+    retry_errors: bool,
+    progress: bool,
+    progress_db: Path,
+    config: Path,
+    verbose: bool,
+    debug: bool,
+) -> None:
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    try:
+        rules = load_routing_rules(routing_rules_path_for_config(config))
+    except RoutingConfigError as exc:
+        err_console.print(f"[red]Rules error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    config_store_folder = settings.config_store.folder if settings.config_store is not None else None
+    try:
+        rules.validate_destinations(folder, config_store_folder=config_store_folder)
+    except ValueError as exc:
+        err_console.print(f"[red]Rules error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    if rule is None and rules.fallback_destination is None:
+        err_console.print("[red]Rules error:[/red] full routing requires rules.fallback_destination")
+        raise typer.Exit(2)
+    if rule is not None and not any(candidate.id == rule for candidate in rules.enabled_rules(folder)):
+        err_console.print(f"[red]Rules error:[/red] enabled rule not found for source {folder}: {rule}")
+        raise typer.Exit(2)
+
+    selected_rules = rules.enabled_rules(folder)
+    if rule is not None:
+        selected_rules = tuple(candidate for candidate in selected_rules if candidate.id == rule)
+    allowed_destinations = [candidate.destination for candidate in selected_rules]
+    if rule is None and rules.fallback_destination is not None:
+        allowed_destinations.append(rules.fallback_destination)
+
+    password = ""
+    try:
+        password = _resolve_password(settings.imap)
+        store = ProgressStore(progress_db)
+        with ProcessingMailbox(
+            host=settings.imap.host,
+            port=settings.imap.port,
+            username=settings.imap.username,
+            password=password,
+            folder=folder,
+            writable=apply,
+            allowed_destinations=tuple(dict.fromkeys(allowed_destinations)),
+            max_message_bytes=settings.spam.max_message_bytes,
+            max_body_chars=settings.spam.max_body_chars,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+        ) as mailbox:
+            report = ProcessingEngine(
+                settings=settings,
+                rules=rules,
+                progress_store=store,
+            ).run(
+                mailbox,
+                apply=apply,
+                limit=limit,
+                rule_scope=rule,
+                sort_direction=sort.value,
+                new_run=new_run,
+                retry_errors=retry_errors,
+            )
+    except (ProcessingError, ProgressStoreError, MailboxError) as exc:
+        _print_failure(exc, debug=debug, command="clean")
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        _print_failure(exc, debug=debug, command="clean")
+        raise typer.Exit(1) from exc
+    finally:
+        password = ""
+
+    if progress:
+        for message in report.messages:
+            _print_processing_message(message, preview=report.preview)
+    run = report.run
+    console.print(
+        f"run={run.id} folder={run.source_folder} mode={run.mode} "
+        f"scope={run.rule_scope or '-'} sort={run.sort_direction} status={run.status} "
+        f"uidvalidity={run.uidvalidity} range=({run.lower_bound_uid},{run.high_watermark_uid}] "
+        f"cursor={run.cursor_uid if run.cursor_uid is not None else '-'} "
+        f"scanned_total={run.scanned_count} matched={run.match_count} moved={run.moved_count} "
+        f"no_match={run.no_match_count} errors={run.error_count} "
+        f"this_command={len(report.messages)}",
+        markup=False,
+    )
+    if report.preview:
+        console.print("Preview only. No mailbox or per-message progress state was changed.", markup=False)
+    if report.stopped_on_ambiguous_move:
+        ambiguous = next(
+            (message for message in report.messages if message.error_code in {"PartialMoveError", "MoveUnconfirmed"}),
+            None,
+        )
+        uid_text = f" UID={ambiguous.uid}." if ambiguous is not None else ""
+        console.print(
+            f"Stopped after an ambiguous MOVE.{uid_text} Reconcile this UID before continuing.",
+            markup=False,
+        )
+    if any(message.outcome == "error" for message in report.messages):
+        raise typer.Exit(1)
+
+
+def _print_processing_message(message: ProcessedMessage, *, preview: bool) -> None:
+    plan = message.plan
+    states = "-"
+    if plan is not None and plan.rule_results:
+        states = ",".join(
+            f"{result.rule_id}:{result.state.value}"
+            + (f"({result.confidence:.3f})" if result.confidence is not None else "")
+            for result in plan.rule_results
+        )
+    destination = message.destination or "-"
+    rule_id = plan.winner_rule_id if plan is not None and plan.winner_rule_id is not None else "-"
+    action = "preview" if preview else ("confirmed" if message.confirmed else "not-moved")
+    error = f" error={message.error_code}" if message.error_code else ""
+    console.print(
+        f"uid={message.uid} outcome={message.outcome} rule={rule_id} destination={destination} "
+        f"evaluations={states} action={action}{error}",
+        markup=False,
+    )
+
+
+def _progress_context(config: Path, progress_db: Path) -> tuple[ProgressStore, str]:
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+    try:
+        return ProgressStore(progress_db), account_identity_key(settings)
+    except Exception as exc:
+        _print_failure(exc, debug=False, command="progress")
+        raise typer.Exit(1) from exc
+
+
+@progress_app.command("list")
+def progress_list(
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database."),  # noqa: B008
+) -> None:
+    """List resumable runs for the configured IMAP account."""
+    store, account_key = _progress_context(config, progress_db)
+    runs = store.list_runs(account_key=account_key)
+    table = Table(title="Routing progress")
+    for column in ("Folder", "Mode", "Scope", "Sort", "Status", "Cursor", "Scanned", "Errors", "Run"):
+        table.add_column(column)
+    for run in runs:
+        table.add_row(
+            run.source_folder,
+            run.mode,
+            run.rule_scope or "-",
+            run.sort_direction,
+            run.status,
+            str(run.cursor_uid) if run.cursor_uid is not None else "-",
+            str(run.scanned_count),
+            str(run.error_count),
+            run.id,
+        )
+    console.print(table)
+    console.print(f"database: {progress_db}", markup=False)
+
+
+@progress_app.command("show")
+def progress_show(
+    folder: str = typer.Argument(..., help="Source folder."),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database."),  # noqa: B008
+) -> None:
+    """Show the most recent run for one source folder."""
+    store, account_key = _progress_context(config, progress_db)
+    runs = store.list_runs(account_key=account_key, source_folder=folder, limit=1000)
+    if not runs:
+        console.print(f"No progress recorded for {folder}.", markup=False)
+        return
+    run = runs[0]
+    console.print(
+        f"run={run.id} folder={run.source_folder} mode={run.mode} scope={run.rule_scope or '-'} "
+        f"status={run.status} sort={run.sort_direction} uidvalidity={run.uidvalidity} "
+        f"range=({run.lower_bound_uid},{run.high_watermark_uid}] cursor={run.cursor_uid or '-'} "
+        f"scanned={run.scanned_count} matched={run.match_count} moved={run.moved_count} "
+        f"no_match={run.no_match_count} errors={run.error_count}",
+        markup=False,
+    )
+    console.print(f"database: {progress_db}", markup=False)
+
+
+@progress_app.command("errors")
+def progress_errors(
+    folder: str = typer.Argument(..., help="Source folder."),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database."),  # noqa: B008
+) -> None:
+    """List retryable UID error codes from the most recent run with errors."""
+    store, account_key = _progress_context(config, progress_db)
+    runs = store.list_runs(account_key=account_key, source_folder=folder, limit=1000)
+    run = next((candidate for candidate in runs if candidate.error_count), None)
+    if run is None:
+        console.print(f"No stored errors for {folder}.", markup=False)
+        return
+    for result in store.errors(run.id):
+        console.print(f"folder={folder} uid={result.uid} error={result.error_code or 'unknown'}", markup=False)
+
+
+@progress_app.command("reset")
+def progress_reset(
+    folder: str = typer.Argument(..., help="Source folder."),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database."),  # noqa: B008
+) -> None:
+    """Delete all saved progress runs for one source folder after confirmation."""
+    store, account_key = _progress_context(config, progress_db)
+    runs = store.list_runs(account_key=account_key, source_folder=folder, limit=1000)
+    if not runs:
+        console.print(f"No progress recorded for {folder}.", markup=False)
+        return
+    if not typer.confirm(f"Delete all progress runs for {folder}?", default=False):
+        console.print("Progress reset cancelled.", markup=False)
+        return
+    deleted = store.reset_folder(account_key, folder)
+    console.print(f"Deleted {deleted} progress run(s) for {folder}.", markup=False)
 
 
 @state_app.command("status")

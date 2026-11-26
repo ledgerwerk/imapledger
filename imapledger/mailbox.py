@@ -23,6 +23,7 @@ DELETED_FLAG = "\\Deleted"
 DEFAULT_FETCH_BATCH_SIZE = 100
 DEFAULT_MUTATION_BATCH_SIZE = 100
 DEFAULT_DELETE_BATCH_SIZE = DEFAULT_MUTATION_BATCH_SIZE
+UID_SEARCH_WINDOW_SIZE = 4096
 
 
 class MailboxError(RuntimeError):
@@ -233,9 +234,20 @@ class MailboxSnapshot:
     uids: frozenset[int]
     permanent_flags: frozenset[bytes] = frozenset()
     permanent_flags_known: bool = False
+    uidnext: int | None = None
 
     def supports_persistent_keyword(self, keyword: str) -> bool:
         return _supports_persistent_keyword(self.permanent_flags, keyword)
+
+
+@dataclass(frozen=True, slots=True)
+class MailboxRunMetadata:
+    uidvalidity: int
+    uidnext: int
+
+    @property
+    def high_watermark_uid(self) -> int:
+        return self.uidnext - 1
 
 
 class MessageSort(str, Enum):
@@ -482,6 +494,7 @@ class ScopedMailbox:
         allowed_destinations: Collection[str] = (),
         allow_delete: bool = False,
         uid_scope: Collection[int] | None = None,
+        cursor_oriented: bool = False,
         client_factory: ClientFactory | None = None,
         event_callback: Callable[[str], None] | None = None,
     ) -> None:
@@ -496,6 +509,7 @@ class ScopedMailbox:
         self._allow_delete = allow_delete
         self._host = host
         self._uid_scope = _normalize_uid_scope(uid_scope)
+        self._cursor_oriented = cursor_oriented
         self._port = port
         self._username = username
         self._password = password
@@ -553,6 +567,10 @@ class ScopedMailbox:
             raise failure from exc
         self._reselect_source(operation="imap_post_destination_select")
         return exists
+
+    def validate_destination(self, destination: str) -> None:
+        if not self.destination_exists(destination):
+            raise UnsafeMailboxOperation(f"configured destination does not exist: {destination}")
 
     def __enter__(self) -> ScopedMailbox:
         self._emit(f"connect host={self._host} port={self._port} tls=true")
@@ -622,6 +640,7 @@ class ScopedMailbox:
                 ) from exc
             self._emit(f"select folder={self._folder!r} readonly={not self._writable}")
             uidvalidity = _uidvalidity(selected)
+            uidnext = _uidnext(selected) if self._cursor_oriented else None
             permanent_flags = _permanent_flags(selected)
             permanent_flags_known = _permanent_flags_known(selected)
             self._emit(f"uidvalidity={uidvalidity}")
@@ -640,6 +659,7 @@ class ScopedMailbox:
             uids=uids,
             permanent_flags=permanent_flags,
             permanent_flags_known=permanent_flags_known,
+            uidnext=uidnext,
         )
         self._capabilities = normalized_capabilities
         return self
@@ -649,6 +669,8 @@ class ScopedMailbox:
         client: _Client,
         selected: Mapping[bytes, Any],
     ) -> frozenset[int]:
+        if self._cursor_oriented:
+            return frozenset()
         if self._uid_scope is None:
             return self._fetch_full_uid_snapshot(client, selected)
         if not self._uid_scope:
@@ -739,6 +761,169 @@ class ScopedMailbox:
         if self._snapshot is None:
             raise MailboxError("mailbox is not open")
         return self._snapshot
+
+    def metadata(self) -> MailboxRunMetadata:
+        if not self._cursor_oriented:
+            raise MailboxError("mailbox was not opened in cursor-oriented mode")
+        snapshot = self.snapshot()
+        if snapshot.uidnext is None:
+            raise MailboxError("selected mailbox has no UIDNEXT metadata")
+        return MailboxRunMetadata(snapshot.uidvalidity, snapshot.uidnext)
+
+    def find_next_uids(
+        self,
+        *,
+        cursor_uid: int | None,
+        high_watermark_uid: int,
+        limit: int,
+        direction: str,
+        lower_bound_uid: int = 0,
+    ) -> tuple[int, ...]:
+        if not self._cursor_oriented:
+            raise MailboxError("mailbox was not opened in cursor-oriented mode")
+        metadata = self.metadata()
+        if isinstance(high_watermark_uid, bool) or not isinstance(high_watermark_uid, int):
+            raise ValueError("high-watermark UID must be an integer")
+        if not 0 <= high_watermark_uid <= metadata.high_watermark_uid:
+            raise ValueError("high-watermark UID is outside the selected mailbox snapshot")
+        if isinstance(lower_bound_uid, bool) or not isinstance(lower_bound_uid, int):
+            raise ValueError("lower-bound UID must be an integer")
+        if not 0 <= lower_bound_uid <= high_watermark_uid:
+            raise ValueError("lower-bound UID is outside the stable run range")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("UID window limit must be a positive integer")
+        if direction not in {"oldest", "newest"}:
+            raise ValueError("UID scan direction must be oldest or newest")
+        if cursor_uid is not None and (
+            isinstance(cursor_uid, bool) or not isinstance(cursor_uid, int) or cursor_uid < 0
+        ):
+            raise ValueError("UID cursor must be a non-negative integer")
+
+        found: list[int] = []
+        if direction == "oldest":
+            start = max(cursor_uid or lower_bound_uid, lower_bound_uid) + 1
+            while start <= high_watermark_uid and len(found) < limit:
+                end = min(start + UID_SEARCH_WINDOW_SIZE - 1, high_watermark_uid)
+                found.extend(self._search_uid_window(start, end))
+                start = end + 1
+            return tuple(found[:limit])
+
+        cursor = high_watermark_uid + 1 if cursor_uid is None else cursor_uid
+        end = min(cursor - 1, high_watermark_uid)
+        while end > lower_bound_uid and len(found) < limit:
+            start = max(lower_bound_uid + 1, end - UID_SEARCH_WINDOW_SIZE + 1)
+            found.extend(reversed(self._search_uid_window(start, end)))
+            end = start - 1
+        return tuple(found[:limit])
+
+    def _search_uid_window(self, start: int, end: int) -> tuple[int, ...]:
+        client = self._reselect_source(operation="imap_uid_window_select")
+        selector = f"UID {start}:{end}"
+        try:
+            response = client.search(["UID", f"{start}:{end}"])
+            uids = tuple(int(uid) for uid in response)
+            if any(uid < start or uid > end for uid in uids):
+                raise ValueError("UID SEARCH returned a UID outside its requested range")
+        except Exception as exc:
+            raise _operation_error(
+                operation="imap_uid_window_search",
+                message="bounded UID SEARCH failed",
+                exc=exc,
+                folder=self._folder,
+                selector=selector,
+            ) from exc
+        return tuple(sorted(set(uids)))
+
+    def fetch_items(self, uids: Sequence[int], *, high_watermark_uid: int) -> tuple[MailboxItem, ...]:
+        if not self._cursor_oriented:
+            raise MailboxError("mailbox was not opened in cursor-oriented mode")
+        metadata = self.metadata()
+        requested = tuple(uids)
+        if len(set(requested)) != len(requested):
+            raise ValueError("UID fetch request must not contain duplicates")
+        if isinstance(high_watermark_uid, bool) or not isinstance(high_watermark_uid, int):
+            raise ValueError("high-watermark UID must be an integer")
+        if not 0 <= high_watermark_uid <= metadata.high_watermark_uid:
+            raise ValueError("high-watermark UID is outside the selected mailbox snapshot")
+        if any(
+            isinstance(uid, bool) or not isinstance(uid, int) or uid < 1 or uid > high_watermark_uid
+            for uid in requested
+        ):
+            raise ValueError("fetch UID is outside the stable run high-watermark")
+        if not requested:
+            return ()
+
+        items: dict[int, MailboxItem] = {}
+        for batch in _iter_chunks(requested, self._fetch_batch_size):
+            client = self._reselect_source(operation="imap_processing_size_select")
+            try:
+                sizes = client.fetch(batch, ["RFC822.SIZE"])
+            except Exception as exc:
+                raise _operation_error(
+                    operation="imap_processing_size_fetch",
+                    message="batched RFC822.SIZE FETCH failed",
+                    exc=exc,
+                    folder=self._folder,
+                    selector="RFC822.SIZE",
+                    uids=batch,
+                ) from exc
+            eligible: list[int] = []
+            message_sizes: dict[int, int] = {}
+            for uid in batch:
+                data = sizes.get(uid)
+                if data is None:
+                    items[uid] = MailboxItem(uid=uid, skip_reason="message disappeared before size fetch")
+                    continue
+                size = _fetch_size_value(data) if isinstance(data, Mapping) else None
+                if size is None:
+                    raise ImapOperationError(
+                        operation="imap_processing_size_fetch",
+                        message="server returned invalid RFC822.SIZE",
+                        folder=self._folder,
+                        selector="RFC822.SIZE",
+                        uids=(uid,),
+                    )
+                if size > self._max_message_bytes:
+                    items[uid] = MailboxItem(
+                        uid=uid,
+                        skip_reason=f"message size {size} exceeds limit {self._max_message_bytes}",
+                    )
+                    continue
+                eligible.append(uid)
+                message_sizes[uid] = size
+
+            for body_batch in _iter_chunks(tuple(eligible), self._fetch_batch_size):
+                client = self._reselect_source(operation="imap_processing_body_select")
+                try:
+                    bodies = client.fetch(body_batch, ["BODY.PEEK[]"])
+                except Exception as exc:
+                    raise _operation_error(
+                        operation="imap_processing_body_fetch",
+                        message="batched BODY.PEEK[] FETCH failed",
+                        exc=exc,
+                        folder=self._folder,
+                        selector="BODY.PEEK[]",
+                        uids=body_batch,
+                    ) from exc
+                for uid in body_batch:
+                    data = bodies.get(uid)
+                    if not isinstance(data, Mapping):
+                        items[uid] = MailboxItem(uid=uid, skip_reason="message disappeared before body fetch")
+                        continue
+                    raw = data.get(b"BODY[]", data.get("BODY[]"))
+                    if not isinstance(raw, bytes):
+                        items[uid] = MailboxItem(uid=uid, skip_reason="server did not return BODY[] bytes")
+                        continue
+                    items[uid] = MailboxItem(
+                        uid=uid,
+                        message=parse_message(
+                            uid,
+                            raw,
+                            max_body_chars=self._max_body_chars,
+                            size_bytes=message_sizes[uid],
+                        ),
+                    )
+        return tuple(items[uid] for uid in requested)
 
     def candidate_uids(self, *, excluded_keywords: Sequence[str] = ()) -> frozenset[int]:
         keywords = tuple(excluded_keywords)
@@ -1547,7 +1732,10 @@ class ScopedMailbox:
             raise UnsafeMailboxOperation("mailbox is read-only")
         client = self._require_client()
         uid = int(uid)
-        if uid not in self.snapshot().uids:
+        snapshot = self.snapshot()
+        if uid not in snapshot.uids and (
+            not self._cursor_oriented or snapshot.uidnext is None or uid >= snapshot.uidnext
+        ):
             raise UnsafeMailboxOperation(f"refusing UID outside initial mailbox snapshot: {uid}")
         capability_name = required_capability.decode("ascii")
         if required_capability not in self.capabilities:
@@ -1792,6 +1980,17 @@ def _uidvalidity(selected: dict[bytes, Any]) -> int:
     return int(value)
 
 
+def _uidnext(selected: Mapping[Any, Any]) -> int:
+    value = selected.get(b"UIDNEXT", selected.get("UIDNEXT"))
+    try:
+        uidnext = int(value)
+    except (TypeError, ValueError) as exc:
+        raise UnsafeMailboxOperation("server did not provide valid UIDNEXT; refusing resumable scan") from exc
+    if isinstance(value, bool) or uidnext < 1:
+        raise UnsafeMailboxOperation("server did not provide valid UIDNEXT; refusing resumable scan")
+    return uidnext
+
+
 def _fetch_header_bytes(data: Mapping[Any, Any]) -> bytes | None:
     for key, value in data.items():
         normalized = key.decode("ascii", errors="replace") if isinstance(key, bytes) else str(key)
@@ -1843,6 +2042,15 @@ def _skipped_summary(uid: int, reason: str) -> MailSummary:
         persisted_state=None,
         skip_reason=reason,
     )
+
+
+class ProcessingMailbox(ScopedMailbox):
+    """Bounded UID-window mailbox that does not build a full UID snapshot."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs["uid_scope"] = ()
+        kwargs["cursor_oriented"] = True
+        super().__init__(**kwargs)
 
 
 class BrowserMailbox:

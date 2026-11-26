@@ -9,6 +9,8 @@ from textual.widgets import Button, Checkbox, Input, Label, ListItem, ListView, 
 
 from ..classification_state import SpamOutcome
 from ..config import ActionKind, MessageAction, Settings
+from ..routing_models import RoutingRule, RuleType
+from ..routing_models import RuleSet as RoutingRuleSet
 from ..rule_candidates import build_rule_candidates
 from ..rules import MATCH_FIELDS, MailRule, RuleMatch, RuleSet, describe_match, generate_rule_id, validate_rule_id
 
@@ -422,3 +424,227 @@ class RuleTestResultScreen(ModalScreen[None]):
 
     def action_close(self) -> None:
         self.dismiss()
+
+
+class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("n", "new_rule", "New"),
+        ("e", "edit_rule", "Edit"),
+        ("space", "toggle_rule", "Enable/disable"),
+        ("[", "move_up", "Move up"),
+        ("]", "move_down", "Move down"),
+        ("d", "remove_rule", "Delete"),
+        ("t", "test_rule", "Test selected"),
+        ("T", "test_all", "Evaluate all"),
+    ]
+    CSS = """
+    RoutingRuleCenterScreen { align: center middle; }
+    #routing-rule-center { width: 96%; height: 92%; border: round $accent; padding: 1 2; background: $surface; }
+    #routing-rule-list { height: 1fr; }
+    #routing-rule-center Horizontal { height: 3; }
+    #routing-rule-center Button { margin-right: 1; }
+    """
+
+    def __init__(self, rules: RoutingRuleSet, folders: tuple[str, ...]) -> None:
+        super().__init__()
+        self.rules = rules
+        self.folders = folders
+
+    def compose(self) -> ComposeResult:
+        enabled = sum(rule.enabled for rule in self.rules.rules)
+        with Vertical(id="routing-rule-center"):
+            yield Static(f"Rules · {len(self.rules.rules)} rules · {enabled} enabled", markup=False)
+            yield ListView(
+                *[
+                    ListItem(Label(self._rule_label(index, rule)))
+                    for index, rule in enumerate(self.rules.rules, start=1)
+                ],
+                id="routing-rule-list",
+            )
+            yield Static(
+                f"Fallback: {self.rules.fallback_destination or '(not configured)'}\n"
+                "Priority is top to bottom. First matching rule wins.",
+                markup=False,
+            )
+            yield Input(self.rules.fallback_destination or "", placeholder="INBOX.Processed", id="routing-fallback")
+            with Horizontal():
+                yield Button("New", id="new")
+                yield Button("Edit", id="edit")
+                yield Button("Enable/disable", id="toggle")
+                yield Button("Move up", id="up")
+                yield Button("Move down", id="down")
+            with Horizontal():
+                yield Button("Test selected", id="test")
+                yield Button("Evaluate all", id="test-all")
+                yield Button("Delete", id="remove")
+                yield Button("Save fallback", id="fallback")
+                yield Button("Close", id="close")
+
+    def on_mount(self) -> None:
+        if self.rules.rules:
+            self.query_one("#routing-rule-list", ListView).index = 0
+        self.query_one("#routing-rule-list", ListView).focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if event.list_view.id == "routing-rule-list":
+            self.dismiss(("edit", self._selected_rule_id()))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        action = event.button.id or "close"
+        if action == "fallback":
+            value = self.query_one("#routing-fallback", Input).value.strip() or None
+            self.dismiss((action, value))
+        else:
+            self.dismiss((action, self._selected_rule_id()))
+
+    def action_new_rule(self) -> None:
+        self.dismiss(("new", None))
+
+    def action_edit_rule(self) -> None:
+        self.dismiss(("edit", self._selected_rule_id()))
+
+    def action_toggle_rule(self) -> None:
+        self.dismiss(("toggle", self._selected_rule_id()))
+
+    def action_move_up(self) -> None:
+        self.dismiss(("up", self._selected_rule_id()))
+
+    def action_move_down(self) -> None:
+        self.dismiss(("down", self._selected_rule_id()))
+
+    def action_remove_rule(self) -> None:
+        self.dismiss(("remove", self._selected_rule_id()))
+
+    def action_test_rule(self) -> None:
+        self.dismiss(("test", self._selected_rule_id()))
+
+    def action_test_all(self) -> None:
+        self.dismiss(("test-all", None))
+
+    def action_close(self) -> None:
+        self.dismiss(("close", None))
+
+    def _selected_rule_id(self) -> str | None:
+        view = self.query_one("#routing-rule-list", ListView)
+        if view.index is None or not 0 <= view.index < len(self.rules.rules):
+            return None
+        return self.rules.rules[view.index].id
+
+    @staticmethod
+    def _rule_label(index: int, rule: RoutingRule) -> str:
+        status = "yes" if rule.enabled else "no"
+        match = (
+            f">= {rule.match_at:g}"
+            if rule.type is RuleType.SEMANTIC and rule.match_at is not None
+            else "policy"
+            if rule.type is RuleType.SPAM
+            else describe_match(rule.match)
+            if rule.match is not None
+            else ""
+        )
+        return f"{index:>2}  {status:<3}  {rule.id:<20} {rule.type.value:<9} {rule.destination:<28} {match}"
+
+
+class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    RoutingRuleEditorScreen { align: center middle; }
+    #routing-rule-editor-box { width: 90%; height: 92%; border: round $accent; padding: 1 2; background: $surface; }
+    #routing-rule-editor { height: 1fr; }
+    #routing-rule-editor-box Horizontal { height: 3; align-horizontal: right; }
+    #routing-rule-editor-box Button { margin-left: 1; }
+    """
+
+    def __init__(self, rule: RoutingRule | None, folders: tuple[str, ...]) -> None:
+        super().__init__()
+        self.rule = rule
+        self.folders = tuple(dict.fromkeys((*folders, *((rule.destination,) if rule else ()))))
+
+    def compose(self) -> ComposeResult:
+        rule = self.rule
+        match = rule.match.as_dict() if rule is not None and rule.match is not None else {}
+        with Vertical(id="routing-rule-editor-box"):
+            with VerticalScroll(id="routing-rule-editor"):
+                yield Static("Edit rule" if rule else "New rule", markup=False)
+                yield Label("ID")
+                yield Input(rule.id if rule else "", placeholder="newsletter", id="routing-rule-id")
+                yield Checkbox("Enabled", value=rule.enabled if rule else True, id="routing-rule-enabled")
+                yield Label("Type")
+                yield Select(
+                    [(item.value.title(), item.value) for item in RuleType],
+                    value=rule.type.value if rule else RuleType.SEMANTIC.value,
+                    allow_blank=False,
+                    id="routing-rule-type",
+                )
+                yield Label("Destination")
+                yield Select(
+                    [(folder, folder) for folder in self.folders],
+                    value=rule.destination if rule else (self.folders[0] if self.folders else Select.NULL),
+                    prompt="Choose an existing folder",
+                    allow_blank=False,
+                    id="routing-rule-destination",
+                )
+                yield Label("Category description, required for semantic rules")
+                yield Input(
+                    rule.description or "" if rule else "",
+                    placeholder="Define the category",
+                    id="routing-rule-description",
+                )
+                yield Label("Match threshold, semantic rules only")
+                yield Input(
+                    str(rule.match_at if rule and rule.match_at is not None else 0.90),
+                    id="routing-rule-threshold",
+                )
+                yield Static("Header matcher fields, combined with AND", markup=False)
+                for field in MATCH_FIELDS:
+                    yield Input(match.get(field, ""), placeholder=field, id=f"routing-match-{field}")
+                yield Static(
+                    "Spam uses the built-in conservative spam evidence policy. All rules route with MOVE.",
+                    markup=False,
+                )
+                yield Static("", id="routing-rule-error", markup=False)
+            with Horizontal():
+                yield Button("Save", id="save")
+                yield Button("Cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        try:
+            self.dismiss(self._read_rule())
+        except (ValueError, TypeError) as exc:
+            self.query_one("#routing-rule-error", Static).update(str(exc))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _read_rule(self) -> RoutingRule:
+        rule_id = validate_rule_id(self.query_one("#routing-rule-id", Input).value.strip())
+        selected_type = self.query_one("#routing-rule-type", Select).value
+        if not isinstance(selected_type, str):
+            raise ValueError("Choose a rule type.")
+        rule_type = RuleType(selected_type)
+        selected_destination = self.query_one("#routing-rule-destination", Select).value
+        if not isinstance(selected_destination, str):
+            raise ValueError("Choose an existing destination folder.")
+        description = self.query_one("#routing-rule-description", Input).value.strip() or None
+        threshold_text = self.query_one("#routing-rule-threshold", Input).value.strip()
+        match_at = float(threshold_text) if rule_type is RuleType.SEMANTIC else None
+        values = {
+            field: widget.value.strip()
+            for field in MATCH_FIELDS
+            if (widget := self.query_one(f"#routing-match-{field}", Input)).value.strip()
+        }
+        match = RuleMatch(**values) if rule_type is RuleType.HEADER else None
+        return RoutingRule(
+            id=rule_id,
+            enabled=self.query_one("#routing-rule-enabled", Checkbox).value,
+            type=rule_type,
+            destination=selected_destination,
+            description=description,
+            match_at=match_at,
+            match=match,
+            source_folders=self.rule.source_folders if self.rule else (),
+        )

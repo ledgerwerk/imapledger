@@ -65,6 +65,7 @@ class FolderAwareFakeClient:
         self.selected_folder = folder
         return {
             b"UIDVALIDITY": self.uidvalidities[folder],
+            b"UIDNEXT": max(self.folders[folder], default=0) + 1,
             b"EXISTS": len(self.folders[folder]),
             b"FLAGS": (),
             b"PERMANENTFLAGS": self.permanent_flags.get(folder),
@@ -90,7 +91,11 @@ class FolderAwareFakeClient:
             return list(folder_uids)
         if isinstance(criteria, (list, tuple)):
             if len(criteria) == 2 and str(criteria[0]).upper() == "UID":
-                requested = int(criteria[1])
+                selector = str(criteria[1])
+                if ":" in selector:
+                    start, end = (int(value) for value in selector.split(":", maxsplit=1))
+                    return sorted(uid for uid in folder_uids if start <= uid <= end)
+                requested = int(selector)
                 return [uid for uid in folder_uids if uid == requested]
             if len(criteria) % 2:
                 raise AssertionError(f"unsupported search criteria: {criteria!r}")

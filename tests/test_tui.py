@@ -24,11 +24,16 @@ from imapledger.mail_service import MessageDetail, MessagePage
 from imapledger.mailbox import FolderInfo, MailboxItem, MessageSort
 from imapledger.message import MailImage, MailSummary, RemoteImageRef, parse_message
 from imapledger.policy import SpamVerdict
+from imapledger.routing_action_service import RoutingActionReceipt
+from imapledger.routing_config import write_routing_rules
+from imapledger.routing_models import EvaluationState, RoutingPlan, RoutingRule, RuleEvaluation, RuleType
+from imapledger.routing_models import RuleSet as RoutingRuleSet
+from imapledger.routing_rule_service import RoutingRuleService
 from imapledger.rule_service import RuleService
 from imapledger.rules import MailRule, RuleMatch, RuleSet
 from imapledger.settings_service import SettingsService
 from imapledger.tui.app import ApplyConfirmation, MailReviewApp
-from imapledger.tui.rule_screens import ClassificationRulesScreen, RuleCenterScreen
+from imapledger.tui.rule_screens import ClassificationRulesScreen, RoutingRuleCenterScreen, RuleCenterScreen
 
 SETTINGS = Settings(
     imap=ImapSettings(host="imap.example.org", username="user@example.org"),
@@ -394,18 +399,22 @@ def test_tui_resolves_credentials_before_textual_run(monkeypatch):
     order = []
 
     class Service:
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             pass
 
         def close(self):
             pass
 
     monkeypatch.setattr(tui_module, "load_settings", lambda path: order.append("settings") or SETTINGS)
-    monkeypatch.setattr(tui_module, "load_rules", lambda *args, **kwargs: order.append("rules") or RuleSet())
+    monkeypatch.setattr(
+        tui_module,
+        "load_routing_rules",
+        lambda *args, **kwargs: order.append("rules") or tui_module.RoutingRuleSet(),
+    )
     monkeypatch.setattr(tui_module, "resolve_credential", resolve_credential)
     monkeypatch.setattr(tui_module, "MailService", Service)
-    monkeypatch.setattr(tui_module, "ActionService", Service)
-    monkeypatch.setattr(tui_module, "AnalysisService", Service)
+    monkeypatch.setattr(tui_module, "RoutingActionService", Service)
+    monkeypatch.setattr(tui_module, "RoutingAnalysisService", Service)
     monkeypatch.setattr(MailReviewApp, "run", lambda self: order.append("run"))
 
     tui_module.run(Path("unused.toml"))
@@ -1008,3 +1017,96 @@ async def _delete_outcome_policy_requires_two_explicit_confirmations(tmp_path: P
 
 def test_delete_outcome_policy_is_global_and_cancelled_without_config_change(tmp_path: Path) -> None:
     asyncio.run(_delete_outcome_policy_requires_two_explicit_confirmations(tmp_path))
+
+
+async def _routing_analysis_is_read_only_and_uses_the_unified_rules_screen(tmp_path: Path) -> None:
+    from textual.widgets import Static
+
+    class FakeRoutingAnalysis:
+        is_routing = True
+
+        def __init__(self):
+            self.calls = []
+
+        def analyze(self, folder, message, **kwargs):
+            self.calls.append((folder, message.uid, kwargs))
+            return RoutingPlan(
+                folder=folder,
+                uid=message.uid,
+                rule_results=(RuleEvaluation("header-match", EvaluationState.MATCH),),
+                winner_rule_id="header-match",
+                destination="Archive",
+                mode="full",
+                rules_fingerprint="current-fingerprint",
+            )
+
+    class FakeRoutingActions:
+        def __init__(self):
+            self.calls = []
+
+        def apply(self, plan, *, uidvalidity, confirmed_by_user):
+            self.calls.append((plan, uidvalidity, confirmed_by_user))
+            return RoutingActionReceipt(plan, uidvalidity, False, False)
+
+    rules = RoutingRuleSet(
+        (
+            RoutingRule(
+                "header-match",
+                True,
+                RuleType.HEADER,
+                "Archive",
+                match=RuleMatch(subject="receipt"),
+            ),
+        ),
+        fallback_destination="Processed",
+    )
+    rules_path = tmp_path / "routing-rules.toml"
+    write_routing_rules(rules, rules_path)
+    analysis = FakeRoutingAnalysis()
+    actions = FakeRoutingActions()
+    app = MailReviewApp(
+        Path("unused.toml"),
+        mail_service=FakeMailService(),
+        settings=SETTINGS,
+        routing_rules=rules,
+        routing_rule_service=RoutingRuleService(rules_path),
+        analysis_service=analysis,
+        action_service=actions,
+    )
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        await pilot.pause()
+        await app._open_message("INBOX", 9)
+        assert analysis.calls == []
+        await pilot.press("c")
+        await pilot.pause()
+        assert len(analysis.calls) == 1
+        assert actions.calls == []
+        rendered = str(app.query_one("#analysis").render())
+        assert "header-match" in rendered
+        assert "Destination: Archive" in rendered
+        assert "Applied: no" in rendered
+
+        await pilot.press("a")
+        await pilot.pause()
+        assert isinstance(app.screen, ApplyConfirmation)
+        confirmation = str(app.screen.query_one(Static).render())
+        assert "UID: 9" in confirmation
+        assert "Source: INBOX" in confirmation
+        assert "Destination: Archive" in confirmation
+        assert "MOVE this exact message?" in confirmation
+        confirmed_plan = app._analysis
+        app._analysis = None
+        app._detail = replace(app._detail, uidvalidity=43)
+        await pilot.click("#apply")
+        await pilot.pause(0.1)
+        assert actions.calls == [(confirmed_plan, 42, True)]
+        await pilot.press("R")
+        await pilot.pause()
+        assert isinstance(app.screen, RoutingRuleCenterScreen)
+        assert "Rules · 1 rules · 1 enabled" in str(app.screen.query_one("#routing-rule-center").children[0].render())
+        assert actions.calls == [(confirmed_plan, 42, True)]
+
+
+def test_routing_analysis_is_read_only_and_uses_the_unified_rules_screen(tmp_path: Path) -> None:
+    asyncio.run(_routing_analysis_is_read_only_and_uses_the_unified_rules_screen(tmp_path))

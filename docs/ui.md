@@ -1,59 +1,65 @@
-# Interactive mail review console
+# Interactive mail and rule workbench
 
-Launch the terminal user interface with:
+Launch the terminal interface with:
 
 ```bash
 imapledger ui
 ```
 
-The console has three panes: folders and smart views, the message list, and message detail. Opening a message uses the existing read-only `BODY.PEEK` path. HTML is not rendered, attachments are not opened, and selecting a message does not mark it seen.
+The console provides folder browsing, a message list, bounded plain-text message detail, and current-message routing analysis. It is primarily a rule-development and single-message test workbench. Reading a message uses the read-only `BODY.PEEK` path. HTML is not rendered and attachments are not opened.
 
 ## Keyboard shortcuts
 
-| Key                    | Action                                                           |
-| ---------------------- | ---------------------------------------------------------------- |
-| Left / `H`             | Focus the previous pane; Left stops at the first pane            |
-| Right / `L`            | Focus the next pane; Right stops at the last pane                |
-| Tab / Shift+Tab        | Cycle focus forward / backward through panes                     |
-| Up / Down or `k` / `j` | Move through folders or messages; scroll message detail          |
-| `g` / `G`              | First / last item, or top / bottom of message detail             |
-| Home / End             | First / last item, or top / bottom of message detail             |
-| PageUp / PageDown      | Page through the focused pane                                    |
-| Enter                  | Open the selected folder or message                              |
-| `c` / `C`              | Classify / reclassify the selected message                       |
-| `i`                    | Explicitly analyze eligible embedded images                      |
-| `I`                    | Review and optionally load remote images after confirmation      |
-| `a`                    | Apply the configured action; a separate confirmation is required |
-| `R`                    | Open global Classification Rules for SPAM, NOT_SPAM, and REVIEW  |
-| `F`                    | Open optional advanced Routing Filters                           |
-| `r`                    | Refresh                                                          |
-| `h` / `?`              | Open keyboard help (`h`, Escape, or `q` closes help)             |
-| `q`                    | Quit                                                             |
+| Key                    | Action                                                      |
+| ---------------------- | ----------------------------------------------------------- |
+| Left / `H`             | Focus the previous pane                                     |
+| Right / `L`            | Focus the next pane                                         |
+| Tab / Shift+Tab        | Cycle focus through panes                                   |
+| Up / Down or `k` / `j` | Move through folders or messages; scroll message detail     |
+| `g` / `G`, Home / End  | Move to the first or last item, or top or bottom of detail  |
+| PageUp / PageDown      | Page through the focused pane                               |
+| Enter                  | Open the selected folder or message                         |
+| `c` / `C`              | Analyze or reanalyze the selected message; no mail is moved |
+| `R`                    | Open the unified Rules workbench                            |
+| `a`                    | Apply the current routing plan after confirmation           |
+| `i`                    | Explicitly analyze eligible embedded images                 |
+| `I`                    | Review and optionally load remote images after confirmation |
+| `r`                    | Refresh                                                     |
+| `h` / `?`              | Open keyboard help                                          |
+| `q`                    | Quit                                                        |
 
-Pane navigation follows the widget that currently has focus, including focus reached with the mouse. The focused pane has a highlighted border. The in-app help screen is available at any time with `h`.
+The focused pane has a highlighted border. Pane navigation follows the widget currently holding focus, including focus reached with the mouse.
 
-## Classification actions and advanced routing filters
+## Analyze and apply the exact plan
 
-Press `a` with a message selected to apply the configured action for its SPAM, NOT_SPAM, or REVIEW category. The analysis panel distinguishes the classification category from the classifier's verdict and shows the configured action. Advanced routing filters are separate from category classification and are not part of the manual apply flow.
+Press `c` with a message selected to evaluate the current full pipeline. The analysis panel shows each rule's state, semantic confidence where available, the first matching rule or fallback, destination, and rules fingerprint. This is read-only. Use `C` to reanalyze rather than relying on cached classification state in the legacy classification workflow.
 
-Applying a category action requires confirmation naming the exact folder and UID. It works for a deliberately selected message in any selectable mailbox folder, regardless of `spam.folders`. MOVE shows its destination. DELETE is permanent and warns about UID EXPUNGE. Saving an action does not change existing mail. SPAM DELETE changes the global action for future SPAM classifications and has its own confirmation. MOVE destinations must already exist.
+Press `a` to apply the current plan. The confirmation names the exact source folder, UID, winning rule or fallback, and destination. Confirmation is bound to the plan and message shown when the dialog opened. Before moving, the application revalidates current rules, UIDVALIDITY, the exact UID, and the configured destination. A stale or invalid plan fails closed. Applying uses configured MOVE destinations only; the TUI does not create folders or issue arbitrary actions.
 
-Press `R` to open Classification Rules. Edit the global action for each category, SPAM, NOT_SPAM, and REVIEW. The screen also lists automatic clean folders and explains that they limit unattended batch processing only. Saving an action updates configuration and the running session without mutating mail.
+## Rules workbench
 
-Press `F` to open optional advanced Routing Filters. These preserve the existing `rules.toml` format and support structured rule creation, editing, enable/disable, priority reordering, details, bounded read-only testing, and confirmed removal. They remain scoped to configured `spam.folders` and are used by batch `clean`, not by manual classification or `mail classify`. Rules use KEEP or MOVE only, and MOVE destinations must already exist.
+Press `R` to create and edit unified schema-2 rules. Priority is top to bottom, and the first enabled match wins. The workbench can:
+
+- create and edit spam, semantic, or deterministic header rules;
+- enable or disable a rule and change its priority;
+- configure the full-pipeline fallback destination;
+- test the selected rule or evaluate all rules on the current message;
+- delete a rule after selection.
+
+Tests are read-only and show rule results, winner, and destination. Saving rule changes updates the local `rules.toml` and refreshes current-message analysis; it does not move existing messages. Rule destinations must be existing mailboxes and cannot be the current source or configuration-ledger folder. Schema-1 files must be explicitly migrated before using the schema-2 workbench. See [Unified routing rules](rules.md).
+
+## Legacy classification actions
+
+Configurations that still use the legacy classification workflow retain category actions for SPAM, NOT_SPAM, and REVIEW. Applying those actions through the TUI is also confirmation-gated. The `spam.folders` list limits bare `clean` compatibility mode, not the explicit-folder routing pipeline. See [Cleaning and diagnostics](cleaning.md) and [Persistent state](state.md).
 
 ## Image inventory and visual analysis
 
 The visual-content section counts embedded images and remote HTML image references as soon as the message is opened. This inventory is local. Opening a message does not contact remote image hosts or send image bytes to `pyjev`.
 
-Press `i` to explicitly assess eligible embedded images. Preparation and model work run in the background. Results include the image's role, importance, whether visible text is insufficient, actionable/financial relevance, interest dependence, and a deterministic local recommendation. Unsupported, malformed, oversized, or otherwise ineligible images are reported as skipped. Analysis reports are cached in memory for the current session using folder, UIDVALIDITY, and UID; they are not written to disk or IMAP.
-
-Visual recommendations are reading aids only. They do not change spam outcomes, persisted classification state, configured actions, or message flags. They do not open links or perform mail actions. The `c` and `C` classification keys remain separate from `i`.
+Press `i` to explicitly assess eligible embedded images. Preparation and model work run in the background. Results are reading aids only; they do not change routing rules, destination, persistent classification state, or mail actions. Analysis reports are cached only in memory for the current session.
 
 ## Remote image privacy
 
 Remote image references are never fetched automatically. Pressing `I` opens a confirmation screen with Cancel focused by default. Loading an image contacts its external host and may reveal that the message was opened and the user's network address. Canceling makes no remote request.
 
-After confirmation, the loader accepts only credential-free HTTPS URLs on the standard HTTPS port. It resolves each hostname, rejects non-public addresses, pins the connection to a validated address, and revalidates every redirect target. Requests have bounded connect/read timeouts, a small redirect limit, an image-count limit, and an 8 MB response limit per image. Only PNG/JPEG responses are accepted. The loader sends no cookies, Authorization header, or Referer, does not use a proxy, execute, or render downloaded content, and reports failures per image. Accepted bytes are passed through local image preparation before visual analysis. URLs and downloaded bytes are not persisted; the visual report alone may be retained in the in-memory session cache.
-
-The `a` key remains the only TUI path to apply a configured mail action, and its confirmation is independent of visual analysis.
+After confirmation, the loader accepts only credential-free HTTPS URLs on the standard HTTPS port. It resolves each hostname, rejects non-public addresses, pins the connection to a validated address, and revalidates every redirect target. Requests have bounded timeouts, redirect count, image count, and response size. Only PNG/JPEG responses are accepted. The loader sends no cookies, Authorization header, or Referer, does not use a proxy, execute, or render downloaded content. URLs and downloaded bytes are not persisted.

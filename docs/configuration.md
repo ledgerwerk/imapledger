@@ -1,6 +1,6 @@
 # Configuration
 
-The default configuration path is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset. The separate rules file is named `rules.toml` beside the selected config file. The IMAP password is never written to configuration. If `[imap.auth]` is omitted, credential resolution uses hidden prompt authentication, preserving existing behavior. Credential-consuming commands resolve once per invocation and reuse the credential across source folders.
+The default configuration path is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset. The separate schema-2 rules file is named `rules.toml` beside the selected config file. The IMAP password is never written to configuration. If `[imap.auth]` is omitted, credential resolution uses hidden prompt authentication, preserving existing behavior. Credential-consuming commands resolve once per invocation; legacy bare `clean` reuses the credential across its configured sources, while positional `clean FOLDER` processes one source.
 
 ## IMAP credential sources
 
@@ -118,7 +118,7 @@ also asks for its master passphrase.
 
 A missing or unavailable credential in an explicitly selected keyring or vault is an
 error. imapledger does not silently fall back to a password prompt. `clean`, `doctor`,
-`rule learn`, `rule test`, and config-mode `folders` resolve credentials once per
+legacy `rule learn`, `rule test`, and config-mode `folders` resolve credentials once per
 invocation. Direct `folders --host ... --username ...` mode has no configured storage
 source and continues to use hidden prompt authentication.
 
@@ -136,9 +136,9 @@ max_file_bytes = 1048576
 
 The folder must already exist. Snapshot messages are readable email, not encrypted secret storage.
 
-## Batch clean scope and category action example
+## Legacy bare-clean compatibility configuration
 
-This configuration scans two source folders and routes spam and not-spam outcomes to existing destination folders:
+This configuration supports the deprecated bare `clean` compatibility workflow and legacy category classification. It scans the listed `spam.folders` and routes SPAM, NOT_SPAM, and REVIEW outcomes to configured actions. Positional `clean FOLDER` instead uses the separate schema-2 `rules.toml` pipeline.
 
 ```toml
 [imap]
@@ -183,7 +183,7 @@ trusted_authserv_ids = []
 trusted_spam_headers = []
 ```
 
-`folders` lists source mailboxes, not destinations. Sources are processed in listed order, one source-scoped IMAP session at a time. `--limit`, `--offset`, and `--sort` select messages independently in each source. UID values from different folders are not compared.
+`spam.folders`, when configured, lists compatibility and legacy classification source mailboxes, not destinations. It may be omitted when only positional routing is used. Bare `clean` processes them in listed order, one source-scoped IMAP session at a time. Its `--limit`, `--offset`, and `--sort` options apply independently in each source. Positional `clean FOLDER` scans only its named source, uses bounded UID windows, defaults to oldest-first, and does not accept `--offset`. UIDs from different folders are never compared.
 
 Source mailbox names are exact and server-specific. Every configured source must exist and be selectable on the account. The example names above are not universal; imapledger does not normalize names or create source folders. `doctor` distinguishes a missing source from an existing source that cannot be selected.
 
@@ -198,30 +198,15 @@ backend = "imap-keywords"
 
 Supported values are `none` and `imap-keywords`. `imapledger init` selects `imap-keywords` for new configurations. Existing configurations that omit `[spam.state]` use `none` for backward compatibility. `imapledger config show` displays the effective setting. The application owns the marker names; they are not configurable.
 
-The selected mailbox must advertise persistent custom keywords through `PERMANENTFLAGS` (`\\*` or the exact keyword). `doctor` reports persistence support, and `clean --apply` checks it before classification whenever a configured outcome may be kept. See [Persistent classification state](state.md) for marker semantics, command usage, privacy, and failure behavior.
+The selected compatibility source must advertise persistent custom keywords through `PERMANENTFLAGS` (`\\*` or the exact keyword). `doctor` reports persistence support, and bare `clean --apply` checks it before classification whenever a configured outcome may be kept. Positional `clean FOLDER` does not use IMAP classification keywords. See [Persistent state](state.md) for marker semantics and the separate local progress database.
 
-## Optional advanced routing filters
+## Unified routing rules
 
-Optional advanced routing filters remain stored separately in the compatible `rules.toml` file beside the selected config file. The default path follows the same XDG configuration directory as `config.toml`. These filters are used by batch `clean` and explicit `explain`; they do not replace global category actions in manual classification. A filter source must be one of the configured `spam.folders`; filters cannot add folders to the scan. Move destinations must exist and cannot be configured source folders.
+The positional `clean FOLDER` pipeline reads schema-2 rules from the sibling `rules.toml`. The first enabled spam, semantic, or deterministic header rule that matches wins. Full mode routes unmatched messages to `rules.fallback_destination`; a fallback is required. `--rule ID` scans only one enabled rule and leaves non-matches in the source. `spam.folders` is optional and does not limit this explicit-folder path. Destinations are configured explicitly and must exist; preview is the default and `--apply` is required to move mail.
 
-The versioned format is:
+The schema-2 format supports `rules.default_match_at`, per-rule semantic descriptions and `match_at` thresholds, optional `source_folders`, and deterministic header matchers. Schema-1 header rules require explicit migration with `imapledger rule migrate --preview` followed by `--apply`; only MOVE rules migrate, and no fallback is inferred. See [Unified routing rules](rules.md) for the full schema and priority semantics.
 
-```toml
-[rules]
-schema = 1
-
-[[rules.rule]]
-id = "mailer-daemon-gmx-net"
-enabled = true
-source_folders = ["INBOX.Junk"]
-action = "move"
-destination = "INBOX.Trash"
-match = { from_address = "mailer-daemon@gmx.net" }
-```
-
-Rules support only `keep` and `move`. Matcher fields are combined with AND, and the first enabled match in file order wins. Supported fields are `from_address`, `from_domain`, `return_path`, `return_path_domain`, `list_id`, `auto_submitted`, `subject`, and `subject_prefix`. The file is strictly validated and written atomically with restrictive permissions. See [Learned routing rules](rules.md) for matching details and the command workflow.
-
-## Global classification actions
+## Legacy global classification actions
 
 The existing policy verdicts are kept for compatibility. They map to three global classification categories and their configured actions:
 
@@ -231,7 +216,7 @@ The existing policy verdicts are kept for compatibility. They map to three globa
 | `SpamVerdict.KEEP`   | not-spam                | `[spam.actions.not_spam]` |
 | `SpamVerdict.REVIEW` | review                  | `[spam.actions.review]`   |
 
-These actions are global category mappings, not per-folder rules. `imapledger mail classify --apply` and the TUI `a` action can apply the selected category's configured action to one message in any selectable mailbox folder. They retain exact-folder and UID confirmation and safety checks. The `spam.folders` list limits unattended batch `clean` only. Optional advanced routing filters stay in the compatible `rules.toml` file and remain separate from manual classification.
+These actions are global category mappings for legacy classification, not schema-2 routing rules. `imapledger mail classify --apply` and the legacy TUI classification path can apply the selected category's configured action to one message in any selectable mailbox folder. They retain exact-folder and UID confirmation and safety checks. The `spam.folders` list limits deprecated bare `clean` only. Positional `clean FOLDER` uses schema-2 rules and the full-pipeline fallback.
 The NOT_SPAM action maps to `SpamVerdict.KEEP`; `REVIEW` is separate and follows `[spam.actions.review]`.
 An action table accepts `keep`, `move`, or `delete`:
 
@@ -240,9 +225,9 @@ An action table accepts `keep`, `move`, or `delete`:
 - `delete` permanently removes the message through the exact-UID deletion path. It is valid only for the spam outcome.
 
 Not-spam and review outcomes cannot be configured for deletion. Review defaults to `keep`. Skipped messages and classification or policy errors always remain in the source folder, regardless of configured actions. A destination cannot equal any configured source folder. Folder names are preserved exactly, including spelling and case. Two outcomes may share a destination if configured explicitly.
-With the new plural `folders` schema, action outcomes omitted from the configuration default to `keep`. Permanent deletion therefore requires an explicit `[spam.actions.spam]` entry. Legacy scalar `spam.folder` configurations retain the old spam-delete default when action tables are absent.
+With the plural `folders` schema, legacy category action outcomes omitted from the configuration default to `keep`. Permanent deletion in bare-clean compatibility therefore requires an explicit `[spam.actions.spam]` entry. Legacy scalar `spam.folder` configurations retain the old spam-delete default when action tables are absent.
 
-`imapledger` does not create destinations. Move actions require server support for the IMAP MOVE capability. They never fall back to COPY and EXPUNGE. Delete actions require UIDPLUS. A configuration using both move and delete actions requires both capabilities when applying actions.
+`imapledger` does not create destinations. Configured moves require server support for the IMAP MOVE capability and never fall back to COPY and EXPUNGE. Legacy delete actions require UIDPLUS and exact-UID EXPUNGE.
 
 Changing actions does not change spam-policy thresholds. The policy remains fail-closed, and a less destructive action does not make classification more aggressive.
 

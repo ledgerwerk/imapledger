@@ -34,6 +34,10 @@ The folder must already exist and be selectable. `push` never creates it. `max_f
 
 Storing `imapledger`'s own local configuration is supported, but a completely empty machine cannot discover its IMAP account from the remote ledger. The local bootstrap settings and a working credential source must be available first. Credential vault files are not uploaded automatically and should not be pushed manually.
 
+## When the optional store is disabled
+
+`[config_store]` is optional. Without it, `imapledger config list` does not attempt an IMAP connection and exits successfully with `Config store: disabled` plus guidance to add the table. Remote operations such as `push`, `versions`, `diff`, `pull`, and `cat` still fail with a non-zero exit and an actionable configuration error. `imapledger config show` remains a local-only command and does not require the store.
+
 ## Snapshot contents and history
 
 A snapshot is a MIME email with machine-readable `X-Imapledger-*` metadata, a readable text representation, and an authoritative attachment containing the exact UTF-8 file bytes. The attachment is verified against the declared size and SHA-256 before content is returned. Snapshot identity and current state come from stable version IDs and parent links, not from mutable IMAP flags, message dates, or UID ordering.

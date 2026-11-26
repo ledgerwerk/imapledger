@@ -1,19 +1,19 @@
 # imapledger
 
-imapledger is a security-scoped IMAP mail tool and configuration ledger. Unattended `clean` scans only the configured `spam.folders`; classification outcomes map to global SPAM, NOT_SPAM, and REVIEW actions. A user can manually apply a category action to one selected message in any selectable folder. The semantic model never receives an IMAP client and cannot select destinations or issue IMAP commands.
+imapledger is a security-scoped IMAP routing and configuration tool. `clean FOLDER` evaluates an ordered schema-2 rule pipeline and can resume bounded IMAP scans from durable local progress. The TUI provides rule development and exact-plan single-message testing. The semantic model never receives an IMAP client and cannot select destinations or issue IMAP commands.
 
 ## Security model
 
 - Each `ScopedMailbox` session is bound to one source folder.
 - Source folders are processed in configured order, one connection at a time.
 - IMAP uses TLS and UID mode. The default credential source is hidden prompt authentication; optional OS keyring and encrypted-vault sources keep passwords out of configuration.
-- Dry-run is the default. It selects each source read-only and performs no mutations.
-- `--apply` uses only configured actions. Every MOVE destination is allow-listed, must exist, and requires server MOVE support. imapledger does not create folders or fall back to COPY and EXPUNGE.
-- Before `--apply`, all configured sources are checked read-only for authentication, required capabilities, exact source existence, SELECT, and move destinations. A failed preflight aborts before classifier construction or mutation. It is best-effort, not transactional, and server state can change before mutation-time checks.
-- Moves and deletes use only UIDs from the initial source snapshot. Before mutation, imapledger rechecks UIDVALIDITY and confirms that the selected UIDs still exist.
-- Permanent deletion is available only as an explicit spam action. It requires UIDPLUS and uses exact-UID EXPUNGE.
-- Classification, evidence, and policy errors fail closed. Skipped and errored messages remain in their source folders.
-- Separate source-folder operations are not one cross-folder transaction. If a later source fails, earlier confirmed changes are reported and are not rolled back.
+- IMAP uses TLS and UID mode. The default credential source is hidden prompt authentication; optional OS keyring and encrypted-vault sources keep passwords out of configuration.
+- Positional `clean FOLDER` is preview-only by default. It scans one exact source folder in bounded UID windows, records local progress only when applying, and does not use `spam.folders` as its scope.
+- `clean FOLDER --apply` uses only destinations configured in schema-2 rules. Destinations must exist, cannot be the source or reserved config-store folder, and require server MOVE support. imapledger does not create folders or fall back to COPY and EXPUNGE.
+- Before `--apply`, the source and routing destinations are checked read-only. Every MOVE is bound to the exact source, UIDVALIDITY, UID, active rules, and configured destination. Preflight is best-effort, not transactional.
+- Bare `clean` remains a deprecated compatibility workflow over `spam.folders`. It retains the older SPAM, NOT_SPAM, and REVIEW actions and classification-state keywords; it is separate from resumable routing.
+- The semantic model evaluates message evidence only. Ordered rules, thresholds, and configured fallback own every destination and side effect.
+- Processing errors fail closed. Confirmed earlier moves are not rolled back; ambiguous MOVE results stop the run for reconciliation.
 
 A process with arbitrary code execution and the IMAP password could still create an unrestricted connection. Use a dedicated IMAP account and server-side ACLs where stronger isolation is needed.
 
@@ -39,7 +39,7 @@ imapledger folders \
   --username me@example.org
 ```
 
-Use exact IMAP names for `spam.folders` and action destinations. `spam.folders` defines only the unattended batch-clean scope; it does not limit manual classification actions. The command uses IMAP `LIST` and aggregate `STATUS (MESSAGES UNSEEN)` counts. It does not select mailboxes or fetch message contents. `--no-counts` skips STATUS entirely. STATUS avoids a client-side scan through messages, although the server may do internal work to calculate mailbox counts.
+Use exact IMAP names for source folders and destinations. `spam.folders` is optional for the explicit-folder pipeline and, when configured, remains the scope for deprecated bare `clean` compatibility. Legacy manual classification commands can target any selectable folder, and positional `clean FOLDER` can process any valid selectable source folder. The command uses IMAP `LIST` and aggregate `STATUS (MESSAGES UNSEEN)` counts. It does not select mailboxes or fetch message contents. `--no-counts` skips STATUS entirely. STATUS avoids a client-side scan through messages, although the server may do internal work to calculate mailbox counts.
 
 Create a configuration file with repeated source folders and explicit actions:
 
@@ -125,18 +125,20 @@ destination = "INBOX.NotSpam"
 action = "keep"
 ```
 
-The source folders are scanned in listed order by `clean`. A `SpamVerdict.DELETE` maps to SPAM, `SpamVerdict.KEEP` maps to NOT_SPAM, and `SpamVerdict.REVIEW` maps to REVIEW. The `[spam.actions.*]` settings define global category actions. Manual actions apply to an explicitly selected message in any selectable folder; unattended `clean` remains limited to `spam.folders`. REVIEW defaults to keep. Skip and error results always keep. Delete is supported only for SPAM. Move destinations must already exist and cannot be any configured source folder.
+These `[spam.actions.*]` settings apply to legacy category classification and deprecated bare `clean` compatibility. In that workflow, `SpamVerdict.DELETE`, `KEEP`, and `REVIEW` map to SPAM, NOT_SPAM, and REVIEW; REVIEW defaults to keep, and delete is supported only for SPAM. The new positional `clean FOLDER` workflow uses the ordered schema-2 routing rules and fallback instead. See [the unified rules guide](docs/rules.md).
 
 Mailbox names are exact and server-specific. Every configured source must exist and be selectable on the account. The `INBOX.Junk` and `INBOX.Spam` names above are examples, not universal names. `doctor` distinguishes missing sources from existing sources that cannot be selected.
-For the new plural `folders` schema, omitted action tables default to `keep`. Permanent deletion therefore requires an explicit `[spam.actions.spam]` entry. Legacy scalar `spam.folder` configurations retain the old spam-delete default when action tables are absent.
+For the plural `folders` schema, omitted category action tables default to `keep`. Permanent deletion in the legacy classification workflow therefore requires an explicit `[spam.actions.spam]` entry. Legacy scalar `spam.folder` configurations retain the old spam-delete default when action tables are absent.
 
 Legacy configurations with `spam.folder` remain supported with a deprecation warning. If they have no action tables, the old behavior is preserved: spam is deleted when `--apply` is used, and not-spam and review are kept. New configurations use `folders` and explicit action tables.
 
 Legacy `spam.threshold` values are deprecated, warned about, and ignored. The documented policy defaults apply when `[spam.policy]` is absent. There is deliberately no password setting. Configure `pyjev` authentication separately as documented by `pyjev`.
 
+The resumable routing pipeline is configured separately in the sibling `rules.toml`, using schema 2. It supports spam-policy, semantic, and deterministic header rules, plus a full-pipeline fallback destination. `spam.folders` is optional and does not constrain positional `clean FOLDER`. See [rules](docs/rules.md), [cleaning](docs/cleaning.md), and [progress state](docs/state.md).
+
 ## Configuration ledger
 
-Store small UTF-8 configuration files for arbitrary tools as append-only, readable email snapshots in a dedicated IMAP folder. Configure `[config_store]` locally, then use `config push`, `list`, `versions`, `diff`, `pull`, or `cat`. The store folder must already exist. Snapshots are not encrypted, and the secret scan is best-effort. See the [configuration ledger guide](docs/config-store.md) for setup, history, overwrite behavior, and security limits.
+Store small UTF-8 configuration files for arbitrary tools as append-only, readable email snapshots in a dedicated IMAP folder. Configure `[config_store]` locally, then use `config push`, `list`, `versions`, `diff`, `pull`, or `cat`. The store folder must already exist. Without `[config_store]`, `config list` exits successfully with a disabled-store message; commands that access the remote store report an actionable configuration error. Snapshots are not encrypted, and the secret scan is best-effort. See the [configuration ledger guide](docs/config-store.md) for setup, history, overwrite behavior, and security limits.
 
 ```bash
 imapledger config push ruff ~/.config/ruff/ruff.toml
@@ -150,27 +152,23 @@ imapledger config pull ruff
 
 ```bash
 imapledger folders --no-counts
-imapledger clean
-imapledger clean --limit 10
-imapledger clean --limit 10 --offset 10 --sort newest
-imapledger clean --no-progress
-imapledger clean --apply
+imapledger clean INBOX.Junk --limit 10
+imapledger clean INBOX.Junk --limit 10 --apply
+imapledger clean INBOX.Junk --rule newsletters --apply
+imapledger progress list
 imapledger doctor
 imapledger config show
 ```
 
-Each `clean` and `doctor` invocation resolves one IMAP credential and reuses it across configured source folders. The default prompt source asks once; keyring and vault sources use their configured secure backend.
-Apply mode first checks every configured source and move destination read-only; if any preflight check fails, it stops before classifier construction or mutations. This is not a transaction and does not prevent server-side changes or runtime partial failures after preflight.
+`clean FOLDER` uses the resumable schema-2 pipeline. Preview is the default and does not advance the durable cursor. Apply evaluates enabled rules in priority order and moves the exact UID to the winning rule's destination or, in full mode, the configured fallback. `--rule ID` scans only one enabled rule. Full mode requires a fallback. Positional cleaning defaults to oldest-first; `--sort newest` reverses UID order. `--limit` bounds work in this invocation, and bounded UID windows avoid a full-mailbox UID snapshot.
 
-`--limit` and `--offset` apply independently to each source folder. With two folders, `--limit 10 --offset 10` selects positions 11 through 20 in each folder. `--sort newest` and `--sort oldest` order each folder by descending or ascending IMAP UID, which represents mailbox arrival order, not the message `Date:` header. UIDs are folder-local and are never globally ordered or merged.
+Use `imapledger progress show FOLDER` to inspect a run, `progress errors FOLDER` to list retryable error codes, and `clean FOLDER --retry-errors --apply` to retry matching errors. `--new-run` explicitly supersedes active progress. See [the cleaning guide](docs/cleaning.md) for run identity, high-watermarks, UIDVALIDITY, and failure behavior.
 
-Moves require the IMAP MOVE capability and an existing destination. Deletes require UIDPLUS. `doctor` checks every configured source, the configured action capabilities, and all move destinations without mutating mail. Mutation batches stop on failure. Earlier confirmed actions remain applied, later action groups and source folders are not attempted, and the command exits non-zero. Inspect pending UIDs before retrying because their result was not confirmed.
-
-See [the configuration guide](docs/configuration.md), [the cleaning guide](docs/cleaning.md), and [the learned routing rules guide](docs/rules.md) for the complete schema, safety checks, reporting, and failure behavior.
+Bare `imapledger clean` remains available temporarily with a deprecation warning. It uses the older category-action workflow and `spam.folders`; `--offset` is supported only there. Apply in either workflow is best-effort, not a transaction. Confirmed earlier changes are retained if a later message fails.
 
 ## Persistent classification state
 
-New configurations created by `imapledger init` use server-side IMAP keywords to remember spam, not-spam, or review outcomes after an applied `keep` action. Existing configurations without `[spam.state]` remain on the `none` backend. The markers are coarse recipient-mailbox state, not message headers or model history. See the [persistent state guide](docs/state.md) for server requirements, privacy details, and safe inspection and reset commands.
+Server-side IMAP keywords are legacy classification state for spam, not-spam, or review outcomes after an applied `keep` action. They are used by the deprecated bare-clean compatibility workflow, not by resumable positional routing. New routing progress is stored separately in a local SQLite database and tracks runs, UID cursors, and safe results. See the [state guide](docs/state.md) for both mechanisms and their distinct reset behavior.
 
 ```bash
 imapledger state status
@@ -181,7 +179,7 @@ imapledger state reset --folder INBOX.Junk --uid 43652 --apply
 
 ## Mail review console
 
-Launch the interactive console explicitly with `imapledger ui`. It provides folder browsing, a merged Review view, bounded plain-text message reading, on-demand spam analysis, a separate visual-content section, and confirmation-gated configured actions. Browsing uses read-only mailbox access and `BODY.PEEK`; opening a message does not mark it seen, fetch remote images, or send images to a model. Press `i` to analyze embedded images explicitly. `I` offers remote image loading behind a cancel-default privacy warning and strict HTTPS, DNS/IP, redirect, timeout, and response-size checks. Visual assessments are informational and do not affect spam outcomes or mail actions. HTML is not rendered, attachments are not opened, and results are kept only in the current session. See the [interactive console guide](docs/ui.md) for navigation, shortcuts, and privacy behavior.
+Launch `imapledger ui` for folder browsing, bounded plain-text message reading, routing analysis, and the unified Rules workbench. Press `c` to inspect the current plan, `R` to edit or test rules, and `a` to apply the displayed plan after exact-message confirmation. Browsing uses read-only mailbox access and `BODY.PEEK`; opening a message does not mark it seen, fetch remote images, or send images to a model. Press `i` to analyze embedded images explicitly. `I` offers remote image loading behind a cancel-default privacy warning and strict HTTPS, DNS/IP, redirect, timeout, and response-size checks. Visual assessments are informational and do not affect routing or mail actions. HTML is not rendered, attachments are not opened, and results are kept only in the current session. See the [interactive console guide](docs/ui.md) for navigation and privacy behavior.
 
 The same services are available through composable commands:
 
@@ -192,24 +190,20 @@ imapledger mail classify 43724 --folder INBOX.Junk
 imapledger mail classify 43724 --folder INBOX.Junk --apply
 ```
 
-`mail list` fetches bounded headers only. `mail show` reads bounded text without changing flags. `mail classify` is preview-only unless `--apply` is explicitly supplied; applying uses the category's global action and existing exact-folder, UID, and mailbox safety checks. Classification can target a message from any selectable folder. This manual operation does not expand the `clean` scan scope. Bare `imapledger` continues to print help, including in non-interactive use.
+`mail list` fetches bounded headers only. `mail show` reads bounded text without changing flags. `mail classify` is preview-only unless `--apply` is explicitly supplied; applying uses the category's global action and existing exact-folder, UID, and mailbox safety checks. Classification can target a message from any selectable folder. This manual category-action command is separate from the schema-2 routing rules and their progress. Bare `imapledger` continues to print help, including in non-interactive use.
 
-## Optional advanced routing filters
+## Unified routing rules
 
-Use an optional advanced routing filter for a personal mailbox preference that should remain separate from global SPAM, NOT_SPAM, and REVIEW actions. Filters affect batch `clean`; they do not replace manual classification actions. For example, learn a narrow filter from one explicitly scoped message UID:
+The schema-2 `rules.toml` file defines ordered spam-policy, semantic, and deterministic header rules for `clean FOLDER`. The first enabled match wins; if none matches in full mode, the configured fallback is used. A rule's destination is explicit configuration, never model output. Preview is read-only, `--apply` is required to move mail, and a single-rule scan is available with `--rule ID`.
 
 ```bash
-imapledger rule learn 43627 --folder INBOX.Junk --move INBOX.Trash --preview
-imapledger rule learn 43627 --folder INBOX.Junk --move INBOX.Trash
-imapledger rule list
-imapledger rule test mailer-daemon-gmx-net --limit 20
+imapledger clean INBOX --limit 10
+imapledger clean INBOX --rule newsletter --limit 10
+imapledger rule migrate --preview
+imapledger rule migrate --apply
 ```
 
-Learning requires a configured source folder and an explicit move destination. Jev selects only from deterministic matcher candidates generated locally by imapledger; it cannot invent a matcher or destination. The message body is excluded from Jev's learning state by default. A proposal must pass local safety thresholds before it can be saved. `--preview` does not save, and the default save prompt is no. `--yes` confirms saving only. Moving the example message requires the separate `--apply-current` option.
-
-Optional advanced routing filters in the existing `rules.toml` format are used by batch `clean` and explicit `explain`, not by manual category actions. A matching filter bypasses classification for that message, while non-matches continue through the global category actions. Filters are limited to configured source folders and cannot broaden the scan. They are separate from manual classification actions. `clean` remains read-only unless `--apply` is supplied. See [docs/rules.md](docs/rules.md) for the schema, precedence, and safety details.
-
-## Evidence and policy
+Schema-1 header rules require explicit migration. The migration retains safe MOVE rules as schema-2 header rules, but does not infer a fallback. The older `rule learn/list/show/remove/test` helpers are schema-1-only; after migration use the `R` TUI workbench or edit `rules.toml` directly. See [docs/rules.md](docs/rules.md) for schema, priority, thresholds, migration, and safety.
 
 `imapledger/decisions.toml` defines one `spam-evidence` bundle with independent unsolicited-bulk, phishing/scam, identity-deception, legitimate/expected, and delete-safe questions. The classifier sends one structured state per message and validates every child probability. Operational UID data and raw authentication payloads are not sent as semantic evidence.
 
@@ -227,7 +221,7 @@ Start with the read-only protocol probe:
 imapledger doctor --verbose
 ```
 
-For a failing clean run, use `imapledger clean --verbose` to see safe IMAP operation progress. Use `--no-progress` to disable per-message rows and `--debug` for local traceback frames and exception class names. Neither option enables raw IMAP wire logging.
+For a failing positional run, use `imapledger clean FOLDER --verbose` to see safe IMAP operation progress, `progress show FOLDER` to inspect saved counters, and `progress errors FOLDER` to view retryable error codes. Use `--no-progress` to disable per-message rows and `--debug` for local traceback frames and exception class names. Neither option enables raw IMAP wire logging.
 
 Errors include safe context such as the configured folder, selector, UID range, batch, and recognized server status token. They do not print passwords, authentication payloads, exception messages, raw server responses, or message bytes. Verbose output and reports can still reveal folder names, account identifiers, UIDs, senders, and subjects, so redact those details before sharing.
 

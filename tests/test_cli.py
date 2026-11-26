@@ -332,6 +332,7 @@ def test_clean_streams_decisions_once_with_summary(monkeypatch):
 
     rendered = output.getvalue()
     assert result.exit_code == 0
+    assert "clean` is deprecated" in rendered
     assert "folder=Spam messages=4 selected=4 sort=newest offset=0 limit=all" in rendered
     assert "[1/4] SPAM | WOULD DELETE |" in rendered
     assert "Signals=" not in rendered

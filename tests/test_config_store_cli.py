@@ -190,7 +190,7 @@ def test_config_diff_returns_one_for_differences_and_zero_when_identical(monkeyp
     assert identical.output == ""
 
 
-def test_config_store_folder_must_be_configured_and_must_exist(monkeypatch, tmp_path):
+def test_config_list_is_graceful_without_store_and_remote_commands_require_it(monkeypatch, tmp_path):
     missing_config = tmp_path / "missing-store.toml"
     _write_config(missing_config, with_store=False)
     fake = ConfigStoreFakeClient({"INBOX": {}})
@@ -200,8 +200,16 @@ def test_config_store_folder_must_be_configured_and_must_exist(monkeypatch, tmp_
         cli.app,
         ["config", "list", "--config", str(missing_config)],
     )
-    assert unconfigured.exit_code == 2
-    assert "config_store" in unconfigured.output
+    assert unconfigured.exit_code == 0
+    assert "Config store: disabled" in unconfigured.output
+    assert "Add a [config_store] table" in unconfigured.output
+
+    remote = CliRunner().invoke(
+        cli.app,
+        ["config", "versions", "xyz", "--config", str(missing_config)],
+    )
+    assert remote.exit_code == 2
+    assert "add a [config_store] table" in remote.output
     assert resolved == []
 
     config = tmp_path / "configured.toml"

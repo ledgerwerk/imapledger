@@ -140,11 +140,9 @@ class SpamSettings:
 
     def __post_init__(self) -> None:
         if not isinstance(self.folders, (tuple, list)):
-            raise ConfigError("spam.folders must be a non-empty array of folder names")
+            raise ConfigError("spam.folders must be an array of folder names")
         folders = tuple(self.folders)
         object.__setattr__(self, "folders", folders)
-        if not folders:
-            raise ConfigError("spam.folders must not be empty")
         if any(not isinstance(folder, str) for folder in folders):
             raise ConfigError("spam.folders entries must be strings")
         if any(not folder.strip() for folder in folders):
@@ -283,7 +281,7 @@ def _parse_imap_settings(payload: dict[str, object]) -> ImapSettings:
 
 def _parse_config_store_settings(value: object) -> ConfigStoreSettings:
     if not isinstance(value, dict):
-        raise ConfigError("config requires a [config_store] table")
+        raise ConfigError("config_store is not configured; add a [config_store] table to enable remote config commands")
     unknown = set(value) - {"folder", "max_file_bytes"}
     if unknown:
         raise ConfigError(f"unknown key in config_store: {sorted(unknown)[0]}")
@@ -300,6 +298,14 @@ def load_config_store_context(path: Path | None = None) -> ConfigStoreContext:
     imap = _parse_imap_settings(payload)
     store = _parse_config_store_settings(payload.get("config_store"))
     return ConfigStoreContext(imap=imap, store=store)
+
+
+def load_optional_config_store_settings(path: Path | None = None) -> ConfigStoreSettings | None:
+    """Load the optional store settings without requiring spam configuration or IMAP access."""
+    _, payload = _load_config_payload(path)
+    if "config_store" not in payload:
+        return None
+    return _parse_config_store_settings(payload["config_store"])
 
 
 def load_imap_settings(path: Path | None = None) -> ImapSettings:
@@ -329,6 +335,9 @@ def load_settings(path: Path | None = None) -> Settings:
         raise ConfigError("spam.folder and spam.folders cannot both be configured")
     if "folders" in spam:
         folders = _folder_tuple(spam["folders"])
+
+        if not folders:
+            raise ConfigError("spam.folders must not be empty")
     elif "folder" in spam:
         folder = spam["folder"]
         if not isinstance(folder, str):
@@ -340,7 +349,7 @@ def load_settings(path: Path | None = None) -> Settings:
         )
         folders = (folder,)
     else:
-        raise ConfigError("config requires spam.folders")
+        folders = ()
 
     policy_payload = spam.get("policy", {})
     authentication = spam.get("authentication", {})
@@ -459,13 +468,15 @@ def render_settings(settings: Settings) -> str:
         f"vault_min_passphrase_length = {settings.imap.auth.vault_min_passphrase_length}",
         "",
         "[spam]",
-        f"folders = {_toml_string_array(settings.spam.folders)}",
         f"max_message_bytes = {settings.spam.max_message_bytes}",
         f"max_body_chars = {settings.spam.max_body_chars}",
         "",
         "[spam.state]",
         f'backend = "{settings.spam.state.backend.value}"',
     ]
+    if settings.spam.folders:
+        lines.insert(lines.index("[spam]") + 1, f"folders = {_toml_string_array(settings.spam.folders)}")
+
     if settings.imap.auth.vault_path is not None:
         source_line = f'source = "{settings.imap.auth.source.value}"'
         vault_path = _toml_string(str(settings.imap.auth.vault_path))

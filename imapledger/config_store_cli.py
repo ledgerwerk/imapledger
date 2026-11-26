@@ -10,7 +10,13 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .config import ConfigError, ConfigStoreContext, default_config_path, load_config_store_context
+from .config import (
+    ConfigError,
+    ConfigStoreContext,
+    default_config_path,
+    load_config_store_context,
+    load_optional_config_store_settings,
+)
 from .config_diff import DiffDirection
 from .config_errors import ConfigLedgerError
 from .config_ledger import ConfigLedger, ConfigToolStatus
@@ -53,6 +59,16 @@ def register_config_store_commands(app: typer.Typer, *, resolve_password: Passwo
         config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
         verbose: bool = typer.Option(False, "-v", "--verbose", help="Show corruption details"),
     ) -> None:
+        """List local snapshots, or report clearly when the optional store is disabled."""
+        try:
+            store_settings = load_optional_config_store_settings(config)
+        except ConfigError as exc:
+            typer.echo(f"Configuration error: {exc}", err=True)
+            raise typer.Exit(2) from exc
+        if store_settings is None:
+            typer.echo("Config store: disabled. Add a [config_store] table to enable remote snapshots.")
+            return
+
         def operation(ledger: ConfigLedger, _context: ConfigStoreContext) -> None:
             summaries = ledger.list_tools()
             if not summaries:

@@ -13,8 +13,8 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Label, ListItem, ListView, Static
 
-from ..action_service import ActionReceipt, ActionService
-from ..analysis_service import AnalysisService, MessageAnalysis
+from ..action_service import ActionReceipt
+from ..analysis_service import MessageAnalysis
 from ..classification_state import SpamOutcome
 from ..config import Settings, load_settings
 from ..credentials import resolve_credential
@@ -23,14 +23,22 @@ from ..mail_service import MailService, MessageDetail
 from ..mailbox import FolderInfo
 from ..message import MailSummary
 from ..remote_images import RemoteImageLoader
+from ..routing_action_service import RoutingActionReceipt, RoutingActionService
+from ..routing_analysis_service import RoutingAnalysisService
+from ..routing_config import load_routing_rules, routing_rules_path_for_config
+from ..routing_models import RoutingPlan, RoutingRule
+from ..routing_models import RuleSet as RoutingRuleSet
+from ..routing_rule_service import RoutingRuleService
 from ..rule_service import RuleService
 from ..rule_test_service import RuleTestService
-from ..rules import MailRule, RuleSet, load_rules, rules_path_for_config
+from ..rules import MailRule, RuleSet, rules_path_for_config
 from ..settings_service import SettingsService
 from .rule_screens import (
     ClassificationRuleEditorScreen,
     ClassificationRulesScreen,
     DeletePolicyConfirmation,
+    RoutingRuleCenterScreen,
+    RoutingRuleEditorScreen,
     RuleCenterScreen,
     RuleDeleteConfirmation,
     RuleDetailScreen,
@@ -85,11 +93,24 @@ class ApplyConfirmation(ModalScreen[bool]):
     #confirm-buttons Button { margin-left: 1; }
     """
 
-    def __init__(self, analysis: MessageAnalysis) -> None:
+    def __init__(self, analysis: MessageAnalysis | RoutingPlan) -> None:
         super().__init__()
         self.analysis = analysis
 
     def compose(self) -> ComposeResult:
+        if isinstance(self.analysis, RoutingPlan):
+            plan = self.analysis
+            yield Static(
+                "Apply current routing plan?\n\n"
+                f"UID: {plan.uid}\nSource: {plan.folder}\n"
+                f"Rule: {plan.winner_rule_id or 'fallback'}\nDestination: {plan.destination}\n\n"
+                "MOVE this exact message?",
+                markup=False,
+            )
+            with Horizontal(id="confirm-buttons"):
+                yield Button("Move message", id="apply", variant="primary")
+                yield Button("Cancel", id="cancel")
+            return
         action = self.analysis.configured_action
         action_label = _format_action(action) if action is not None else "UNKNOWN"
         outcome = self.analysis.outcome or self.analysis.persisted_outcome
@@ -280,28 +301,26 @@ class HelpScreen(ModalScreen[None]):
                     "  i               analyze embedded images only\n"
                     "  I               review remote-image loading (privacy-sensitive)\n\n"
                     "Actions\n"
-                    "  a               apply the configured classification action to the selected message\n"
-                    "  R               open Classification Rules\n"
-                    "  F               open advanced Routing Filters\n"
-                    "  SPAM DELETE changes future SPAM actions, not existing mail.\n"
-                    "  Saving a classification rule changes configuration only.\n"
-                    "  Automatic clean folders limit batch clean only. Manual confirmed actions\n"
-                    "  can operate on a selected message in any folder.\n"
+                    "  c               evaluate every enabled rule for the selected message\n"
+                    "  C               reevaluate the current message\n"
+                    "  i               analyze embedded images only\n"
+                    "  I               review remote-image loading (privacy-sensitive)\n\n"
+                    "Safe operations\n"
+                    "  a               apply the current MOVE plan to the exact selected UID\n"
+                    "  R               open the unified Rules workbench\n"
+                    "  Pressing c never changes mailbox contents. Rule edits never move mail.\n"
                     "  r               refresh\n\n"
-                    "Classification Rules\n"
-                    "  SPAM      KEEP / MOVE / DELETE\n"
-                    "  NOT_SPAM  KEEP / MOVE\n"
-                    "  REVIEW    KEEP / MOVE\n\n"
-                    "Routing Filters\n"
-                    "  j/k             move through filters\n"
-                    "  Enter           show selected filter\n"
-                    "  n/e             new/edit filter\n"
-                    "  Space           enable/disable filter\n"
-                    "  t               bounded read-only test\n"
-                    "  d               remove filter\n"
-                    "  [ / ]           move filter priority\n\n"
-                    "Routing filters match message headers and are separate from classification\n"
-                    "categories. Filters support KEEP/MOVE only.\n"
+                    "Rules workbench\n"
+                    "  j/k             select a rule\n"
+                    "  Enter           edit selected rule\n"
+                    "  n/e             create or edit a rule\n"
+                    "  Space           enable or disable\n"
+                    "  [ / ]           change priority\n"
+                    "  t               test selected rule on current message\n"
+                    "  T               evaluate all rules on current message\n"
+                    "  d               delete selected rule\n\n"
+                    "Full-pipeline analysis shows the first matching rule or the fallback."
+                    " Applying requires current rules, UIDVALIDITY, and exact UID checks.\n\n"
                     "General\n"
                     "  h / ?           show help (h closes this page)\n"
                     "  Escape          close help\n"
@@ -319,15 +338,15 @@ class HelpScreen(ModalScreen[None]):
 
 class MailReviewApp(App[None]):
     TITLE = "imapledger"
-    SUB_TITLE = "Safe terminal mail review"
+    SUB_TITLE = "IMAP operations workbench"
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
         Binding("c", "classify", "Classify"),
         Binding("C", "reclassify", "Reclassify"),
         Binding("a", "apply", "Action"),
-        Binding("R", "classification_rules", "Classification Rules"),
-        Binding("F", "filters", "Routing Filters"),
+        Binding("R", "rules", "Rules"),
+        Binding("F", "filters", "Rules", show=False),
         Binding("i", "analyze_images", "Analyze images"),
         Binding("I", "remote_images", "Remote images"),
         Binding("tab", "next_pane", "Next pane", priority=True),
@@ -362,6 +381,8 @@ class MailReviewApp(App[None]):
         settings: Settings | None = None,
         rules: RuleSet | None = None,
         rule_service: RuleService | None = None,
+        routing_rules: RoutingRuleSet | None = None,
+        routing_rule_service: RoutingRuleService | None = None,
         rule_test_service: RuleTestService | None = None,
         settings_service: SettingsService | None = None,
         analysis_service: Any | None = None,
@@ -378,6 +399,8 @@ class MailReviewApp(App[None]):
         self.rule_service = rule_service or (
             RuleService(rules_path_for_config(config), source_folders=settings.spam.folders) if settings else None
         )
+        self.routing_rules = routing_rules or RoutingRuleSet()
+        self.routing_rule_service = routing_rule_service
         self.rule_test_service = rule_test_service
         self.analysis_service = analysis_service
         self.action_service = action_service
@@ -397,7 +420,7 @@ class MailReviewApp(App[None]):
         self._selected_folder: str | None = None
         self._loading_folder: str | None = None
         self._detail: MessageDetail | None = None
-        self._analysis: MessageAnalysis | None = None
+        self._analysis: MessageAnalysis | RoutingPlan | None = None
         self._folder_generation = 0
         self._message_generation = 0
         self._classification_generation = 0
@@ -615,7 +638,11 @@ class MailReviewApp(App[None]):
             self.query_one("#message-detail", MessageDetailView).update(
                 self._render_message(folder, message, detail, state)
             )
-            if state is not None and self.analysis_service is not None:
+            if (
+                state is not None
+                and self.analysis_service is not None
+                and not getattr(self.analysis_service, "is_routing", False)
+            ):
                 self._analysis = await asyncio.to_thread(
                     self.analysis_service.analyze,
                     folder,
@@ -897,8 +924,32 @@ class MailReviewApp(App[None]):
                 )
             )
 
-    def _render_analysis(self, analysis: MessageAnalysis) -> None:
+    def _render_analysis(self, analysis: MessageAnalysis | RoutingPlan) -> None:
         lines = ["Analysis"]
+        if isinstance(analysis, RoutingPlan):
+            lines.append(f"  Source: {analysis.folder} UID {analysis.uid}")
+            lines.append(f"  Rules fingerprint: {analysis.rules_fingerprint[:12]}")
+            lines.append("  Rule evaluations:")
+            for result in analysis.rule_results:
+                confidence = f"  p={result.confidence:.2f}" if result.confidence is not None else ""
+                detail = f"  ({result.detail})" if result.detail else ""
+                lines.append(f"    {result.rule_id:<18} {result.state.value.upper()}{confidence}{detail}")
+            if analysis.winner_rule_id is not None:
+                lines.append(f"  Winner: {analysis.winner_rule_id} (first matching rule by priority)")
+            else:
+                lines.append("  Winner: none" if analysis.mode == "single-rule" else "  Winner: fallback")
+            lines.append(f"  Destination: {analysis.destination or '(none)'}")
+            lines.append("  Action: MOVE" if analysis.destination else "  Action: none")
+            lines.append("  Applied: no")
+            if analysis.model is not None:
+                lines.append(f"  Model: {analysis.model}")
+            if analysis.request_id is not None:
+                lines.append(f"  Request: {analysis.request_id}")
+            lines.extend(
+                ("", "Next", "  a Apply this exact plan" if analysis.destination else "  No action is planned")
+            )
+            self.query_one("#analysis", Static).update("\n".join(lines))
+            return
         outcome = analysis.outcome or analysis.persisted_outcome
         if analysis.decision_source == "persisted-state":
             lines.append("  Source: persisted state")
@@ -1002,7 +1053,10 @@ class MailReviewApp(App[None]):
             self._analysis = analysis
             self._render_analysis(analysis)
             _LOG.debug("ui.classify duration_ms=%.1f result_count=1", (time.monotonic() - started) * 1000)
-            if analysis.decision_source == "rule":
+            if isinstance(analysis, RoutingPlan):
+                outcome = analysis.winner_rule_id or ("fallback" if analysis.destination else "no route")
+                self._set_status(f"Routing analysis complete: {outcome}.")
+            elif analysis.decision_source == "rule":
                 self._set_status(f"Analysis complete: routing rule {analysis.rule_id} matched.")
             elif analysis.decision_source == "persisted-state":
                 outcome = analysis.persisted_outcome.value.upper() if analysis.persisted_outcome else "unknown"
@@ -1025,15 +1079,38 @@ class MailReviewApp(App[None]):
         if analysis is None:
             self._set_status("Classify this message first with c.")
             return
-        if analysis.configured_action is None:
+        if isinstance(analysis, RoutingPlan):
+            if analysis.destination is None:
+                self._set_status("The current plan has no MOVE destination.")
+                return
+        elif analysis.configured_action is None:
             self._set_status("No classification action is configured.")
             return
-        self.push_screen(ApplyConfirmation(analysis), self._confirmed_action)
+        self._confirm_action(analysis)
+
+    def _confirm_action(self, analysis: MessageAnalysis | RoutingPlan) -> None:
+        detail = self._detail
+        if detail is None:
+            self._set_status("Select a message before confirming an action.")
+            return
+        self.push_screen(
+            ApplyConfirmation(analysis),
+            lambda confirmed: self._confirmed_action(confirmed, analysis, detail),
+        )
 
     def action_classification_rules(self) -> None:
-        self._open_outcome_policy()
+        self.action_rules()
+
+    def action_rules(self) -> None:
+        if self.routing_rule_service is not None:
+            self._open_routing_rules()
+        else:
+            self._open_outcome_policy()
 
     def action_filters(self) -> None:
+        if self.routing_rule_service is not None:
+            self._open_routing_rules()
+            return
         if self.rule_service is None:
             self._set_status("Routing filter management is unavailable.")
             return
@@ -1044,6 +1121,162 @@ class MailReviewApp(App[None]):
             return
         self.rules = rules
         self.push_screen(RuleCenterScreen(rules), self._rule_center_selected)
+
+    def _routing_folders(self) -> tuple[str, ...]:
+        config_folder = self.settings.config_store.folder if self.settings and self.settings.config_store else None
+        return tuple(folder.name for folder in self.folders if folder.selectable and folder.name != config_folder)
+
+    def _open_routing_rules(self) -> None:
+        if self.routing_rule_service is None:
+            self._set_status("Rules workbench is unavailable.")
+            return
+        try:
+            rules = self.routing_rule_service.load()
+        except Exception as exc:
+            self._set_status(f"Could not load rules: {type(exc).__name__}")
+            return
+        self.routing_rules = rules
+        self.push_screen(RoutingRuleCenterScreen(rules, self._routing_folders()), self._routing_rule_center_selected)
+
+    def _routing_rule_center_selected(self, selection: tuple[str, str | None] | None) -> None:
+        if selection is None:
+            return
+        action, selected = selection
+        if action == "close":
+            return
+        if action == "fallback":
+            self.run_worker(self._save_routing_fallback(selected), group="routing-rule-mutation", exclusive=True)
+            return
+        if action == "test-all":
+            self.run_worker(self._test_routing_rules(), group="routing-rule-test", exclusive=True)
+            return
+        if action == "new":
+            self.push_screen(
+                RoutingRuleEditorScreen(None, self._routing_folders()),
+                lambda rule: self._routing_rule_saved(rule, None),
+            )
+            return
+        rule = next((item for item in self.routing_rules.rules if item.id == selected), None)
+        if rule is None:
+            self._set_status("Select a rule first.")
+            return
+        if action == "edit":
+            self.push_screen(
+                RoutingRuleEditorScreen(rule, self._routing_folders()),
+                lambda replacement: self._routing_rule_saved(replacement, rule.id),
+            )
+        elif action == "test":
+            self.run_worker(self._test_routing_rules(rule.id), group="routing-rule-test", exclusive=True)
+        else:
+            self.run_worker(
+                self._mutate_routing_rule(action, rule.id),
+                group="routing-rule-mutation",
+                exclusive=True,
+                exit_on_error=False,
+            )
+
+    def _routing_rule_saved(self, rule: RoutingRule | None, existing_id: str | None) -> None:
+        if rule is None:
+            self._set_status("Rule edit cancelled. No changes made.")
+            return
+        self.run_worker(
+            self._save_routing_rule(rule, existing_id),
+            group="routing-rule-mutation",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _save_routing_rule(self, rule: RoutingRule, existing_id: str | None) -> None:
+        try:
+            if self.routing_rule_service is None:
+                raise RuntimeError("rules service unavailable")
+            if existing_id is None:
+                result = await asyncio.to_thread(self.routing_rule_service.add, rule)
+            else:
+                result = await asyncio.to_thread(self.routing_rule_service.update, existing_id, rule)
+            self._replace_routing_rules(result.rules)
+            await self._reanalyze_current_message()
+            self._set_status(f"Saved rule {rule.id}. Current message analysis refreshed.")
+            self._open_routing_rules()
+        except Exception as exc:
+            self._set_status(f"Rule save failed: {type(exc).__name__}.")
+
+    async def _mutate_routing_rule(self, action: str, rule_id: str) -> None:
+        try:
+            if self.routing_rule_service is None:
+                raise RuntimeError("rules service unavailable")
+            if action == "toggle":
+                rule = next(item for item in self.routing_rules.rules if item.id == rule_id)
+                result = await asyncio.to_thread(self.routing_rule_service.set_enabled, rule_id, not rule.enabled)
+            elif action == "up":
+                result = await asyncio.to_thread(self.routing_rule_service.move, rule_id, -1)
+            elif action == "down":
+                result = await asyncio.to_thread(self.routing_rule_service.move, rule_id, 1)
+            elif action == "remove":
+                result = await asyncio.to_thread(self.routing_rule_service.remove, rule_id)
+            else:
+                return
+            if result.changed_rule_id is None:
+                self._set_status(result.detail)
+                return
+            self._replace_routing_rules(result.rules)
+            await self._reanalyze_current_message()
+            self._activity.append(result.detail)
+            self._render_activity()
+            self._set_status(result.detail)
+            self._open_routing_rules()
+        except Exception as exc:
+            self._set_status(f"Rule change failed: {type(exc).__name__}.")
+
+    async def _save_routing_fallback(self, destination: str | None) -> None:
+        try:
+            if self.routing_rule_service is None:
+                raise RuntimeError("rules service unavailable")
+            if destination is not None and destination not in self._routing_folders():
+                raise ValueError(f"Destination {destination} is not an available folder.")
+            result = await asyncio.to_thread(self.routing_rule_service.set_fallback_destination, destination)
+            self._replace_routing_rules(result.rules)
+            await self._reanalyze_current_message()
+            self._set_status("Fallback destination saved.")
+            self._open_routing_rules()
+        except Exception as exc:
+            self._set_status(f"Fallback save failed: {type(exc).__name__}.")
+
+    async def _test_routing_rules(self, rule_scope: str | None = None) -> None:
+        detail = self._detail
+        if detail is None or detail.item.message is None or self.analysis_service is None:
+            self._set_status("Select a message before testing rules.")
+            return
+        try:
+            plan = await asyncio.to_thread(
+                self.analysis_service.analyze,
+                detail.folder,
+                detail.item.message,
+                rule_scope=rule_scope,
+            )
+            lines = [f"Routing test: {rule_scope or 'all rules'}", f"Source: {plan.folder} UID {plan.uid}", ""]
+            lines.extend(
+                f"{item.rule_id}: {item.state.value}"
+                + (f" p={item.confidence:.2f}" if item.confidence is not None else "")
+                for item in plan.rule_results
+            )
+            lines.extend(
+                (
+                    "",
+                    f"Winner: {plan.winner_rule_id or 'none'}",
+                    f"Destination: {plan.destination or '(none)'}",
+                )
+            )
+            lines.append("\nRead-only. No message was moved.")
+            self.push_screen(RuleTestResultScreen("\n".join(lines)))
+        except Exception as exc:
+            self._set_status(f"Rule test failed: {type(exc).__name__}.")
+
+    def _replace_routing_rules(self, rules: RoutingRuleSet) -> None:
+        self.routing_rules = rules
+        for service in (self.analysis_service, self.action_service):
+            if service is not None and hasattr(service, "set_rules"):
+                service.set_rules(rules)
 
     def _open_outcome_policy(self) -> None:
         if self.settings is None or self.settings_service is None:
@@ -1173,7 +1406,7 @@ class MailReviewApp(App[None]):
                     self._set_status("Rule saved, but it is not the winning rule for the current message.")
                     return
                 self._set_status(f"Rule saved: {rule.id}. Confirm the exact message action.")
-                self.push_screen(ApplyConfirmation(self._analysis), self._confirmed_action)
+                self._confirm_action(self._analysis)
             else:
                 self._set_status(f"Saved rule {rule.id}. Current message analysis refreshed.")
             if not apply_current:
@@ -1297,21 +1530,81 @@ class MailReviewApp(App[None]):
     def _render_activity(self) -> None:
         self.query_one("#activity", Static).update("Activity\n" + "\n".join(self._activity[-20:]))
 
-    def _confirmed_action(self, confirmed: bool) -> None:
+    def _confirmed_action(
+        self,
+        confirmed: bool,
+        analysis: MessageAnalysis | RoutingPlan,
+        detail: MessageDetail,
+    ) -> None:
         if confirmed and not self._action_running:
             self._action_running = True
-            self.run_worker(self._apply_confirmed(True), group="action", exit_on_error=False)
+            self.run_worker(
+                self._apply_confirmed(analysis, detail),
+                group="action",
+                exit_on_error=False,
+            )
 
-    async def _apply_confirmed(self, confirmed: bool) -> None:
-        if not confirmed:
-            return
-        analysis = self._analysis
-        detail = self._detail
-        if analysis is None or detail is None or self.action_service is None:
+    async def _apply_confirmed(
+        self,
+        analysis: MessageAnalysis | RoutingPlan,
+        detail: MessageDetail,
+    ) -> None:
+        if self.action_service is None:
+            self._set_status("Mailbox action service is unavailable.")
+            self._action_running = False
             return
         self._set_status("Applying confirmed mailbox action in a background thread…")
         started = time.monotonic()
         try:
+            if isinstance(analysis, RoutingPlan):
+                routing_receipt: RoutingActionReceipt = await asyncio.to_thread(
+                    self.action_service.apply,
+                    analysis,
+                    uidvalidity=detail.uidvalidity,
+                    confirmed_by_user=True,
+                )
+                result = "confirmed" if routing_receipt.applied and routing_receipt.confirmed else "not confirmed"
+                activity = (
+                    f"{routing_receipt.plan.folder} UID {routing_receipt.plan.uid}: MOVE {result}"
+                    f" to {routing_receipt.plan.destination}"
+                )
+                if routing_receipt.detail:
+                    activity += f" ({routing_receipt.detail})"
+                self._activity.append(activity)
+                self.query_one("#activity", Static).update("Activity\n" + "\n".join(self._activity[-20:]))
+                self._set_status(f"Action {result}.")
+                if routing_receipt.applied and routing_receipt.confirmed:
+                    summary = self._find_summary(routing_receipt.plan.folder, routing_receipt.plan.uid)
+                    rows = [
+                        (row_folder, row_summary)
+                        for row_folder, row_summary in self._rows
+                        if not (
+                            row_folder == routing_receipt.plan.folder and row_summary.uid == routing_receipt.plan.uid
+                        )
+                    ]
+                    self._populate_rows(tuple(rows))
+                    if (
+                        self._detail is not None
+                        and self._detail.folder == routing_receipt.plan.folder
+                        and self._detail.item.uid == routing_receipt.plan.uid
+                    ):
+                        self._detail = None
+                        self._analysis = None
+                        self.query_one("#message-detail", MessageDetailView).update(
+                            "Select a message to read its text content."
+                        )
+                        self.query_one("#analysis", Static).update("Analysis will not run until requested.")
+                    self._set_status("MOVE confirmed. Updating folder counts…")
+                    self._adjust_folder_count(routing_receipt.plan.folder, -1, summary=summary)
+                    targets = tuple(
+                        dict.fromkeys(
+                            folder
+                            for folder in (routing_receipt.plan.folder, routing_receipt.plan.destination)
+                            if folder
+                        )
+                    )
+                    self.run_worker(self._refresh_action_counts(targets), group="folder-counts", exit_on_error=False)
+                return
             receipt: ActionReceipt = await asyncio.to_thread(
                 self.action_service.apply,
                 analysis,
@@ -1484,22 +1777,26 @@ def run(config: Path) -> None:
     action_service = None
     try:
         settings = load_settings(config)
-        rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
+        routing_rules_path = routing_rules_path_for_config(config)
+        routing_rules = load_routing_rules(routing_rules_path)
         password = resolve_credential(settings.imap).password
         mail_service = MailService(settings, password)
-        analysis_service = AnalysisService(settings, rules)
-        rule_service = RuleService(rules_path_for_config(config), source_folders=settings.spam.folders)
-        rule_test_service = RuleTestService(settings, password)
+        analysis_service = RoutingAnalysisService(settings, routing_rules)
+        routing_rule_service = RoutingRuleService(routing_rules_path)
         image_analysis_service = ImageAnalysisService()
         remote_image_loader = RemoteImageLoader()
-        action_service = ActionService(settings, password)
+        action_service = RoutingActionService(
+            settings,
+            password,
+            routing_rules,
+            rules_provider=lambda: load_routing_rules(routing_rules_path),
+        )
         MailReviewApp(
             config,
             mail_service=mail_service,
             settings=settings,
-            rules=rules,
-            rule_service=rule_service,
-            rule_test_service=rule_test_service,
+            routing_rules=routing_rules,
+            routing_rule_service=routing_rule_service,
             analysis_service=analysis_service,
             action_service=action_service,
             image_analysis_service=image_analysis_service,

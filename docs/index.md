@@ -1,6 +1,6 @@
 # imapledger
 
-`imapledger` is a security-scoped IMAP tool for classifying messages and an append-only ledger for small configuration files. The semantic model receives message evidence only; deterministic policy and configuration control every cleaning side effect.
+`imapledger` is a security-scoped IMAP routing tool and an append-only ledger for small configuration files. The semantic model receives message evidence only; deterministic rules and configured destinations control every cleaning side effect.
 
 ## Quick start
 
@@ -18,8 +18,10 @@ imapledger init \
 
 imapledger config show
 imapledger doctor
-imapledger clean
-imapledger clean --apply
+imapledger ui  # press R to create schema-2 rules and configure a fallback
+imapledger clean INBOX.Junk
+imapledger clean INBOX.Junk --apply
+imapledger progress list
 ```
 
 Credential resolution defaults to hidden prompt authentication, and no password is stored in configuration. Use `imapledger auth set` to opt into OS keyring or encrypted-vault storage; see the configuration guide for setup and deletion behavior.

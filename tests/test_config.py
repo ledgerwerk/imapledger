@@ -145,6 +145,17 @@ def test_new_folder_schema_without_actions_defaults_to_keep(tmp_path: Path) -> N
     assert settings.spam.actions.review.action is ActionKind.KEEP
 
 
+def test_spam_folders_are_optional_for_explicit_routing_config(tmp_path: Path) -> None:
+    settings = _load_spam(tmp_path, "")
+    assert settings.spam.folders == ()
+
+    rendered = render_settings(settings)
+    assert "folders =" not in rendered
+    roundtrip = tmp_path / "roundtrip.toml"
+    roundtrip.write_text(rendered, encoding="utf-8")
+    assert load_settings(roundtrip) == settings
+
+
 def test_folder_and_folders_cannot_both_be_configured(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="cannot both"):
         _load_spam(tmp_path, 'folder = "Spam"\nfolders = ["Spam"]\n')

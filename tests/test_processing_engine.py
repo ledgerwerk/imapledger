@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from imapledger.config import ImapSettings, Settings, SpamSettings
+from imapledger.mailbox import MailboxItem, MailboxRunMetadata
+from imapledger.message import MailMessage
+from imapledger.processing_engine import ProcessingEngine
+from imapledger.progress_store import ProgressStore, account_identity_key
+from imapledger.routing_models import EvaluationState, RoutingPlan, RoutingRule, RuleEvaluation, RuleSet, RuleType
+from imapledger.rules import RuleMatch
+
+
+class _FakeEvaluator:
+    failing_uids: set[int] = set()
+    matching_uids: set[int] = {1}
+    destination_override: str | None = None
+
+    def __init__(self, **_: object) -> None:
+        pass
+
+    def __enter__(self) -> _FakeEvaluator:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def fingerprint(self, rules: RuleSet) -> str:
+        fallback = rules.fallback_destination or "none"
+        return f"rules-{fallback}"
+
+    def plan(self, folder: str, message: MailMessage, rules: RuleSet, *, rule_scope: str | None = None) -> RoutingPlan:
+        if message.uid in self.failing_uids:
+            raise RuntimeError("private provider details must not be stored")
+        candidates = rules.enabled_rules(folder)
+        if rule_scope is not None:
+            candidates = tuple(rule for rule in candidates if rule.id == rule_scope)
+        matched = message.uid in self.matching_uids
+        result = tuple(
+            RuleEvaluation(
+                rule.id,
+                EvaluationState.MATCH if matched else EvaluationState.NO_MATCH,
+            )
+            for rule in candidates
+        )
+        winner = candidates[0] if matched and candidates else None
+        mode = "single-rule" if rule_scope is not None else "full"
+        if winner is not None:
+            destination = winner.destination
+        elif rule_scope is None:
+            destination = rules.fallback_destination
+        else:
+            destination = None
+        if self.destination_override is not None:
+            destination = self.destination_override
+        return RoutingPlan(
+            folder=folder,
+            uid=message.uid,
+            rule_results=result,
+            winner_rule_id=winner.id if winner is not None else None,
+            destination=destination,
+            mode=mode,
+            rules_fingerprint=self.fingerprint(rules),
+            model="fake-model",
+            request_id="fake-request",
+        )
+
+
+class _FakeMailbox:
+    def __init__(self, uids: tuple[int, ...], *, writable: bool, destinations: tuple[str, ...] = ()) -> None:
+        self.folder = "INBOX"
+        self.writable = writable
+        self.uids = list(uids)
+        self.destinations = set(destinations)
+        self.high_watermark_uid = max(uids, default=0)
+        self.moved: list[tuple[int, str]] = []
+
+    def metadata(self) -> MailboxRunMetadata:
+        return MailboxRunMetadata(uidvalidity=7, uidnext=self.high_watermark_uid + 1)
+
+    def validate_destination(self, destination: str) -> None:
+        if destination not in self.destinations:
+            raise ValueError("missing destination")
+
+    def find_next_uids(
+        self,
+        *,
+        cursor_uid: int | None,
+        high_watermark_uid: int,
+        direction: str,
+        limit: int,
+        lower_bound_uid: int = 0,
+    ) -> tuple[int, ...]:
+        candidates = [uid for uid in self.uids if lower_bound_uid < uid <= high_watermark_uid]
+        if direction == "oldest":
+            candidates = [uid for uid in candidates if uid > (cursor_uid or lower_bound_uid)]
+            return tuple(sorted(candidates)[:limit])
+        candidates = [
+            uid for uid in candidates if uid < (cursor_uid if cursor_uid is not None else high_watermark_uid + 1)
+        ]
+        return tuple(sorted(candidates, reverse=True)[:limit])
+
+    def fetch_items(self, uids: tuple[int, ...], *, high_watermark_uid: int) -> tuple[MailboxItem, ...]:
+        return tuple(
+            MailboxItem(uid, MailMessage(uid, "subject", "sender@example.org", (), "", "body"))
+            for uid in uids
+            if uid in self.uids
+        )
+
+    def move_uid(self, uid: int, destination: str) -> SimpleNamespace:
+        self.uids.remove(uid)
+        self.moved.append((uid, destination))
+        return SimpleNamespace(moved=(uid,))
+
+
+def _settings() -> Settings:
+    return Settings(
+        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
+        spam=SpamSettings(folders=("Spam",)),
+    )
+
+
+def _rules(*, fallback: str = "Archive") -> RuleSet:
+    return RuleSet(
+        (
+            RoutingRule(
+                id="invoice",
+                enabled=True,
+                type=RuleType.HEADER,
+                destination="Invoices",
+                match=RuleMatch(subject="invoice"),
+            ),
+        ),
+        fallback_destination=fallback,
+    )
+
+
+def _engine(monkeypatch, tmp_path, rules: RuleSet) -> tuple[ProcessingEngine, ProgressStore]:
+    monkeypatch.setattr("imapledger.processing_engine.SemanticRoutingEvaluator", _FakeEvaluator)
+    store = ProgressStore(tmp_path / "progress.sqlite3")
+    engine = ProcessingEngine(settings=_settings(), rules=rules, progress_store=store)
+    return engine, store
+
+
+def test_preview_repeats_same_uids_without_advancing_progress_then_apply_checkpoints(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = set()
+    _FakeEvaluator.matching_uids = {1}
+    rules = _rules()
+    engine, store = _engine(monkeypatch, tmp_path, rules)
+    mailbox = _FakeMailbox((1, 2), writable=True, destinations=("Invoices", "Archive"))
+
+    preview = engine.run(mailbox, apply=False, limit=2, sort_direction="oldest")
+    repeated_preview = engine.run(mailbox, apply=False, limit=2, sort_direction="oldest")
+    assert tuple(result.uid for result in preview.messages) == (1, 2)
+    assert tuple(result.uid for result in repeated_preview.messages) == (1, 2)
+    assert tuple(result.outcome for result in preview.messages) == ("match", "fallback")
+    assert preview.run.cursor_uid is None
+    assert preview.run.scanned_count == 0
+    assert store.results(preview.run.id) == ()
+    assert mailbox.moved == []
+
+    applied = engine.run(mailbox, apply=True, limit=2, sort_direction="oldest")
+    assert tuple(mailbox.moved) == ((1, "Invoices"), (2, "Archive"))
+    assert applied.run.scanned_count == 2
+    assert applied.run.match_count == 1
+    assert applied.run.moved_count == 2
+    assert applied.run.status == "active"
+
+    completed = engine.run(mailbox, apply=True, sort_direction="oldest")
+    assert completed.run.status == "completed"
+    assert completed.run.scanned_count == 2
+
+
+def test_single_rule_nonmatch_is_checkpointed_without_moving(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = set()
+    _FakeEvaluator.matching_uids = {1}
+    engine, store = _engine(monkeypatch, tmp_path, _rules())
+    mailbox = _FakeMailbox((2,), writable=True, destinations=("Invoices",))
+
+    report = engine.run(mailbox, apply=True, rule_scope="invoice", sort_direction="oldest")
+
+    assert report.messages[0].outcome == "no_match"
+    assert mailbox.moved == []
+    assert report.run.mode == "single-rule"
+    assert report.run.no_match_count == 1
+    assert report.run.moved_count == 0
+    assert store.get_result(report.run.id, 2).outcome == "no_match"
+
+
+def test_retry_errors_reuses_run_and_replaces_error_with_confirmed_move(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = {1}
+    _FakeEvaluator.matching_uids = {1}
+    engine, store = _engine(monkeypatch, tmp_path, _rules())
+    mailbox = _FakeMailbox((1,), writable=True, destinations=("Invoices", "Archive"))
+
+    first = engine.run(mailbox, apply=True, sort_direction="oldest")
+    assert first.run.status == "completed"
+    assert first.run.error_count == 1
+    assert store.errors(first.run.id)[0].error_code == "RuntimeError"
+    assert mailbox.moved == []
+
+    _FakeEvaluator.failing_uids = set()
+    retried = engine.run(mailbox, apply=True, sort_direction="oldest", retry_errors=True)
+
+    assert retried.run.id == first.run.id
+    assert retried.messages[0].outcome == "match"
+    assert mailbox.moved == [(1, "Invoices")]
+    assert retried.run.status == "completed"
+    assert retried.run.error_count == 0
+    assert retried.run.moved_count == 1
+    assert store.get_result(first.run.id, 1).error_code is None
+
+
+def test_changed_fingerprint_supersedes_active_run(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = set()
+    _FakeEvaluator.matching_uids = set()
+    engine, store = _engine(monkeypatch, tmp_path, _rules(fallback="Archive"))
+    mailbox = _FakeMailbox((1, 2), writable=True, destinations=("Invoices", "Archive", "Other"))
+    first = engine.run(mailbox, apply=True, limit=1, sort_direction="oldest")
+    assert first.run.status == "active"
+
+    changed = ProcessingEngine(
+        settings=_settings(),
+        rules=_rules(fallback="Other"),
+        progress_store=store,
+    )
+    second = changed.run(mailbox, apply=True, limit=1, sort_direction="oldest")
+
+    assert second.run.id != first.run.id
+    assert store.get_run(first.run.id).status == "superseded"
+    assert second.messages[0].uid == 2
+    assert second.messages[0].destination == "Other"
+
+
+def test_engine_rejects_destination_not_bound_to_configured_winner(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = set()
+    _FakeEvaluator.matching_uids = {1}
+    _FakeEvaluator.destination_override = "Unconfigured"
+    engine, store = _engine(monkeypatch, tmp_path, _rules())
+    mailbox = _FakeMailbox((1,), writable=True, destinations=("Invoices", "Archive"))
+
+    try:
+        report = engine.run(mailbox, apply=True, sort_direction="oldest")
+    finally:
+        _FakeEvaluator.destination_override = None
+
+    assert report.messages[0].error_code == "InvalidRoutingPlan"
+    assert mailbox.moved == []
+    assert store.get_result(report.run.id, 1).error_code == "InvalidRoutingPlan"
+
+
+def test_engine_account_key_uses_existing_account_identity_hash(tmp_path, monkeypatch) -> None:
+    engine, _ = _engine(monkeypatch, tmp_path, _rules())
+    assert engine.account_key == account_identity_key(_settings())
