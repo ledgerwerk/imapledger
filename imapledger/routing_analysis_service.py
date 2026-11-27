@@ -34,13 +34,7 @@ class RoutingAnalysisService:
         settings = self._settings
         evaluator = SemanticRoutingEvaluator(
             config=self._config,
-            context=MailboxContext(
-                folder_role="mail",
-                already_in_configured_junk_folder=folder in settings.spam.folders,
-            ),
-            trusted_authserv_ids=settings.spam.trusted_authserv_ids,
-            trusted_provider_headers=settings.spam.trusted_provider_headers,
-            spam_policy=settings.spam.policy,
+            context=MailboxContext(source_folder=folder),
             config_store_folder=settings.config_store.folder if settings.config_store is not None else None,
         )
         with evaluator:

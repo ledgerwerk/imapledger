@@ -1,15 +1,21 @@
 from __future__ import annotations
 
-import pyjev
-import pyjev.decisions as decision_module
 import pytest
-from pyjev.decisions import BundleDecision, NoulDecision
+from pyjev.decisions import BundleDecision
 from pyjev.results import BundleResult, NoulResult
 
-from imapledger.classifier import SIGNAL_NAMES
 from imapledger.message import MailMessage
+from imapledger.routing_actions import RuleAction
 from imapledger.routing_evaluator import SemanticRoutingEvaluator
-from imapledger.routing_models import EvaluationState, RoutingAction, RoutingRule, RuleSet, RuleType
+from imapledger.routing_models import (
+    EvaluationState,
+    RoutingAction,
+    RoutingRule,
+    RuleEvidenceSettings,
+    RuleSet,
+    RuleType,
+)
+from imapledger.rule_recipes.spam import SIGNAL_NAMES
 from imapledger.rules import RuleMatch
 
 
@@ -30,15 +36,9 @@ class FakeJev:
         self.calls.append((decision, state))
         if self.failure is not None:
             raise self.failure
-        keys = list(decision.questions)
         answers = {
-            key: NoulResult(
-                value=self.values.get(key, 0.05),
-                model="child-model",
-                usage={},
-                raw={},
-            )
-            for key in keys
+            key: NoulResult(value=self.values.get(key, 0.05), model="child-model", usage={}, raw={})
+            for key in decision.questions
         }
         if self.extra_key:
             answers["unexpected"] = NoulResult(value=0.99, model="child-model", usage={}, raw={})
@@ -52,15 +52,12 @@ class FakeJev:
 
 
 def _install_jev(monkeypatch: pytest.MonkeyPatch, fake: FakeJev) -> None:
-    spam_bundle = BundleDecision(
-        name="spam-evidence",
-        questions={name: NoulDecision(name=name, question=f"Question for {name}") for name in SIGNAL_NAMES},
-    )
-    monkeypatch.setattr(decision_module, "load_decision", lambda name, *, config: spam_bundle)
-    monkeypatch.setattr(pyjev, "Jev", lambda: fake)
+    import imapledger.routing_evaluator as evaluator_module
+
+    monkeypatch.setattr(evaluator_module, "Jev", lambda: fake)
 
 
-def _message(uid: int = 77) -> MailMessage:
+def _message(uid: int = 77, *, x_spam_flag: str = "") -> MailMessage:
     return MailMessage(
         uid,
         "subject",
@@ -69,6 +66,7 @@ def _message(uid: int = 77) -> MailMessage:
         "",
         "mail body",
         from_address="sender@example.org",
+        x_spam_flag=x_spam_flag,
     )
 
 
@@ -83,26 +81,34 @@ def _semantic(rule_id: str, destination: str, threshold: float = 0.9) -> Routing
     )
 
 
-def _routing_key(rule_id: str) -> str:
-    return f"route_{rule_id}"
+def _spam_rule(rule_id: str = "spam", destination: str = "INBOX.Trash", **options) -> RoutingRule:
+    return RoutingRule(
+        id=rule_id,
+        enabled=True,
+        type=RuleType.RECIPE,
+        recipe="spam",
+        action=RuleAction.MOVE,
+        destination=destination,
+        options=options,
+    )
 
 
-def test_spam_and_semantic_questions_share_one_bundle_and_first_match_wins(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _semantic_key(rule_id: str) -> str:
+    return f"semantic__{rule_id}"
+
+
+def _recipe_key(rule_id: str, name: str) -> str:
+    return f"recipe__{rule_id}__{name}"
+
+
+def test_recipe_and_semantic_questions_share_one_bundle_and_keep_order(monkeypatch: pytest.MonkeyPatch) -> None:
     values: dict[str, object] = {name: 0.1 for name in SIGNAL_NAMES}
-    values["unsolicited_bulk"] = 0.99
-    values["delete_safe"] = 0.95
-    values[_routing_key("advertising")] = 0.99
+    values[_recipe_key("spam", "unsolicited_bulk")] = 0.99
+    values[_recipe_key("spam", "action_safe")] = 0.95
+    values[_semantic_key("advertising")] = 0.99
     fake = FakeJev(values)
     _install_jev(monkeypatch, fake)
-    rules = RuleSet(
-        (
-            RoutingRule("spam", True, RuleType.SPAM, "INBOX.Trash"),
-            _semantic("advertising", "INBOX.Advertising"),
-        ),
-        fallback_destination="INBOX.Processed",
-    )
+    rules = RuleSet((_spam_rule(), _semantic("advertising", "INBOX.Advertising")))
 
     with SemanticRoutingEvaluator() as evaluator:
         plan = evaluator.plan("INBOX.Archive", _message(), rules)
@@ -113,20 +119,22 @@ def test_spam_and_semantic_questions_share_one_bundle_and_first_match_wins(
     assert plan.request_id == "request-test"
     assert len(fake.calls) == 1
     decision, state = fake.calls[0]
-    assert set(decision.questions) == set(SIGNAL_NAMES) | {_routing_key("advertising")}
-    assert "security_note" in state
+    assert set(decision.questions) == {
+        *(_recipe_key("spam", name) for name in SIGNAL_NAMES),
+        _semantic_key("advertising"),
+    }
+    assert "source_folder" in state["mailbox_context"]
     assert plan.rule_results[1].confidence == 0.99
 
 
 def test_first_semantic_match_wins_even_when_later_rule_also_matches(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = FakeJev({_routing_key("advertising"): 0.93, _routing_key("newsletter"): 0.97})
+    fake = FakeJev({_semantic_key("advertising"): 0.93, _semantic_key("newsletter"): 0.97})
     _install_jev(monkeypatch, fake)
     rules = RuleSet(
         (
             _semantic("advertising", "INBOX.Advertising", 0.9),
             _semantic("newsletter", "INBOX.Newsletter", 0.88),
-        ),
-        fallback_destination="INBOX.Processed",
+        )
     )
 
     with SemanticRoutingEvaluator() as evaluator:
@@ -137,13 +145,30 @@ def test_first_semantic_match_wins_even_when_later_rule_also_matches(monkeypatch
     assert plan.destination == "INBOX.Advertising"
 
 
-def test_no_match_keeps_in_place_and_selected_rule_never_uses_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = FakeJev({})
+def test_uncertain_spam_is_no_match_and_later_rules_continue(monkeypatch: pytest.MonkeyPatch) -> None:
+    values: dict[str, object] = {_recipe_key("spam", name): 0.1 for name in SIGNAL_NAMES}
+    values[_recipe_key("spam", "action_safe")] = 0.1
+    values[_semantic_key("newsletter")] = 0.97
+    fake = FakeJev(values)
     _install_jev(monkeypatch, fake)
     rules = RuleSet(
-        (_semantic("invoice", "INBOX.Invoice"), _semantic("newsletter", "INBOX.Newsletter")),
-        fallback_destination="INBOX.Processed",
+        (_spam_rule(), _semantic("newsletter", "INBOX.Newsletter")),
+        evidence=RuleEvidenceSettings(trusted_provider_headers=("X-Spam-Flag",)),
     )
+
+    with SemanticRoutingEvaluator() as evaluator:
+        plan = evaluator.plan("INBOX.Archive", _message(x_spam_flag="YES"), rules)
+
+    assert plan.rule_results[0].state is EvaluationState.NO_MATCH
+    assert plan.rule_results[0].detail == "provider-marker-needs-corroboration"
+    assert plan.winner_rule_id == "newsletter"
+    assert plan.destination == "INBOX.Newsletter"
+
+
+def test_no_match_stays_in_place_and_selected_rule_does_not_use_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeJev({})
+    _install_jev(monkeypatch, fake)
+    rules = RuleSet((_semantic("invoice", "INBOX.Invoice"), _semantic("newsletter", "INBOX.Newsletter")))
 
     with SemanticRoutingEvaluator() as evaluator:
         full_plan = evaluator.plan("INBOX.Archive", _message(), rules)
@@ -156,65 +181,54 @@ def test_no_match_keeps_in_place_and_selected_rule_never_uses_fallback(monkeypat
     assert selected_plan.rule_results[0].rule_id == "invoice"
     assert selected_plan.rule_results[0].state is EvaluationState.NO_MATCH
     assert selected_plan.destination is None
-    assert set(fake.calls[1][0].questions) == {_routing_key("invoice")}
+    assert set(fake.calls[1][0].questions) == {_semantic_key("invoice")}
 
 
-def test_deterministic_header_match_needs_no_model_request(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_deterministic_header_rule_needs_no_model_request(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeJev({})
     _install_jev(monkeypatch, fake)
-    rules = RuleSet(
-        (
-            RoutingRule(
-                "github",
-                True,
-                RuleType.HEADER,
-                "INBOX.Development",
-                match=RuleMatch(from_domain="example.org"),
-            ),
-        ),
-        fallback_destination="INBOX.Processed",
+    rule = RoutingRule(
+        "github",
+        True,
+        RuleType.HEADER,
+        "INBOX.Development",
+        match=RuleMatch(from_domain="example.org"),
     )
 
     with SemanticRoutingEvaluator() as evaluator:
-        plan = evaluator.plan("INBOX.Archive", _message(), rules)
+        plan = evaluator.plan("INBOX.Archive", _message(), RuleSet((rule,)))
 
     assert fake.calls == []
     assert plan.winner_rule_id == "github"
     assert plan.destination == "INBOX.Development"
 
 
-def test_spam_review_remains_a_no_match_with_review_detail(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_jev(monkeypatch, FakeJev({}))
-    rules = RuleSet((RoutingRule("spam", True, RuleType.SPAM, "INBOX.Trash"),), "INBOX.Processed")
+def test_deterministic_recipe_match_skips_model_questions(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeJev({})
+    _install_jev(monkeypatch, fake)
+    rule = RoutingRule(
+        "spam-fast-path",
+        True,
+        RuleType.RECIPE,
+        destination="INBOX.Trash",
+        action=RuleAction.MOVE,
+        recipe="spam",
+        match_any=(RuleMatch(from_address="sender@example.org"),),
+    )
 
     with SemanticRoutingEvaluator() as evaluator:
-        plan = evaluator.plan("INBOX.Archive", _message(), rules)
+        plan = evaluator.plan("INBOX.Archive", _message(), RuleSet((rule,)))
 
-    assert plan.rule_results[0].state is EvaluationState.NO_MATCH
-    assert plan.rule_results[0].detail is not None
-    assert plan.rule_results[0].detail.startswith("review:")
-    assert plan.destination is None
-    assert plan.action is RoutingAction.KEEP_IN_PLACE
+    assert fake.calls == []
+    assert plan.winner_rule_id == "spam-fast-path"
+    assert plan.rule_results[0].detail == "deterministic matcher match"
 
 
-def test_winning_rule_to_current_folder_is_already_there(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_jev(monkeypatch, FakeJev({_routing_key("newsletter"): 0.95}))
-    rules = RuleSet((_semantic("newsletter", "INBOX"),))
-
-    with SemanticRoutingEvaluator() as evaluator:
-        plan = evaluator.plan("INBOX", _message(), rules)
-
-    assert plan.winner_rule_id == "newsletter"
-    assert plan.destination == "INBOX"
-    assert plan.action is RoutingAction.ALREADY_THERE
-
-
-def test_model_exception_produces_error_and_never_selects_a_destination(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_recipe_model_exception_produces_error_and_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_jev(monkeypatch, FakeJev({}, failure=RuntimeError("offline")))
-    rules = RuleSet((_semantic("invoice", "INBOX.Invoice"),), "INBOX.Processed")
 
     with SemanticRoutingEvaluator() as evaluator:
-        plan = evaluator.plan("INBOX.Archive", _message(), rules)
+        plan = evaluator.plan("INBOX.Archive", _message(), RuleSet((_spam_rule(),)))
 
     assert plan.rule_results[0].state is EvaluationState.ERROR
     assert plan.rule_results[0].detail == "offline"
@@ -222,12 +236,11 @@ def test_model_exception_produces_error_and_never_selects_a_destination(monkeypa
     assert plan.destination is None
 
 
-def test_unknown_result_key_produces_error_without_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unknown_result_key_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_jev(monkeypatch, FakeJev({}, extra_key=True))
-    rules = RuleSet((_semantic("invoice", "INBOX.Invoice"),), "INBOX.Processed")
 
     with SemanticRoutingEvaluator() as evaluator:
-        plan = evaluator.plan("INBOX.Archive", _message(), rules)
+        plan = evaluator.plan("INBOX.Archive", _message(), RuleSet((_semantic("invoice", "INBOX.Invoice"),)))
 
     assert plan.rule_results[0].state is EvaluationState.ERROR
     assert "unknown or missing" in (plan.rule_results[0].detail or "")
@@ -239,11 +252,10 @@ def test_invalid_model_probabilities_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     probability: object,
 ) -> None:
-    _install_jev(monkeypatch, FakeJev({_routing_key("invoice"): probability}))
-    rules = RuleSet((_semantic("invoice", "INBOX.Invoice"),), "INBOX.Processed")
+    _install_jev(monkeypatch, FakeJev({_semantic_key("invoice"): probability}))
 
     with SemanticRoutingEvaluator() as evaluator:
-        plan = evaluator.plan("INBOX.Archive", _message(), rules)
+        plan = evaluator.plan("INBOX.Archive", _message(), RuleSet((_semantic("invoice", "INBOX.Invoice"),)))
 
     assert plan.rule_results[0].state is EvaluationState.ERROR
     assert plan.destination is None

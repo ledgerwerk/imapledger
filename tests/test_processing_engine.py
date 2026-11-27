@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from imapledger.config import ImapSettings, Settings, SpamSettings
+import pytest
+
+from imapledger.config import ImapSettings, Settings
 from imapledger.mailbox import MailboxItem, MailboxRunMetadata
 from imapledger.message import MailMessage
 from imapledger.processing_engine import ProcessingEngine
 from imapledger.progress_store import ProgressStore, account_identity_key
+from imapledger.routing_actions import RuleAction
 from imapledger.routing_models import EvaluationState, RoutingPlan, RoutingRule, RuleEvaluation, RuleSet, RuleType
 from imapledger.rules import RuleMatch
 
@@ -57,6 +60,8 @@ class _FakeEvaluator:
             winner_rule_id=winner.id if winner is not None else None,
             destination=destination,
             mode=mode,
+            configured_action=winner.action if winner is not None else None,
+            rule_scope=rule_scope,
             rules_fingerprint=self.fingerprint(rules),
             model="fake-model",
             request_id="fake-request",
@@ -72,6 +77,7 @@ class _FakeMailbox:
         self.high_watermark_uid = max(uids, default=0)
         self.moved: list[tuple[int, str]] = []
 
+        self.deleted: list[int] = []
     def metadata(self) -> MailboxRunMetadata:
         return MailboxRunMetadata(uidvalidity=7, uidnext=self.high_watermark_uid + 1)
 
@@ -110,20 +116,29 @@ class _FakeMailbox:
         return SimpleNamespace(moved=(uid,))
 
 
+    def delete_uid(self, uid: int) -> SimpleNamespace:
+        self.uids.remove(uid)
+        self.deleted.append(uid)
+        return SimpleNamespace(deleted=(uid,))
+
 def _settings() -> Settings:
     return Settings(
         imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-        spam=SpamSettings(folders=("Spam",)),
     )
 
 
-def _rules(*, destination: str = "Invoices") -> RuleSet:
+def _rules(
+    *,
+    destination: str | None = "Invoices",
+    action: RuleAction = RuleAction.MOVE,
+) -> RuleSet:
     return RuleSet(
         (
             RoutingRule(
                 id="invoice",
                 enabled=True,
                 type=RuleType.HEADER,
+                action=action,
                 destination=destination,
                 match=RuleMatch(subject="invoice"),
             ),
@@ -149,7 +164,7 @@ def test_preview_repeats_same_uids_without_advancing_progress_then_apply_checkpo
     repeated_preview = engine.run(mailbox, apply=False, limit=2, sort_direction="oldest")
     assert tuple(result.uid for result in preview.messages) == (1, 2)
     assert tuple(result.uid for result in repeated_preview.messages) == (1, 2)
-    assert tuple(result.outcome for result in preview.messages) == ("match", "no_match")
+    assert tuple(result.outcome for result in preview.messages) == ("would_move", "no_match")
     assert preview.run.cursor_uid is None
     assert preview.run.scanned_count == 0
     assert store.results(preview.run.id) == ()
@@ -199,7 +214,7 @@ def test_retry_errors_reuses_run_and_replaces_error_with_confirmed_move(tmp_path
     retried = engine.run(mailbox, apply=True, sort_direction="oldest", retry_errors=True)
 
     assert retried.run.id == first.run.id
-    assert retried.messages[0].outcome == "match"
+    assert retried.messages[0].outcome == "moved"
     assert mailbox.moved == [(1, "Invoices")]
     assert retried.run.status == "completed"
     assert retried.run.error_count == 0
@@ -310,3 +325,81 @@ def test_retry_streams_results_and_stops_safely_between_uids(tmp_path, monkeypat
     assert report.stopped_on_ambiguous_move is False
     assert report.run.status == "active"
     assert store.get_result(report.run.id, 2).error_code == "RuntimeError"
+
+
+
+def test_keep_action_is_counted_as_acted_without_mailbox_mutation(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = set()
+    _FakeEvaluator.matching_uids = {1}
+    engine, store = _engine(monkeypatch, tmp_path, _rules(destination=None, action=RuleAction.KEEP))
+    mailbox = _FakeMailbox((1,), writable=True)
+
+    report = engine.run(mailbox, apply=True, sort_direction="oldest")
+    result = store.get_result(report.run.id, 1)
+
+    assert report.messages[0].outcome == "kept"
+    assert report.messages[0].applied and report.messages[0].confirmed
+    assert mailbox.moved == []
+    assert mailbox.deleted == []
+    assert result.configured_action is RuleAction.KEEP
+    assert (report.run.acted_count, report.run.kept_count, report.run.moved_count) == (1, 1, 0)
+
+
+def test_delete_without_authorization_is_blocked_and_persisted(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = set()
+    _FakeEvaluator.matching_uids = {1}
+    engine, store = _engine(monkeypatch, tmp_path, _rules(destination=None, action=RuleAction.DELETE))
+    mailbox = _FakeMailbox((1,), writable=True)
+
+    report = engine.run(mailbox, apply=True, sort_direction="oldest")
+    result = store.get_result(report.run.id, 1)
+
+    assert report.messages[0].outcome == "blocked"
+    assert report.messages[0].error_code == "DeleteAuthorizationRequired"
+    assert "allow-delete" in report.messages[0].detail
+    assert mailbox.deleted == []
+    assert result.configured_action is RuleAction.DELETE
+    assert result.detail == report.messages[0].detail
+    assert report.run.error_count == 1
+
+
+def test_authorized_delete_records_deleted_outcome_and_counters(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = set()
+    _FakeEvaluator.matching_uids = {1}
+    engine, store = _engine(monkeypatch, tmp_path, _rules(destination=None, action=RuleAction.DELETE))
+    mailbox = _FakeMailbox((1,), writable=True)
+
+    report = engine.run(mailbox, apply=True, allow_delete=True, sort_direction="oldest")
+    result = store.get_result(report.run.id, 1)
+
+    assert report.messages[0].outcome == "deleted"
+    assert report.messages[0].applied and report.messages[0].confirmed
+    assert mailbox.deleted == [1]
+    assert result.configured_action is RuleAction.DELETE
+    assert result.outcome == "deleted"
+    assert (report.run.acted_count, report.run.deleted_count, report.run.moved_count) == (1, 1, 0)
+
+
+def test_delete_preview_never_mutates_and_requires_no_authorization(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = set()
+    _FakeEvaluator.matching_uids = {1}
+    engine, store = _engine(monkeypatch, tmp_path, _rules(destination=None, action=RuleAction.DELETE))
+    mailbox = _FakeMailbox((1,), writable=False)
+
+    report = engine.run(mailbox, apply=False, sort_direction="oldest")
+
+    assert report.messages[0].outcome == "would_delete"
+    assert mailbox.deleted == []
+    assert report.run.scanned_count == 0
+    assert store.results(report.run.id) == ()
+
+
+
+def test_processing_engine_rejects_non_boolean_delete_authorization(tmp_path, monkeypatch) -> None:
+    engine, _ = _engine(monkeypatch, tmp_path, _rules(destination=None, action=RuleAction.DELETE))
+    mailbox = _FakeMailbox((1,), writable=True)
+
+    with pytest.raises(ValueError, match="allow_delete must be a boolean"):
+        engine.run(mailbox, apply=True, allow_delete="yes")
+
+    assert mailbox.deleted == []

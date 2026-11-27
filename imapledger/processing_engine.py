@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from .config import Settings
 from .evidence import MailboxContext
-from .mailbox import MailboxItem, MailboxRunMetadata, PartialMoveError, ProcessingMailbox
+from .mailbox import MailboxItem, MailboxRunMetadata, PartialDeleteError, PartialMoveError, ProcessingMailbox
 from .progress_store import (
     ProgressResumeError,
     ProgressRun,
@@ -14,6 +14,7 @@ from .progress_store import (
     SortDirection,
     account_identity_key,
 )
+from .routing_actions import RuleAction
 from .routing_evaluator import SemanticRoutingEvaluator
 from .routing_models import EvaluationState, RoutingModelError, RoutingPlan, RuleSet
 
@@ -34,6 +35,7 @@ class ProcessedMessage:
     applied: bool = False
     confirmed: bool = False
 
+    detail: str | None = None
 
 @dataclass(frozen=True, slots=True)
 class ProcessingReport:
@@ -65,6 +67,7 @@ class ProcessingEngine:
         mailbox: ProcessingMailbox,
         *,
         apply: bool,
+        allow_delete: bool = False,
         limit: int | None = None,
         rule_scope: str | None = None,
         sort_direction: SortDirection = "newest",
@@ -74,6 +77,8 @@ class ProcessingEngine:
         should_stop: Callable[[], bool] | None = None,
     ) -> ProcessingReport:
         """Process UIDs in order. Result callbacks run on this thread and propagate exceptions."""
+        if not isinstance(allow_delete, bool):
+            raise ValueError("allow_delete must be a boolean")
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
             raise ValueError("message limit must be a positive integer")
         if sort_direction not in {"oldest", "newest"}:
@@ -82,6 +87,8 @@ class ProcessingEngine:
             raise ProcessingError("--new-run cannot be combined with --retry-errors")
         if retry_errors and not apply:
             raise ProcessingError("--retry-errors requires --apply")
+        if allow_delete and not apply:
+            raise ProcessingError("--allow-delete requires apply mode")
 
         folder = mailbox.folder
         mode: RunMode = "single-rule" if rule_scope is not None else "full"
@@ -102,13 +109,7 @@ class ProcessingEngine:
                 mailbox.validate_destination(destination)
 
         evaluator = SemanticRoutingEvaluator(
-            context=MailboxContext(
-                folder_role="mail",
-                already_in_configured_junk_folder=folder in self.settings.spam.folders,
-            ),
-            trusted_authserv_ids=self.settings.spam.trusted_authserv_ids,
-            trusted_provider_headers=self.settings.spam.trusted_provider_headers,
-            spam_policy=self.settings.spam.policy,
+            context=MailboxContext(source_folder=folder),
             config_store_folder=config_store_folder,
         )
         with evaluator:
@@ -119,6 +120,7 @@ class ProcessingEngine:
                     evaluator,
                     fingerprint=fingerprint,
                     mode=mode,
+                    allow_delete=allow_delete,
                     rule_scope=rule_scope,
                     sort_direction=sort_direction,
                     limit=limit,
@@ -143,6 +145,7 @@ class ProcessingEngine:
                 run=run,
                 rule_scope=rule_scope,
                 apply=apply,
+                allow_delete=allow_delete,
                 limit=limit,
                 on_result=on_result,
                 should_stop=should_stop,
@@ -156,6 +159,7 @@ class ProcessingEngine:
         run: ProgressRun,
         rule_scope: str | None,
         apply: bool,
+        allow_delete: bool,
         limit: int | None,
         on_result: Callable[[ProcessedMessage, ProgressRun], None] | None,
         should_stop: Callable[[], bool] | None,
@@ -191,6 +195,7 @@ class ProcessingEngine:
                     run=run,
                     rule_scope=rule_scope,
                     apply=apply,
+                    allow_delete=allow_delete,
                 )
                 messages.append(result)
                 processed += 1
@@ -226,6 +231,7 @@ class ProcessingEngine:
         run: ProgressRun,
         rule_scope: str | None,
         apply: bool,
+        allow_delete: bool,
     ) -> tuple[ProcessedMessage, ProgressRun, bool]:
         uid = item.uid
         if item.message is None:
@@ -236,12 +242,7 @@ class ProcessingEngine:
                 outcome = "error"
                 code = "MessageUnavailable"
             if apply:
-                run = self.progress_store.record_result(
-                    run.id,
-                    uid=uid,
-                    outcome=outcome,
-                    error_code=code,
-                )
+                run = self.progress_store.record_result(run.id, uid=uid, outcome=outcome, error_code=code)
             return ProcessedMessage(uid, outcome, error_code=code), run, False
 
         try:
@@ -276,118 +277,208 @@ class ProcessingEngine:
                     uid=uid,
                     outcome="error",
                     winner_rule_id=None,
-                    destination=None,
+                    error_code="RuleEvaluationError",
                     model=plan.model,
                     request_id=plan.request_id,
-                    error_code="RuleEvaluationError",
                 )
             return ProcessedMessage(uid, "error", plan=plan, error_code="RuleEvaluationError"), run, False
 
-        if plan.destination is None:
-            outcome = "no_match"
+        action = plan.configured_action
+        if plan.winner_rule_id is None or action is None:
             if apply:
                 run = self.progress_store.record_result(
                     run.id,
                     uid=uid,
-                    outcome=outcome,
+                    outcome="no_match",
                     model=plan.model,
                     request_id=plan.request_id,
                 )
-            return ProcessedMessage(uid, outcome, plan=plan), run, False
+            return ProcessedMessage(uid, "no_match", plan=plan), run, False
 
-        if plan.destination == mailbox.folder:
+        if action is RuleAction.KEEP:
             if apply:
                 run = self.progress_store.record_result(
                     run.id,
                     uid=uid,
-                    outcome="already_there",
+                    outcome="kept",
                     winner_rule_id=plan.winner_rule_id,
-                    destination=plan.destination,
+                    configured_action=action,
+                    applied=True,
+                    confirmed=True,
                     model=plan.model,
                     request_id=plan.request_id,
                 )
-            return ProcessedMessage(uid, "already_there", plan=plan, destination=plan.destination), run, False
-
-        outcome = "match"
-        if not apply:
-            return ProcessedMessage(uid, outcome, plan=plan, destination=plan.destination), run, False
-
-        try:
-            moved = mailbox.move_uid(uid, plan.destination)
-        except PartialMoveError:
-            run = self.progress_store.record_result(
-                run.id,
-                uid=uid,
-                outcome="error",
-                winner_rule_id=plan.winner_rule_id,
-                destination=plan.destination,
-                model=plan.model,
-                request_id=plan.request_id,
-                error_code="PartialMoveError",
-            )
             return (
                 ProcessedMessage(
                     uid,
-                    "error",
+                    "kept",
                     plan=plan,
-                    destination=plan.destination,
-                    error_code="PartialMoveError",
-                ),
-                run,
-                True,
-            )
-        except Exception as exc:
-            code = _safe_error_code(exc)
-            run = self.progress_store.record_result(
-                run.id,
-                uid=uid,
-                outcome="error",
-                winner_rule_id=plan.winner_rule_id,
-                destination=plan.destination,
-                model=plan.model,
-                request_id=plan.request_id,
-                error_code=code,
-            )
-            return (
-                ProcessedMessage(
-                    uid,
-                    "error",
-                    plan=plan,
-                    destination=plan.destination,
-                    error_code=code,
+                    applied=apply,
+                    confirmed=apply,
+                    detail="Message kept in place; no mailbox mutation was required.",
                 ),
                 run,
                 False,
             )
 
-        if uid not in moved.moved:
-            run = self.progress_store.record_result(
-                run.id,
-                uid=uid,
-                outcome="error",
-                winner_rule_id=plan.winner_rule_id,
-                destination=plan.destination,
-                model=plan.model,
-                request_id=plan.request_id,
-                error_code="MoveUnconfirmed",
-            )
-            return (
-                ProcessedMessage(
-                    uid,
-                    "error",
-                    plan=plan,
-                    destination=plan.destination,
+        if action is RuleAction.MOVE:
+            destination = plan.destination
+            if destination is None:
+                return self._invalid_plan_result(run, uid, plan, apply)
+            if destination == mailbox.folder:
+                if apply:
+                    run = self.progress_store.record_result(
+                        run.id,
+                        uid=uid,
+                        outcome="already_there",
+                        winner_rule_id=plan.winner_rule_id,
+                        configured_action=action,
+                        destination=destination,
+                        applied=True,
+                        confirmed=True,
+                        model=plan.model,
+                        request_id=plan.request_id,
+                    )
+                return (
+                    ProcessedMessage(
+                        uid,
+                        "already_there",
+                        plan=plan,
+                        destination=destination,
+                        applied=apply,
+                        confirmed=apply,
+                    ),
+                    run,
+                    False,
+                )
+            if not apply:
+                return ProcessedMessage(uid, "would_move", plan=plan, destination=destination), run, False
+            try:
+                moved = mailbox.move_uid(uid, destination)
+            except PartialMoveError:
+                run = self.progress_store.record_result(
+                    run.id,
+                    uid=uid,
+                    outcome="error",
+                    winner_rule_id=plan.winner_rule_id,
+                    configured_action=action,
+                    destination=destination,
+                    model=plan.model,
+                    request_id=plan.request_id,
+                    error_code="PartialMoveError",
+                )
+                return (
+                    ProcessedMessage(uid, "error", plan=plan, destination=destination, error_code="PartialMoveError"),
+                    run,
+                    True,
+                )
+            except Exception as exc:
+                code = _safe_error_code(exc)
+                run = self.progress_store.record_result(
+                    run.id,
+                    uid=uid,
+                    outcome="error",
+                    winner_rule_id=plan.winner_rule_id,
+                    configured_action=action,
+                    destination=destination,
+                    model=plan.model,
+                    request_id=plan.request_id,
+                    error_code=code,
+                )
+                return ProcessedMessage(uid, "error", plan=plan, destination=destination, error_code=code), run, False
+            if uid not in moved.moved:
+                run = self.progress_store.record_result(
+                    run.id,
+                    uid=uid,
+                    outcome="error",
+                    winner_rule_id=plan.winner_rule_id,
+                    configured_action=action,
+                    destination=destination,
+                    model=plan.model,
+                    request_id=plan.request_id,
                     error_code="MoveUnconfirmed",
-                ),
-                run,
-                True,
-            )
+                )
+                return (
+                    ProcessedMessage(uid, "error", plan=plan, destination=destination, error_code="MoveUnconfirmed"),
+                    run,
+                    True,
+                )
+            outcome = "moved"
+        else:
+            if not allow_delete:
+                detail = "DELETE requires explicit --allow-delete authorization; no changes made."
+                if apply:
+                    run = self.progress_store.record_result(
+                        run.id,
+                        uid=uid,
+                        outcome="blocked",
+                        winner_rule_id=plan.winner_rule_id,
+                        configured_action=action,
+                        error_code="DeleteAuthorizationRequired",
+                        detail=detail,
+                        model=plan.model,
+                        request_id=plan.request_id,
+                    )
+                return (
+                    ProcessedMessage(
+                        uid,
+                        "blocked" if apply else "would_delete",
+                        plan=plan,
+                        error_code="DeleteAuthorizationRequired" if apply else None,
+                        detail=detail if apply else None,
+                    ),
+                    run,
+                    False,
+                )
+            if not apply:
+                return ProcessedMessage(uid, "would_delete", plan=plan), run, False
+            try:
+                deleted = mailbox.delete_uid(uid)
+            except PartialDeleteError:
+                run = self.progress_store.record_result(
+                    run.id,
+                    uid=uid,
+                    outcome="error",
+                    winner_rule_id=plan.winner_rule_id,
+                    configured_action=action,
+                    model=plan.model,
+                    request_id=plan.request_id,
+                    error_code="PartialDeleteError",
+                )
+                return ProcessedMessage(uid, "error", plan=plan, error_code="PartialDeleteError"), run, True
+            except Exception as exc:
+                code = _safe_error_code(exc)
+                run = self.progress_store.record_result(
+                    run.id,
+                    uid=uid,
+                    outcome="error",
+                    winner_rule_id=plan.winner_rule_id,
+                    configured_action=action,
+                    model=plan.model,
+                    request_id=plan.request_id,
+                    error_code=code,
+                )
+                return ProcessedMessage(uid, "error", plan=plan, error_code=code), run, False
+            if uid not in deleted.deleted:
+                run = self.progress_store.record_result(
+                    run.id,
+                    uid=uid,
+                    outcome="error",
+                    winner_rule_id=plan.winner_rule_id,
+                    configured_action=action,
+                    model=plan.model,
+                    request_id=plan.request_id,
+                    error_code="DeleteUnconfirmed",
+                )
+                return ProcessedMessage(uid, "error", plan=plan, error_code="DeleteUnconfirmed"), run, True
+            outcome = "deleted"
 
         run = self.progress_store.record_result(
             run.id,
             uid=uid,
             outcome=outcome,
             winner_rule_id=plan.winner_rule_id,
+            configured_action=action,
             destination=plan.destination,
             applied=True,
             confirmed=True,
@@ -407,6 +498,22 @@ class ProcessingEngine:
             False,
         )
 
+    def _invalid_plan_result(
+        self,
+        run: ProgressRun,
+        uid: int,
+        plan: RoutingPlan,
+        apply: bool,
+    ) -> tuple[ProcessedMessage, ProgressRun, bool]:
+        if apply:
+            run = self.progress_store.record_result(
+                run.id,
+                uid=uid,
+                outcome="error",
+                error_code="InvalidRoutingPlan",
+            )
+        return ProcessedMessage(uid, "error", plan=plan, error_code="InvalidRoutingPlan"), run, False
+
     def _retry(
         self,
         mailbox: ProcessingMailbox,
@@ -420,6 +527,7 @@ class ProcessingEngine:
         metadata: MailboxRunMetadata,
         on_result: Callable[[ProcessedMessage, ProgressRun], None] | None,
         should_stop: Callable[[], bool] | None,
+        allow_delete: bool,
     ) -> ProcessingReport:
         candidates = self.progress_store.list_runs(
             account_key=self.account_key,
@@ -471,6 +579,7 @@ class ProcessingEngine:
                 run=run,
                 rule_scope=rule_scope,
                 apply=True,
+                allow_delete=allow_delete,
             )
             messages.append(result)
             if on_result is not None:
@@ -492,7 +601,13 @@ class ProcessingEngine:
         rules = self.rules.enabled_rules(folder)
         if rule_scope is not None:
             rules = tuple(rule for rule in rules if rule.id == rule_scope)
-        return tuple(dict.fromkeys(rule.destination for rule in rules if rule.destination != folder))
+        return tuple(
+            dict.fromkeys(
+                rule.destination
+                for rule in rules
+                if rule.action is RuleAction.MOVE and rule.destination is not None and rule.destination != folder
+            )
+        )
 
 
 def _plan_matches_run(
@@ -508,6 +623,7 @@ def _plan_matches_run(
         plan.folder != folder
         or plan.uid != uid
         or plan.mode != run.mode
+        or plan.rule_scope != rule_scope
         or plan.rules_fingerprint != run.rules_fingerprint
     ):
         return False
@@ -517,17 +633,22 @@ def _plan_matches_run(
     if tuple(result.rule_id for result in plan.rule_results) != tuple(rule.id for rule in candidates):
         return False
     if any(result.state is EvaluationState.ERROR for result in plan.rule_results):
-        return plan.winner_rule_id is None and plan.destination is None
-    if plan.winner_rule_id is not None:
-        winner = next((rule for rule in candidates if rule.id == plan.winner_rule_id), None)
-        first_match = next(
-            (result.rule_id for result in plan.rule_results if result.state is EvaluationState.MATCH),
-            None,
-        )
-        return winner is not None and first_match == winner.id and plan.destination == winner.destination
-    if any(result.state is EvaluationState.MATCH for result in plan.rule_results):
+        return plan.winner_rule_id is None and plan.configured_action is None and plan.destination is None
+
+    first_match = next(
+        (result.rule_id for result in plan.rule_results if result.state is EvaluationState.MATCH),
+        None,
+    )
+    if first_match != plan.winner_rule_id:
         return False
-    return plan.destination is None
+    if plan.winner_rule_id is None:
+        return plan.configured_action is None and plan.destination is None
+    winner = next((rule for rule in candidates if rule.id == plan.winner_rule_id), None)
+    return (
+        winner is not None
+        and winner.action is plan.configured_action
+        and winner.destination == plan.destination
+    )
 
 
 def _safe_error_code(exc: Exception) -> str:

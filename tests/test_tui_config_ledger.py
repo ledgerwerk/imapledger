@@ -6,11 +6,8 @@ from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.widgets import Button, Checkbox, Input, Static
 
-from imapledger.application.legacy_clean import LegacyCleanRequest
 from imapledger.application.operation_registry import OPERATION_SPECS, OperationContext
-from imapledger.cleaner import MessageResult
 from imapledger.config_ledger import ConfigPullPreview, ConfigToolStatus, ConfigToolSummary
-from imapledger.preflight import SourcePreflightResult
 from imapledger.tui.app import MailReviewApp
 from imapledger.tui.command_center import CommandCenterScreen
 from imapledger.tui.config_ledger_screens import (
@@ -19,11 +16,6 @@ from imapledger.tui.config_ledger_screens import (
     ConfigPushConfirmation,
     ConfigPushDialog,
     ConfigPushRequest,
-)
-from imapledger.tui.legacy_clean import (
-    LegacyCleanDialog,
-    LegacyCleanJobScreen,
-    LegacyCleanPreflightScreen,
 )
 
 
@@ -62,99 +54,7 @@ def test_disconnected_tui_opens_global_command_center(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def test_advanced_legacy_clean_is_preview_first_and_lists_its_full_scope() -> None:
-    async def scenario() -> None:
-        app = _ScreenHost()
-        results: list[LegacyCleanRequest | None] = []
-        screen = LegacyCleanDialog(("Spam", "Junk"))
 
-        async with app.run_test() as pilot:
-            app.push_screen(screen, results.append)
-            await pilot.pause()
-            assert not screen.query_one("#legacy-clean-apply", Checkbox).value
-            assert "Spam, Junk" in str(screen.query_one("#legacy-clean-scope", Static).render())
-            await pilot.click("#legacy-clean-review")
-            await pilot.pause()
-
-        assert results == [LegacyCleanRequest()]
-
-    asyncio.run(scenario())
-
-
-def test_legacy_clean_apply_preflight_fails_closed() -> None:
-    async def scenario() -> None:
-        from imapledger.preflight import SourcePreflightResult
-
-        result = SourcePreflightResult(
-            folder="Spam",
-            opened=False,
-            probe=None,
-            capabilities=frozenset(),
-            missing_capabilities=(),
-            destinations=(),
-            errors=(RuntimeError("preflight failed"),),
-        )
-        app = _ScreenHost()
-        screen = LegacyCleanPreflightScreen((result,))
-
-        async with app.run_test() as pilot:
-            app.push_screen(screen)
-            await pilot.pause()
-            assert screen.query_one("#legacy-clean-preflight-continue", Button).disabled
-
-    asyncio.run(scenario())
-
-
-def test_legacy_clean_job_redacts_message_content_and_explains_recheck_failure() -> None:
-    async def scenario() -> None:
-
-        app = _ScreenHost()
-        request = LegacyCleanRequest(apply=True)
-        screen = LegacyCleanJobScreen(request, ("Spam",))
-        row = MessageResult(
-            uid=42,
-            subject="private subject",
-            sender="private@example.org",
-            verdict=None,
-            signals=None,
-            reasons=(),
-            status="keep",
-            inclination="KEEP",
-        )
-        failed_preflight = SourcePreflightResult(
-            folder="Spam",
-            opened=True,
-            probe=None,
-            capabilities=frozenset(),
-            missing_capabilities=(),
-            destinations=(),
-            errors=(),
-            state_persistence_required=True,
-            keyword_persistence="unsupported",
-            unsupported_keywords=("imapledger-v1-spam",),
-        )
-
-        error = ""
-        async with app.run_test() as pilot:
-            app.push_screen(screen)
-            await pilot.pause()
-            screen.append_result("Spam", row, 1, 1)
-            screen.finish(
-                report_count=1,
-                failure=RuntimeError("private exception payload"),
-                preflight_results=(failed_preflight,),
-            )
-            await pilot.pause()
-            error = str(screen.query_one("#legacy-clean-job-error", Static).render())
-
-        assert "private subject" not in " ".join(screen._rows[0])
-        assert "private@example.org" not in " ".join(screen._rows[0])
-        assert "no classification or mutation started" in error
-        assert "Spam" in error
-        assert "unsupported" in error
-        assert "private exception payload" not in error
-
-    asyncio.run(scenario())
 
 
 def test_config_ledger_conflict_keeps_version_history_available() -> None:

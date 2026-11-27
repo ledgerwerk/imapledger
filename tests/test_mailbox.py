@@ -4,7 +4,6 @@ from email.parser import BytesHeaderParser
 
 import pytest
 
-from imapledger.classification_state import SpamOutcome, all_state_keywords, keyword_for_outcome
 from imapledger.mailbox import (
     BrowserMailbox,
     DeleteResult,
@@ -494,7 +493,7 @@ def test_fetch_uid_reads_only_requested_uid_and_uses_body_peek() -> None:
     assert client.added == []
 
 
-def test_browser_mailbox_exact_open_avoids_full_snapshot_and_fetches_flags_with_size() -> None:
+def test_browser_mailbox_exact_open_avoids_full_snapshot_and_fetches_size() -> None:
     client = FakeClient(uids=range(1, 100_001))
     browser = BrowserMailbox(
         host="imap.example.org",
@@ -508,12 +507,12 @@ def test_browser_mailbox_exact_open_avoids_full_snapshot_and_fetches_flags_with_
     )
 
     with browser:
-        item, state = browser.fetch_uid(10)
+        item = browser.fetch_uid(10)
 
     assert item.message is not None
-    assert state is not None and state.outcome is None
+    assert item.uid == 10
     assert "ALL" not in client.searches
-    assert client.fetches[0] == ((10,), ("RFC822.SIZE", "FLAGS"))
+    assert client.fetches[0] == ((10,), ("RFC822.SIZE",))
     assert client.fetches[1] == ((10,), ("BODY.PEEK[]",))
     assert client.selected == [("Spam", True)]
 
@@ -911,7 +910,7 @@ def test_streaming_move_requires_writable_scope_and_capability():
 def test_streaming_delete_requires_explicit_allow_and_uidplus():
     disallowed_client = FakeClient()
     with make_mailbox(disallowed_client, writable=True, allow_delete=False) as mailbox:
-        with pytest.raises(UnsafeMailboxOperation, match="not allowed"):
+        with pytest.raises(UnsafeMailboxOperation, match="explicit authorization"):
             mailbox.delete_uid(10)
 
     client = FakeClient()
@@ -1368,7 +1367,7 @@ def test_destination_existence_is_allow_listed_and_read_only() -> None:
 def test_delete_requires_explicit_allow_delete() -> None:
     client = FakeClient()
     with make_mailbox(client, writable=True, allow_delete=False) as mailbox:
-        with pytest.raises(UnsafeMailboxOperation, match="not allowed"):
+        with pytest.raises(UnsafeMailboxOperation, match="explicit authorization"):
             mailbox.delete_uids([10])
     assert client.expunged == []
 
@@ -1623,199 +1622,18 @@ def test_folder_info_rejects_invalid_counts(total, unread):
         FolderInfo(name="Spam", delimiter=None, flags=frozenset(), total=total, unread=unread)
 
 
-@pytest.mark.parametrize(
-    ("permanent_flags", "expected"),
-    [
-        ((b"\\*",), True),
-        (("imapledger-v1-review",), True),
-        (None, False),
-        (42, False),
-    ],
-)
-def test_snapshot_normalizes_permanent_flags_and_detects_keyword_support(permanent_flags, expected) -> None:
-    client = FakeClient(permanent_flags=permanent_flags)
-    with make_mailbox(client, writable=False) as mailbox:
-        snapshot = mailbox.snapshot()
-
-    assert snapshot.supports_persistent_keyword("imapledger-v1-review") is expected
-    if permanent_flags == ("imapledger-v1-review",):
-        assert snapshot.permanent_flags == frozenset({b"IMAPLEDGER-V1-REVIEW"})
-
-
-def test_apply_precheck_requires_persistent_support_for_every_state_keyword() -> None:
-    supported_client = FakeClient(permanent_flags=(b"\\*",))
-    with make_mailbox(supported_client, writable=True) as mailbox:
-        mailbox.require_persistent_classification_state()
-
-    unsupported_client = FakeClient(permanent_flags=(b"imapledger-v1-spam",))
-    with make_mailbox(unsupported_client, writable=True) as mailbox:
-        with pytest.raises(ImapOperationError) as raised:
-            mailbox.require_persistent_classification_state()
-
-    assert raised.value.operation == "imap_keyword_unsupported"
-    assert "imapledger-v1-notspam" in (raised.value.selector or "")
-    assert supported_client.added == unsupported_client.added == []
-
-
-def test_exact_permanent_keyword_support_does_not_require_wildcard() -> None:
-    client = FakeClient(permanent_flags=(b"imapledger-v1-notspam",))
-    with make_mailbox(client, writable=True) as mailbox:
-        mailbox.add_keyword(10, "imapledger-v1-notspam")
-
-    assert client.added == [((10,), ("imapledger-v1-notspam",), True)]
-
-
-def test_unsupported_keyword_is_rejected_before_store() -> None:
-    client = FakeClient(permanent_flags=(b"\\Seen",))
-    with make_mailbox(client, writable=True) as mailbox:
-        with pytest.raises(ImapOperationError) as raised:
-            mailbox.add_keyword(10, "imapledger-v1-spam")
-
-    assert raised.value.operation == "imap_keyword_unsupported"
-    assert client.added == []
-
-
-def test_keyword_store_is_exact_uid_scoped_and_reselects_source_read_write() -> None:
-    client = FakeClient(uids=[10, 20])
-    with make_mailbox(client, writable=True) as mailbox:
-        mailbox.add_keyword(10, "imapledger-v1-spam")
-
-    assert client.selected[-1] == ("Spam", False)
-    assert client.added == [((10,), ("imapledger-v1-spam",), True)]
-    assert client.flags[10] == {b"imapledger-v1-spam"}
-    assert client.flags.get(20, set()) == set()
-    assert client.searches[-1] == ["UID", 10]
-
-
-def test_keyword_mutation_rejects_uid_outside_initial_snapshot() -> None:
-    client = FakeClient(uids=[10])
-    with make_mailbox(client, writable=True) as mailbox:
-        with pytest.raises(UnsafeMailboxOperation, match="outside initial"):
-            mailbox.add_keyword(20, "imapledger-v1-spam")
-
-    assert client.added == []
-
-
-def test_keyword_mutation_rejects_disappeared_uid() -> None:
-    client = FakeClient(uids=[10])
-    with make_mailbox(client, writable=True) as mailbox:
-        client.uids.clear()
-        with pytest.raises(UnsafeMailboxOperation, match="no longer exists"):
-            mailbox.add_keyword(10, "imapledger-v1-spam")
-
-    assert client.added == []
-
-
-def test_keyword_store_requires_verified_resulting_flags() -> None:
-    client = FakeClient()
-    client.ignore_flag_store = True
-    with make_mailbox(client, writable=True) as mailbox:
-        with pytest.raises(ImapOperationError) as raised:
-            mailbox.add_keyword(10, "imapledger-v1-review")
-
-    assert raised.value.operation == "imap_verify_keyword"
-
-
-def test_conflicting_existing_state_is_reported_without_store() -> None:
-    client = FakeClient(
-        flags={10: {b"imapledger-v1-review", b"imapledger-v1-notspam"}},
-    )
-    with make_mailbox(client, writable=True) as mailbox:
-        with pytest.raises(ImapOperationError) as raised:
-            mailbox.add_keyword(10, "imapledger-v1-spam")
-
-    assert raised.value.operation == "imap_state_conflict"
-    assert client.added == []
-
-
-def test_add_keyword_refuses_to_replace_a_single_existing_state() -> None:
-    client = FakeClient(flags={10: {b"imapledger-v1-spam"}})
-    with make_mailbox(client, writable=True) as mailbox:
-        with pytest.raises(ImapOperationError) as raised:
-            mailbox.add_keyword(10, "imapledger-v1-review")
-
-    assert raised.value.operation == "imap_state_conflict"
-    assert client.added == []
-
-
-def test_set_classification_keyword_adds_before_removing_peer_states() -> None:
-    client = FakeClient(flags={10: {b"imapledger-v1-spam"}})
-    target = keyword_for_outcome(SpamOutcome.REVIEW)
-    peers = tuple(keyword for keyword in all_state_keywords() if keyword != target)
-    with make_mailbox(client, writable=True) as mailbox:
-        mailbox.set_classification_keyword(10, keyword=target, peer_keywords=peers)
-
-    assert client.added[0] == ((10,), (target,), True)
-    assert client.removed == [((10,), (peers[0],), True), ((10,), (peers[1],), True)]
-    assert client.flags[10] == {target.encode()}
-
-
-def test_unclassified_search_filters_markers_before_candidate_pagination() -> None:
-    uids = list(range(1, 16))
-    client = FakeClient(
-        uids=uids,
-        flags={uid: {b"imapledger-v1-review"} for uid in range(11, 16)},
-    )
-    with make_mailbox(client, writable=False) as mailbox:
-        candidates = mailbox.candidate_uids(excluded_keywords=all_state_keywords())
-
-    selected = sorted(candidates, reverse=True)[:10]
-    assert selected == list(range(10, 0, -1))
-    assert client.searches[-1] == [
-        "UNKEYWORD",
-        "imapledger-v1-spam",
-        "UNKEYWORD",
-        "imapledger-v1-notspam",
-        "UNKEYWORD",
-        "imapledger-v1-review",
-    ]
-
-
-def test_excluded_keywords_are_applied_before_message_selection_and_fetch() -> None:
-    client = FakeClient(
-        uids=list(range(1, 16)),
-        flags={uid: {b"imapledger-v1-review"} for uid in range(11, 16)},
-    )
-    selection = MessageSelection(limit=10, excluded_keywords=all_state_keywords())
-    with make_mailbox(client, writable=False) as mailbox:
-        assert mailbox.selected_count(selection) == 10
-        items = list(mailbox.iter_messages(selection))
-
-    assert [item.uid for item in items] == list(range(10, 0, -1))
-    assert [messages for messages, selector in client.fetches if selector == ("RFC822.SIZE",)] == [
-        tuple(range(10, 0, -1))
-    ]
-
-
-def test_flag_inspection_does_not_mutate_seen_and_headers_use_peek_subset() -> None:
+def test_header_fetch_does_not_mutate_seen_and_uses_peek_subset() -> None:
     client = FakeClient(flags={10: {b"\\Seen"}})
     with make_mailbox(client, writable=False) as mailbox:
-        flags = mailbox.get_flags(10)
         message = mailbox.fetch_headers(10)
 
-    assert flags == frozenset({b"\\Seen"})
     assert message is not None
     assert message.subject == "Buy now"
     assert message.body == ""
     assert client.flags[10] == {b"\\Seen"}
-    assert ((10,), ("FLAGS",)) in client.fetches
     assert client.fetches[-1] == ((10,), ("BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]",))
 
 
-def test_state_store_never_touches_another_configured_folder() -> None:
-    client = FolderAwareFakeClient(
-        {
-            "Spam": {10: _folder_raw_message("spam", "sender@example.org")},
-            "Other": {20: _folder_raw_message("other", "other@example.org")},
-        },
-        flags={"Other": {20: {b"imapledger-v1-review"}}},
-    )
-    with make_mailbox(client, writable=True, folder="Spam") as mailbox:
-        mailbox.add_keyword(10, "imapledger-v1-spam")
-
-    assert client.flags["Spam"][10] == {b"imapledger-v1-spam"}
-    assert client.flags["Other"][20] == {b"imapledger-v1-review"}
-    assert all(folder == "Spam" for folder, _ in client.selected)
 
 
 class SummaryFakeClient(FakeClient):
@@ -1844,20 +1662,6 @@ class SummaryFakeClient(FakeClient):
         }
 
 
-def test_fetch_summaries_batches_preserves_requested_order_and_reads_state() -> None:
-    client = SummaryFakeClient(uids=[10, 20], flags={20: {b"imapledger-v1-review"}})
-    with make_mailbox(client, writable=False, fetch_batch_size=1) as mailbox:
-        summaries = mailbox.fetch_summaries((20, 10))
-
-    assert [summary.uid for summary in summaries] == [20, 10]
-    assert summaries[0].sender == "Sender <sender@example.org>"
-    assert summaries[0].subject == "Page row"
-    assert summaries[0].size_bytes == 200
-    assert summaries[0].persisted_state is SpamOutcome.REVIEW
-    assert summaries[1].persisted_state is None
-    assert [call[0] for call in client.fetches if call[1] != ("UID",)] == [(20,), (10,)]
-    assert all("BODY.PEEK[HEADER.FIELDS" in call[1][0] for call in client.fetches if call[1] != ("UID",))
-    assert client.selected[0] == ("Spam", True)
 
 
 def test_fetch_summaries_marks_vanished_uid_and_rejects_uid_outside_snapshot() -> None:

@@ -1,109 +1,135 @@
 # Unified routing rules
 
-`rules.toml` uses schema 3 and defines one ordered routing system for batch runs, single-message evaluation, and learning. The first enabled rule that matches wins. Each rule owns an explicit destination. A model can provide evidence for a semantic decision, but cannot choose a folder or perform an IMAP action.
+`rules.toml` uses schema 4 for batch runs, exact-message evaluation, and learning. It is the only user-facing mail automation configuration. Rules run in file order, and the first enabled matching rule wins. If no rule matches, mail remains in its current folder.
 
-Rules apply to every selectable mail folder by default. `source_folders` is optional and restricts a rule when a narrower scope is needed or preserved from migration. Config Ledger is excluded as a routing source and destination.
+Rules apply to all selectable source folders by default. Set `source_folders` to restrict one rule. Config Ledger is excluded from routing sources and destinations. Rule IDs are ordinary identifiers: `id = "spam"` has no reserved behavior and can be edited, reordered, disabled, or removed. An absent or empty rules file creates no rule and performs no automatic action.
 
-## Rule types and matching
+## Rule types and actions
 
-| Type       | Behavior                                                                                                                                                       |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `spam`     | The built-in Spam rule matches only when the spam policy returns SPAM. NOT_SPAM and REVIEW continue to later rules.                                            |
-| `semantic` | A matching `match_any` matcher gives a deterministic match. Otherwise the semantic evaluator compares the message with the required description and threshold. |
-| `header`   | Matches deterministic message-header fields without a model call. At least one matcher is required.                                                            |
+| Type | Behavior |
+| --- | --- |
+| `semantic` | Match a description using the semantic evaluator and optional `match_at` threshold. Safe deterministic matchers can also be attached. |
+| `header` | Match deterministic message-header fields without a model call. At least one matcher is required. |
+| `recipe` | Use a named evaluator from the shared recipe catalog, optionally with recipe-specific options. |
 
-`match_any` is OR across matcher tables. Fields within one matcher are AND. Supported fields include `from_address`, `from_domain`, `return_path`, `return_path_domain`, `list_id`, `auto_submitted`, `subject`, and `subject_prefix`. Values are normalized where appropriate; subject comparisons are case-insensitive. There are no regular expressions or message-authored actions.
+A rule action is one of:
 
-A semantic rule can combine deterministic learning with semantic matching. If any learned matcher matches, the rule matches without an unnecessary model request. Otherwise its description is evaluated at `match_at`, or `rules.default_match_at` when no per-rule threshold is set. The default threshold is `0.90`.
+- `move` requires an existing `destination` mailbox.
+- `keep` terminates evaluation and leaves the message in its current folder.
+- `delete` permanently removes the message only after explicit apply-time authorization.
 
-The built-in Spam identity uses ID `spam` and type `spam`. Its destination and enabled state can be configured, but the rule cannot be repurposed as another type or removed. Presets create common semantic rules; they do not invent destinations.
+No action or destination is inferred from the rule ID. The model can provide evidence for matching, but cannot choose an action or destination or perform an IMAP operation.
 
-## No match and same-folder behavior
+`match_any` is OR across matcher tables. Fields within one matcher are AND. Supported matcher fields include `from_address`, `from_domain`, `return_path`, `return_path_domain`, `list_id`, `auto_submitted`, `subject`, and `subject_prefix`. Values are normalized where appropriate, and subject comparisons are case-insensitive. There are no regular expressions or message-authored actions.
 
-No fallback is required. If no rule matches, the message stays in its current folder. If the winning rule's destination is already the source folder, the result is ALREADY THERE and no MOVE is issued. Evaluation and preview do not mutate mail. Model or validation errors fail closed.
+Semantic rules can combine `match_any` with a required description. If a deterministic matcher matches, it can match without an unnecessary model request. Otherwise the semantic evaluator uses `match_at`, or `rules.default_match_at` when `match_at` is omitted. The default threshold is `0.90`.
 
-Schema-2 `fallback_destination` values are deprecated and ignored by schema 3. Migration reports that unmatched mail will stay in place. Do not recreate a fallback as an implicit catch-all rule.
+## Recipe catalog and Spam / scam
 
-## Configuration format
+The same searchable, category-filtered recipe catalog is used by the CLI and TUI:
 
-The default file is `$XDG_CONFIG_HOME/imapledger/rules.toml`, or `~/.config/imapledger/rules.toml` when `XDG_CONFIG_HOME` is unset. A custom `--config PATH` uses the sibling `rules.toml`.
+```bash
+imapledger rule recipe list
+imapledger rule recipe list --category Safety
+imapledger rule recipe list --search spam
+imapledger rule recipe show spam
+imapledger rule recipe add spam --id spam --destination INBOX.Junk
+```
+
+Recipes materialize ordinary ordered rules. The recipe ID (`spam`) identifies the evaluator; the rule ID is a user-selected identifier with no special meaning. No Spam rule is created automatically. The Spam / scam recipe is a conservative multi-signal detector, not a single semantic question. It combines unsolicited-bulk, phishing/scam, identity-deception, legitimate/expected, and safe-automation signals with trusted authentication and provider evidence. Strong legitimate evidence vetoes a match. Phishing can match at high confidence; identity deception, bulk mail, and provider evidence need corroboration. Uncertain evidence is a non-match, so later rules can run. Provider or subject markers alone do not match.
+
+The recipe exposes threshold options including `legitimate_veto_at`, `phishing_match_at`, `identity_deception_at`, `unsolicited_bulk_at`, `action_safe_at`, and `provider_junk_support_at`. Defaults are conservative. Use `rule recipe show spam` to inspect the option descriptions and defaults. A recipe match uses the configured rule action, like any other match.
+
+## Schema-4 example
+
+The default rules file is `$XDG_CONFIG_HOME/imapledger/rules.toml`, or `~/.config/imapledger/rules.toml` when `XDG_CONFIG_HOME` is unset. A custom `--config PATH` uses the sibling `rules.toml`.
 
 ```toml
 [rules]
-schema = 3
+schema = 4
 default_match_at = 0.90
+
+[rules.evidence]
+trusted_authserv_ids = ["mx.example.org"]
+trusted_provider_headers = ["X-Verified-Junk"]
 
 [[rules.rule]]
 id = "spam"
 enabled = true
-type = "spam"
-destination = "INBOX.Trash"
+type = "recipe"
+recipe = "spam"
+action = "move"
+destination = "INBOX.Junk"
+source_folders = ["INBOX"]
 
-[[rules.rule]]
-id = "newsletters"
-enabled = true
-type = "semantic"
-description = "Recurring mailing-list newsletters. Exclude account alerts and transactional receipts."
-match_at = 0.93
-destination = "INBOX.Newsletters"
-match_any = [
-  { list_id = "weekly.example.com" },
-  { from_address = "newsletter@example.org" },
-]
+[rules.rule.options]
+legitimate_veto_at = 0.80
+phishing_match_at = 0.90
 
 [[rules.rule]]
 id = "delivery-status"
 enabled = true
 type = "header"
+action = "move"
 destination = "INBOX.System"
-match_any = [{ from_address = "mailer-daemon@example.org", auto_submitted = "auto-replied" }]
+match_any = [{ from_address = "mailer-daemon@example.org" }]
+
+[[rules.rule]]
+id = "receipts"
+enabled = true
+type = "semantic"
+action = "keep"
+description = "Purchase receipts and order confirmations"
+match_at = 0.93
 ```
 
-Rules are evaluated in file order, from highest to lowest priority. `source_folders` is omitted for global scope. A semantic rule requires a description; a header rule requires at least one matcher; `match_at` is valid only for semantic rules. Destinations must already exist, cannot equal the source folder, and cannot be the Config Ledger folder.
+Only add trusted evidence identifiers after verifying that the named receiver or provider inserts them. Authentication results and headers are otherwise untrusted message evidence. Source and destination mailbox names are exact and server-specific. imapledger does not create folders. MOVE requires server support; no COPY and EXPUNGE fallback is used.
 
-## Rule management and exact-message evaluation
+## Manage and evaluate rules
 
 ```bash
 imapledger rule list
-imapledger rule show newsletters
-imapledger rule add receipts --type semantic --destination INBOX.Receipts \
-  --description "Purchase receipts and order confirmations"
-imapledger rule test newsletters --folder INBOX --uid 43724
+imapledger rule show spam
+imapledger rule add receipts --type semantic --action move \
+  --destination INBOX.Receipts --description "Purchase receipts and order confirmations"
+imapledger rule edit receipts --match from_domain=shop.example.org
+imapledger rule move receipts up
+imapledger rule test receipts --folder INBOX --uid 43724
 imapledger rule evaluate --folder INBOX --uid 43724
-imapledger rule learn newsletters --folder INBOX --uid 43724 --preview
+imapledger rule learn receipts --folder INBOX --uid 43724 --preview
+imapledger rule remove receipts
 ```
 
-`rule add` creates a global rule unless `--source-folder` is supplied. Repeat `--match field=value` to add OR alternatives. `rule test` evaluates one selected rule; `rule evaluate` evaluates the full rule order. Both are read-only and name an exact folder and UID.
+`rule add` creates a global rule unless `--source-folder` is supplied. Repeat `--match field=value` to add OR alternatives. `rule test` evaluates one rule; `rule evaluate` evaluates the ordered rule set. Both name one exact folder and UID and are read-only. Learning can add one safe deterministic matcher to an existing semantic rule after fit, safety, duplicate, conflict, and stale-fingerprint checks. It changes the rules file only and never moves the example message.
 
-Learning strengthens an existing semantic rule with one safe deterministic matcher. It assesses fit and generalization safety, checks duplicates and higher-priority conflicts, and requires an unchanged rules fingerprint before save. It adds only the matcher to the existing rule. Learning never moves the example message.
-
-## Preview and apply
+## Preview, apply, and deletion safety
 
 ```bash
 imapledger rule preview INBOX --limit 10 --sort oldest
 imapledger rule preview --all-folders --limit 10
 imapledger rule apply INBOX --limit 10
-imapledger rule apply INBOX --rule newsletters --retry-errors
-imapledger rule apply --all-folders --limit 10 --yes
+imapledger rule apply --all-folders --limit 10
+# Only when you intentionally configured a matching Delete action:
+imapledger rule apply INBOX --allow-delete
 ```
 
-Preview is read-only. Apply performs destination and source preflight and asks for confirmation unless `--yes` is supplied. A rule-scoped run evaluates only the named rule. `--new-run` supersedes active progress; `--retry-errors` is apply-only and uses the matching run's rules, scope, UIDVALIDITY, and ordering. All-folder runs omit non-selectable folders and Config Ledger.
+Preview is read-only. Apply performs source and destination preflight and asks for confirmation unless `--yes` is supplied. A Delete action has a separate authorization gate: explicitly pass `--allow-delete`. `--yes` skips only the confirmation prompt and does not authorize deletion. Apply executes the plan for exact UIDs after checking the rules fingerprint, UIDVALIDITY, source membership, and configured action. A destination equal to the source is recorded as already there without a MOVE. Preflight is best-effort rather than transactional. Confirmed earlier actions are not rolled back if a later message fails; ambiguous MOVE results stop for reconciliation.
 
-Each action is tied to the exact folder, UID, UIDVALIDITY, current rule fingerprint, and configured destination. IMAP MOVE uses exact UIDs. Preflight is best-effort rather than transactional; confirmed earlier moves are not rolled back if a later message fails. Ambiguous MOVE results stop for reconciliation.
+`--rule ID` limits evaluation to one enabled rule. `--new-run` supersedes active progress, and apply-only `--retry-errors` uses the matching run identity and scope. All-folder runs skip non-selectable folders and Config Ledger. `clean FOLDER` is a deprecated alias for preview/apply on one folder.
 
-`clean FOLDER` remains a deprecated compatibility alias for `rule preview FOLDER` or `rule apply FOLDER`. It uses the same rule-run operation. There is no bare-folderless Clean workflow.
+## Explicit migration
 
-## Migration
-
-Schema-1 and schema-2 files require explicit migration:
+Schema-1, schema-2, and schema-3 rules files require explicit conversion:
 
 ```bash
 imapledger rule migrate --preview
 imapledger rule migrate --apply
 ```
 
-Schema-1 MOVE rules become header rules while retaining their matchers and source scopes. Schema-2 `match` becomes a one-item `match_any`; fallback destinations are dropped with a warning because unmatched mail is kept in place. Valid legacy Spam MOVE configuration can populate the built-in Spam rule. Migration does not invent a destination or convert an unsafe action. Review the preview and its warnings before applying.
+The preview reports the source schema, converted rules, and warnings without writing. Schema-2 fallback destinations are dropped because unmatched mail now stays in place. Older Spam rule types become ordinary recipe rules. If migration would create any Delete rule, `--apply` also requires `--allow-delete`. Applying a rules-only migration writes schema 4 to `rules.toml`.
+
+Legacy `[spam]` configuration is also migration-only. Normal configuration loading rejects it with guidance to run `rule migrate`. When an old Spam action is configured, migration can transfer its destination, source folders, thresholds, and trusted evidence to a regular Spam recipe rule. It does not create a Spam rule if no old Spam action was configured. Legacy `not_spam` and `review` actions are not migrated automatically; create separate rules if that behavior is still wanted. Review preview warnings carefully. If the migration includes a Delete action, the configuration migration also requires `--allow-delete` to apply. See [configuration](configuration.md) for details.
 
 ## TUI workbench
 
-Run `imapledger ui` and press `R` for the unified Rules workbench. It includes Spam, rule ordering, presets, editing, read-only tests, and migration. Select a message and press `c` to evaluate the current rules. Press `e` to explain that existing evaluation without running it again. `a` opens confirmation for the displayed MOVE plan; `l` starts preview-first learning for an existing semantic rule. See [Interactive console](ui.md).
+Run `imapledger ui` and press `R` to open the Rules workbench. An empty ruleset explains that no automatic actions are configured. The workbench supports searchable, category-filtered recipe discovery, rule scope and action editing, advanced recipe options, TOML preview, ordering, enable/disable, read-only tests, full-pipeline evaluation, explicit rules migration, and confirmed rule removal. Delete actions remain subject to separate authorization when applying. See [Interactive console](ui.md).

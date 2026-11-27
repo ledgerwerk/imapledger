@@ -160,7 +160,7 @@ def test_malformed_and_idn_headers_are_parsed_without_losing_unicode_name() -> N
     assert message.body == "hello"
 
 
-def test_legacy_message_state_does_not_expose_uid() -> None:
+def test_message_state_does_not_expose_uid() -> None:
     message = parse_message(26, b"From: sender@example.org\n\nbody", max_body_chars=100)
 
     assert "uid" not in message.as_state()

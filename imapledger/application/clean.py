@@ -8,6 +8,7 @@ from ..config import Settings
 from ..mailbox import MailboxError, ProcessingMailbox
 from ..processing_engine import ProcessedMessage, ProcessingEngine, ProcessingReport
 from ..progress_store import ProgressRun, ProgressStore, SortDirection, default_progress_path
+from ..routing_actions import RuleAction
 from ..routing_models import RoutingModelError, RuleSet
 
 
@@ -21,6 +22,7 @@ class CleanRequest:
     new_run: bool = False
     retry_errors: bool = False
     progress_db: Path = field(default_factory=default_progress_path)
+    allow_delete: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.folder, str) or not self.folder.strip():
@@ -29,6 +31,13 @@ class CleanRequest:
             raise ValueError("source folder must not have leading or trailing whitespace")
         if not isinstance(self.apply, bool):
             raise ValueError("apply must be a boolean")
+        if not isinstance(self.allow_delete, bool):
+            raise ValueError("allow_delete must be a boolean")
+        if self.allow_delete and not self.apply:
+            raise ValueError("--allow-delete requires apply mode")
+        if self.limit is not None and (
+            isinstance(self.limit, bool) or not isinstance(self.limit, int) or self.limit < 1
+        ):
             raise ValueError("message limit must be a positive integer")
         if self.sort not in {"oldest", "newest"}:
             raise ValueError("sort direction must be oldest or newest")
@@ -47,6 +56,7 @@ class CleanPreflight:
     destinations: tuple[str, ...]
     rule_scope: str | None
 
+    requires_delete: bool = False
 
 @dataclass(frozen=True, slots=True)
 class CleanResult:
@@ -83,12 +93,18 @@ class CleanOperation:
             if not selected_rules:
                 raise ValueError(f"enabled rule not found for source {request.folder}: {request.rule_scope}")
 
-        destinations = [rule.destination for rule in selected_rules if rule.destination != request.folder]
+        destinations = [
+            rule.destination
+            for rule in selected_rules
+            if rule.action is RuleAction.MOVE and rule.destination is not None and rule.destination != request.folder
+        ]
+        requires_delete = any(rule.action is RuleAction.DELETE for rule in selected_rules)
         return CleanPreflight(
             folder=request.folder,
             mode="single-rule" if request.rule_scope is not None else "full",
             destinations=tuple(dict.fromkeys(destinations)),
             rule_scope=request.rule_scope,
+            requires_delete=requires_delete,
         )
 
     def run(
@@ -111,8 +127,9 @@ class CleanOperation:
                 folder=request.folder,
                 writable=request.apply,
                 allowed_destinations=preflight.destinations,
-                max_message_bytes=self._settings.spam.max_message_bytes,
-                max_body_chars=self._settings.spam.max_body_chars,
+                allow_delete=request.apply and request.allow_delete,
+                max_message_bytes=self._settings.mail.max_message_bytes,
+                max_body_chars=self._settings.mail.max_body_chars,
                 event_callback=event_callback,
             ) as mailbox:
                 report = ProcessingEngine(
@@ -122,6 +139,7 @@ class CleanOperation:
                 ).run(
                     mailbox,
                     apply=request.apply,
+                    allow_delete=request.allow_delete,
                     limit=request.limit,
                     rule_scope=request.rule_scope,
                     sort_direction=request.sort,

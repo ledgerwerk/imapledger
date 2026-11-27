@@ -5,16 +5,13 @@ from types import SimpleNamespace
 import pytest
 
 from imapledger.application.clean import CleanOperation, CleanRequest
-from imapledger.config import ImapSettings, Settings, SpamSettings
+from imapledger.config import ImapSettings, Settings
 from imapledger.routing_models import RoutingRule, RuleSet, RuleType
 from imapledger.rules import RuleMatch
 
 
 def _settings() -> Settings:
-    return Settings(
-        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-        spam=SpamSettings(folders=()),
-    )
+    return Settings(imap=ImapSettings(host="imap.example.org", username="user@example.org"))
 
 
 def _rules() -> RuleSet:
@@ -114,6 +111,7 @@ def test_clean_operation_passes_request_and_reports_touched_folders(monkeypatch,
         "retry_errors": False,
         "on_result": None,
         "should_stop": None,
+        "allow_delete": False,
     }
 
 

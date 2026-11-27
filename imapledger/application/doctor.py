@@ -14,7 +14,6 @@ class DoctorRequest:
     folder: str
     destinations: tuple[str, ...] = ()
     requires_delete: bool = False
-    require_state_persistence: bool = False
     deep_probe: bool = True
 
 
@@ -38,7 +37,6 @@ class DoctorOperation:
             password=password,
             destinations=request.destinations,
             requires_delete=request.requires_delete,
-            require_state_persistence=request.require_state_persistence,
             deep_probe=request.deep_probe,
             mailbox_factory=self._mailbox_factory,
             event_callback=event_callback,

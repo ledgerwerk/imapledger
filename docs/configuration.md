@@ -1,6 +1,6 @@
 # Configuration
 
-The default configuration path is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset. The unified schema-3 rules file is named `rules.toml` beside the selected config file. The IMAP password is never written to configuration. If `[imap.auth]` is omitted, credential resolution uses hidden prompt authentication. Rule preview, apply, and exact-message operations resolve credentials once per invocation; rule management and migration previews are local operations.
+The default configuration path is `$XDG_CONFIG_HOME/imapledger/config.toml`, or `~/.config/imapledger/config.toml` when `XDG_CONFIG_HOME` is unset. The unified schema-4 rules file is named `rules.toml` beside the selected config file. The IMAP password is never written to configuration. If `[imap.auth]` is omitted, credential resolution uses hidden prompt authentication. Rule preview, apply, and exact-message operations resolve credentials once per invocation; rule management and migration previews are local operations.
 
 ## IMAP credential sources
 
@@ -121,9 +121,7 @@ A missing or unavailable credential in an explicitly selected keyring or vault i
 
 ## Configuration ledger
 
-The optional `[config_store]` section selects an existing IMAP folder for append-only configuration snapshots. Config-ledger commands load only `[imap]` and `[config_store]`, so they do not require `[spam]`. The configured store folder cannot be a rule source or move destination. `imapledger config show` remains an inspection of the effective local application configuration and never connects to IMAP. See the [configuration ledger guide](config-store.md) for setup, commands, history, secret handling, and retention limits.
-
-Example:
+The optional `[config_store]` section selects an existing IMAP folder for append-only configuration snapshots. The store is separate from local imapledger settings and ordered mail rules. `config show` is local-only and never connects to IMAP. Without `[config_store]`, `config list` reports that the store is disabled, while remote-store commands report an actionable configuration error. Snapshots are readable email, not encrypted secret storage. See the [configuration ledger guide](config-store.md).
 
 ```toml
 [config_store]
@@ -131,163 +129,67 @@ folder = "INBOX.imapledger.Config"
 max_file_bytes = 1048576
 ```
 
-The folder must already exist. Snapshot messages are readable email, not encrypted secret storage.
+The folder must already exist. It cannot be used as a routing source or move destination.
 
-## Legacy category classification configuration
+## Generic message limits
 
-`[spam.actions.*]` settings are retained for legacy category-based classification commands. Unified routing destinations belong in the sibling schema-3 `rules.toml`; `rule preview` and `rule apply` use the ordered rules, not these category actions. Explicit migration can use a valid legacy Spam MOVE destination to populate the built-in Spam rule.
+`[mail]` contains optional, non-Spam processing limits. Defaults are 2,000,000 bytes per message and 20,000 body characters:
 
 ```toml
-[imap]
-host = "imap.example.org"
-port = 993
-username = "me@example.org"
-
-[imap.auth]
-source = "prompt"
-
-[spam]
-folders = ["INBOX.Junk", "INBOX.Spam"]
+[mail]
 max_message_bytes = 2000000
 max_body_chars = 20000
-
-[spam.state]
-backend = "imap-keywords"
-
-[spam.actions.spam]
-action = "move"
-destination = "INBOX.Trash"
-
-[spam.actions.not_spam]
-action = "move"
-destination = "INBOX.NotSpam"
-
-[spam.actions.review]
-action = "keep"
-
-[spam.policy]
-legitimate_veto_at = 0.80
-phishing_delete_at = 0.90
-identity_deception_at = 0.90
-unsolicited_bulk_at = 0.92
-delete_safe_at = 0.88
-provider_junk_support_at = 0.80
-
-[spam.authentication]
-trusted_authserv_ids = []
-
-[spam.provider]
-trusted_spam_headers = []
 ```
 
-When used by legacy category workflows, `spam.folders` lists source mailboxes, not destinations. It may be omitted when only unified routing is used. Unified preview/apply takes its source scope from `rule preview` or `rule apply` arguments and supports all selectable folders. Source names are exact and server-specific; UIDs from different folders are never compared.
+Both settings must be positive integers. The table can be omitted when the defaults are suitable.
 
-Source mailbox names are exact and server-specific. Every configured source must exist and be selectable on the account. The example names above are not universal; imapledger does not normalize names or create source folders. `doctor` distinguishes a missing source from an existing source that cannot be selected.
+## Rules configuration
 
-## Classification state backend
-
-The optional state backend is configured with `[spam.state].backend`:
+All automated mail behavior belongs in the sibling `rules.toml`, which uses schema 4. A minimal rule file can be created from a recipe or edited directly:
 
 ```toml
-[spam.state]
-backend = "imap-keywords"
+[rules]
+schema = 4
+default_match_at = 0.90
+
+[[rules.rule]]
+id = "spam"
+enabled = true
+type = "recipe"
+recipe = "spam"
+action = "move"
+destination = "INBOX.Junk"
+source_folders = ["INBOX"]
 ```
 
-Supported values are `none` and `imap-keywords`. `imapledger init` selects `imap-keywords` for new configurations. Existing configurations that omit `[spam.state]` use `none` for backward compatibility. `imapledger config show` displays the effective setting. The application owns the marker names; they are not configurable.
+Rules are ordered, global by default, and do nothing when no rule matches. No rule is created automatically. Actions are `move`, `keep`, or `delete`; `move` requires an existing destination, and `keep` or `delete` must not specify one. Delete requires explicit authorization when applying. See [Unified routing rules](rules.md) for matching, recipes, trusted evidence, action safety, and examples.
 
-The selected compatibility source must advertise persistent custom keywords through `PERMANENTFLAGS` (`\\*` or the exact keyword). `doctor` reports persistence support, and legacy category classification checks it before classification whenever a configured outcome may be kept. The unified rule runner does not use IMAP classification keywords. See [Persistent state](state.md) for marker semantics and the separate local progress database.
-
-## Unified routing rules
-
-The sibling `rules.toml` uses schema 3 for `rule preview`, `rule apply`, exact-message evaluation, and learning. Rules are global by default; optional `source_folders` restricts a rule. The first enabled match wins. `spam`, `semantic`, and deterministic `header` rules all use explicit destinations. No fallback is required: no match keeps mail in place, and an already-current destination causes no MOVE.
-
-Schema 3 supports multiple deterministic `match_any` alternatives. Semantic rules can combine learned header matchers with a description and threshold. The built-in Spam rule is visible in the same ordered rules file. Config Ledger is excluded from routing sources and destinations.
-
-Migrate existing schema-1 or schema-2 rules explicitly with `imapledger rule migrate --preview` and then `--apply`. Migration preserves safe matchers and source scopes, reports any dropped schema-2 fallback, and can transfer a valid legacy Spam MOVE destination. It does not invent a fallback or convert unsafe actions. See [Unified routing rules](rules.md) for the full format and behavior.
-
-## Legacy global classification actions
-
-The existing policy verdicts are kept for compatibility. They map to three global classification categories and their configured actions:
-
-| Policy verdict       | Classification category | Config table              |
-| -------------------- | ----------------------- | ------------------------- |
-| `SpamVerdict.DELETE` | spam                    | `[spam.actions.spam]`     |
-| `SpamVerdict.KEEP`   | not-spam                | `[spam.actions.not_spam]` |
-| `SpamVerdict.REVIEW` | review                  | `[spam.actions.review]`   |
-
-These settings are global category mappings for the compatibility command `imapledger mail classify`, not routing rules. `mail classify --apply` can apply the configured action to one exact message in a selectable folder after confirmation and safety checks. The TUI and batch rule runner use schema-3 rules instead. `spam.folders` does not restrict unified rule sources.
-The NOT_SPAM action maps to `SpamVerdict.KEEP`; `REVIEW` is separate and follows `[spam.actions.review]`.
-An action table accepts `keep`, `move`, or `delete`:
-
-- `keep` leaves the message in its current source folder.
-- `move` requires a non-empty `destination` naming an existing folder.
-- `delete` permanently removes the message through the exact-UID deletion path. It is valid only for the spam outcome.
-
-Not-spam and review outcomes cannot be configured for deletion. Review defaults to `keep`. Skipped messages and classification or policy errors always remain in the source folder, regardless of configured actions. A destination cannot equal any configured source folder. Folder names are preserved exactly, including spelling and case. Two outcomes may share a destination if configured explicitly.
-With the plural `folders` schema, legacy category action outcomes omitted from the configuration default to `keep`. Permanent deletion through `mail classify` therefore requires an explicit `[spam.actions.spam]` entry. Legacy scalar `spam.folder` configurations retain the old spam-delete default when action tables are absent.
-
-`imapledger` does not create destinations. Configured moves require server support for the IMAP MOVE capability and never fall back to COPY and EXPUNGE. Legacy delete actions require UIDPLUS and exact-UID EXPUNGE.
-
-Changing actions does not change spam-policy thresholds. The policy remains fail-closed, and a less destructive action does not make classification more aggressive.
-
-## Discover server folder names
-
-Mailbox names are server-specific. Discover the exact names before writing `spam.folders` or move destinations, using either direct connection options:
+Connection setup is independent of rule setup:
 
 ```bash
-imapledger folders --host imap.example.org --username me@example.org
-```
-
-or an existing configuration:
-
-```bash
-imapledger folders --config /path/to/config.toml
-```
-
-The config mode needs only a valid `[imap]` table. `folders` does not validate or use `spam.folders`, so the spam section may be absent or incomplete. It resolves the configured credential source in config mode; direct mode continues to use hidden prompt authentication. The command connects over TLS and is read-only: one IMAP `LIST` discovers mailbox metadata, and optional `STATUS (MESSAGES UNSEEN)` requests provide aggregate counts without selecting mailboxes or fetching message contents. `--no-counts` skips STATUS requests entirely.
-
-| Folder | Exact IMAP name |     Total |     Read |     Unread | Role        |
-| ------ | --------------- | --------: | -------: | ---------: | ----------- |
-| INBOX  | INBOX           | `<total>` | `<read>` | `<unread>` | Inbox       |
-| Junk   | INBOX.Junk      | `<total>` | `<read>` | `<unread>` | Junk        |
-| Shared | Shared          |         - |        - |          - | `\Noselect` |
-
-The exact IMAP name column is the value to copy into configuration. Read is calculated as total minus unread. STATUS avoids an imapledger client-side scan through messages, but the server may perform internal work to calculate these counts. Use `--no-counts` when you only need names and flags.
-
-## Create and inspect configuration
-
-`init` writes the new plural-folder schema and explicit action tables. Source options can be repeated:
-
-```bash
-imapledger init \
-  --host imap.example.org \
-  --username me@example.org \
-  --folder INBOX.Junk \
-  --folder INBOX.Spam \
-  --spam-action move \
-  --spam-destination INBOX.Trash \
-  --not-spam-action move \
-  --not-spam-destination INBOX.NotSpam
-```
-
-Review the normalized, effective configuration with:
-
-```bash
+imapledger init --host imap.example.org --username me@example.org
+imapledger rule recipe list
+imapledger rule recipe add spam --destination INBOX.Junk
 imapledger config show
-imapledger config show --config /path/to/config.toml
 ```
 
-The command prints the configuration path and TOML, including defaults in effect. It does not prompt for a password, connect to IMAP, or print credentials. It is inspection-only.
+`init` writes only IMAP connection and authentication settings. It does not create folders or rules. Use exact, server-specific mailbox names. Discover them with `imapledger folders --config /path/to/config.toml` or `imapledger folders --host imap.example.org --username me@example.org`.
 
-## Legacy configuration
+## Removed Spam configuration and explicit migration
 
-A legacy configuration may use a scalar source:
+Normal configuration loading rejects a legacy `[spam]` table and directs you to the explicit migration command. Do not remove the table manually before reviewing the migration if you want to preserve its supported values:
 
-```toml
-[spam]
-folder = "Spam"
+```bash
+imapledger rule migrate --preview
+imapledger rule migrate --apply
 ```
 
-When `spam.folders` is absent, `spam.folder` is accepted as a one-element source list and a deprecation warning is emitted. Configurations containing both `folder` and `folders` are rejected. Existing legacy files without action tables keep their old behavior: spam maps to `delete`, while not-spam and review map to `keep`. This preserves deletion behavior across the compatibility period. New files written by `init` or the configuration writer use `folders` and explicit action tables only.
+The preview does not write files. Review the converted schema and every warning before applying. Migration can convert an explicitly configured legacy Spam action into an ordinary Spam / scam recipe rule, including its destination, source-folder scope, supported thresholds, and trusted evidence. If no legacy Spam action is configured, migration does not create a Spam rule. If rule ID `spam` already names an incompatible rule in the target file, resolve that ID conflict before migrating. Legacy `not_spam` and `review` actions are not migrated automatically. Create ordinary rules yourself for any desired non-Spam behavior.
 
-Legacy `spam.threshold` values are warned about and ignored. Use the named values under `[spam.policy]`. When policy values are omitted, the documented defaults are used.
+If the preview includes a Delete rule, apply migration with `--allow-delete` as an explicit authorization to write a configuration that contains that rule:
+
+```bash
+imapledger rule migrate --apply --allow-delete
+```
+
+This migration authorization does not delete messages. A future mailbox run that applies a Delete action separately requires `imapledger rule apply ... --allow-delete`. Existing IMAP keywords and messages are not changed by configuration migration. Rules schemas 1, 2, and 3 also require explicit conversion; see [rule migration](rules.md#explicit-migration).

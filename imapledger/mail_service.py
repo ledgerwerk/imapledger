@@ -4,7 +4,6 @@ import logging
 import time
 from dataclasses import dataclass
 
-from .classification_state import PersistedState, SpamOutcome, keyword_for_outcome
 from .config import Settings
 from .mailbox import (
     BrowserMailbox,
@@ -44,7 +43,7 @@ class MessageDetail:
     folder: str
     uidvalidity: int
     item: MailboxItem
-    persisted_state: PersistedState | None
+
 
 
 class MailService:
@@ -125,25 +124,12 @@ class MailService:
     def get_message(self, folder: str, uid: int) -> MessageDetail:
         started = time.monotonic()
         with self._open_browser(folder) as mailbox:
-            item, state = mailbox.fetch_uid(uid)
+            item = mailbox.fetch_uid(uid)
             uidvalidity = mailbox.uidvalidity
-        detail = MessageDetail(folder=folder, uidvalidity=uidvalidity, item=item, persisted_state=state)
+        detail = MessageDetail(folder=folder, uidvalidity=uidvalidity, item=item)
         _log_timing("ui.message_open", started, message_count=1)
         return detail
 
-    def review_messages(self, *, limit: int = 50, offset: int = 0) -> tuple[tuple[str, MailSummary], ...]:
-        started = time.monotonic()
-        if limit < 1 or offset < 0:
-            raise ValueError("limit must be positive and offset must be non-negative")
-        rows: list[tuple[str, MailSummary]] = []
-        keyword = keyword_for_outcome(SpamOutcome.REVIEW)
-        for folder in self._settings.spam.folders:
-            with self._open_browser(folder) as mailbox:
-                uids = sorted(mailbox.search_keyword(keyword), reverse=True)[offset : offset + limit]
-                rows.extend((folder, summary) for summary in mailbox.fetch_summaries(uids))
-        result = tuple(sorted(rows, key=lambda row: (row[1].uid, row[0]), reverse=True))
-        _log_timing("ui.review_page", started, result_count=len(result), page_size=limit)
-        return result
 
     def _open_browser(self, folder: str) -> BrowserMailbox:
         settings = self._settings
@@ -153,7 +139,7 @@ class MailService:
             username=settings.imap.username,
             password=self._password,
             folder=folder,
-            max_message_bytes=settings.spam.max_message_bytes,
-            max_body_chars=settings.spam.max_body_chars,
+            max_message_bytes=settings.mail.max_message_bytes,
+            max_body_chars=settings.mail.max_body_chars,
             client_factory=self._client_factory,
         )

@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from imapledger.config import ImapSettings, Settings, SpamSettings
+from imapledger.config import ImapSettings, Settings
 from imapledger.progress_store import (
     ProgressResumeError,
     ProgressStore,
@@ -12,12 +12,12 @@ from imapledger.progress_store import (
     account_identity_key,
     default_progress_path,
 )
+from imapledger.routing_actions import RuleAction
 
 
 def _settings(host: str = "imap.example.org", username: str = "user@example.org") -> Settings:
     return Settings(
         imap=ImapSettings(host=host, username=username),
-        spam=SpamSettings(folders=("Spam",)),
     )
 
 
@@ -71,7 +71,10 @@ def test_begin_run_resumes_same_identity_and_preserves_stable_high_watermark(tmp
 def test_changed_fingerprint_supersedes_old_run_and_starts_new_identity(tmp_path) -> None:
     store = ProgressStore(tmp_path / "progress.sqlite3")
     old = _begin(store)
-    store.record_result(old.id, uid=9, outcome="match", winner_rule_id="invoice")
+    store.record_result(old.id, uid=9, outcome="moved",
+        configured_action=RuleAction.MOVE,
+        applied=True,
+        confirmed=True, winner_rule_id="invoice")
 
     current = _begin(store, fingerprint="fingerprint-b", high_watermark_uid=120)
 
@@ -115,16 +118,18 @@ def test_apply_checkpoints_are_transactional_idempotent_and_retryable(tmp_path) 
     checkpoint = store.record_result(
         run.id,
         uid=9,
-        outcome="match",
+        outcome="moved",
         winner_rule_id="invoice",
         destination="Invoices",
         applied=True,
+        configured_action=RuleAction.MOVE,
         confirmed=True,
         model="bundle-model",
         request_id="request-9",
     )
     assert (checkpoint.cursor_uid, checkpoint.scanned_count, checkpoint.match_count) == (9, 1, 1)
     assert checkpoint.moved_count == 1
+    assert checkpoint.acted_count == 1
 
     error = store.record_result(run.id, uid=20, outcome="error", error_code="RuntimeError")
     assert (error.cursor_uid, error.scanned_count, error.error_count) == (20, 2, 1)
@@ -207,3 +212,54 @@ def test_progress_rejects_results_outside_high_watermark_and_unsafe_error_detail
         store.record_result(run.id, uid=11, outcome="no_match")
     with pytest.raises(ProgressStoreError, match="short identifier"):
         store.record_result(run.id, uid=9, outcome="error", error_code="MAIL BODY SECRET: content")
+
+
+
+def test_schema_two_progress_database_migrates_action_results_and_counters(tmp_path) -> None:
+    database = tmp_path / "legacy-progress.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """PRAGMA user_version = 2;
+            CREATE TABLE runs (
+                id TEXT PRIMARY KEY, account_key TEXT NOT NULL, source_folder TEXT NOT NULL,
+                uidvalidity INTEGER NOT NULL, high_watermark_uid INTEGER NOT NULL,
+                lower_bound_uid INTEGER NOT NULL DEFAULT 0, rules_fingerprint TEXT NOT NULL,
+                mode TEXT NOT NULL, rule_scope TEXT, sort_direction TEXT NOT NULL,
+                status TEXT NOT NULL, cursor_uid INTEGER, started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, completed_at TEXT, scanned_count INTEGER NOT NULL,
+                match_count INTEGER NOT NULL, moved_count INTEGER NOT NULL,
+                no_match_count INTEGER NOT NULL, error_count INTEGER NOT NULL
+            );
+            CREATE TABLE message_results (
+                run_id TEXT NOT NULL, uid INTEGER NOT NULL, outcome TEXT NOT NULL,
+                winner_rule_id TEXT, destination TEXT, applied INTEGER NOT NULL,
+                confirmed INTEGER NOT NULL, model TEXT, request_id TEXT,
+                error_code TEXT, processed_at TEXT NOT NULL, PRIMARY KEY(run_id, uid)
+            );"""
+        )
+        connection.execute(
+            """INSERT INTO runs VALUES (
+                'legacy-run', 'account', 'INBOX', 42, 3, 0, 'fingerprint', 'full', NULL,
+                'oldest', 'completed', 3, 'start', 'update', 'complete', 3, 2, 1, 1, 0
+            )"""
+        )
+        connection.executemany(
+            "INSERT INTO message_results VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'processed')",
+            (
+                ("legacy-run", 1, "match", "spam", "Archive", 1, 1),
+                ("legacy-run", 2, "match", "keep-rule", None, 1, 1),
+                ("legacy-run", 3, "no_match", None, None, 0, 0),
+            ),
+        )
+
+    store = ProgressStore(database)
+    run = store.get_run("legacy-run")
+    results = store.results("legacy-run")
+    with sqlite3.connect(database) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert version == 3
+    assert (run.acted_count, run.moved_count, run.deleted_count, run.kept_count) == (2, 1, 0, 1)
+    assert (run.match_count, run.no_match_count, run.error_count) == (2, 1, 0)
+    assert [result.outcome for result in results] == ["moved", "kept", "no_match"]
+    assert [result.configured_action for result in results] == [RuleAction.MOVE, RuleAction.KEEP, None]

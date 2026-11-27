@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
-import warnings
-from dataclasses import dataclass, field, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -14,8 +14,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib
 
-from .classification_state import ClassificationStateBackend, SpamOutcome
-from .policy import SpamPolicy
+from .routing_actions import RuleAction
 
 DEFAULT_MAX_MESSAGE_BYTES = 2_000_000
 DEFAULT_MAX_BODY_CHARS = 20_000
@@ -27,11 +26,7 @@ class ConfigError(ValueError):
     pass
 
 
-class ActionKind(str, Enum):
-    KEEP = "keep"
-    MOVE = "move"
-    DELETE = "delete"
-
+ActionKind = RuleAction
 
 class AuthSource(str, Enum):
     PROMPT = "prompt"
@@ -39,17 +34,6 @@ class AuthSource(str, Enum):
     VAULT = "vault"
 
 
-@dataclass(frozen=True, slots=True)
-class ClassificationStateSettings:
-    backend: ClassificationStateBackend = ClassificationStateBackend.NONE
-
-    def __post_init__(self) -> None:
-        try:
-            backend = ClassificationStateBackend(self.backend)
-        except (TypeError, ValueError) as exc:
-            allowed = ", ".join(item.value for item in ClassificationStateBackend)
-            raise ConfigError(f"spam.state.backend must be one of: {allowed}") from exc
-        object.__setattr__(self, "backend", backend)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,20 +77,6 @@ class MessageAction:
             raise ConfigError(f"{self.action.value} action must not have a destination")
 
 
-@dataclass(frozen=True, slots=True)
-class SpamActions:
-    spam: MessageAction = field(default_factory=lambda: MessageAction(ActionKind.DELETE))
-    not_spam: MessageAction = field(default_factory=lambda: MessageAction(ActionKind.KEEP))
-    review: MessageAction = field(default_factory=lambda: MessageAction(ActionKind.KEEP))
-
-    def __post_init__(self) -> None:
-        for name in ("spam", "not_spam", "review"):
-            if not isinstance(getattr(self, name), MessageAction):
-                raise ConfigError(f"spam.actions.{name} must be a message action")
-        if self.not_spam.action is ActionKind.DELETE:
-            raise ConfigError("delete is not supported for the not_spam outcome")
-        if self.review.action is ActionKind.DELETE:
-            raise ConfigError("delete is not supported for the review outcome")
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,40 +98,23 @@ class ImapSettings:
 
 
 @dataclass(frozen=True, slots=True)
-class SpamSettings:
-    folders: tuple[str, ...]
-    actions: SpamActions = field(default_factory=SpamActions)
-    state: ClassificationStateSettings = field(default_factory=ClassificationStateSettings)
+class MailSettings:
     max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES
     max_body_chars: int = DEFAULT_MAX_BODY_CHARS
-    policy: SpamPolicy = field(default_factory=SpamPolicy)
-    trusted_authserv_ids: tuple[str, ...] = ()
-    trusted_provider_headers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.folders, (tuple, list)):
-            raise ConfigError("spam.folders must be an array of folder names")
-        folders = tuple(self.folders)
-        object.__setattr__(self, "folders", folders)
-        if any(not isinstance(folder, str) for folder in folders):
-            raise ConfigError("spam.folders entries must be strings")
-        if any(not folder.strip() for folder in folders):
-            raise ConfigError("spam.folders entries must not be empty")
-        if any(folder != folder.strip() for folder in folders):
-            raise ConfigError("spam.folders entries must not have leading or trailing whitespace")
-        if len(set(folders)) != len(folders):
-            raise ConfigError("spam.folders must not contain duplicates")
-        if not isinstance(self.state, ClassificationStateSettings):
-            raise ConfigError("spam.state must be classification state settings")
-        if self.max_message_bytes < 1:
-            raise ConfigError("spam.max_message_bytes must be positive")
-        if self.max_body_chars < 1:
-            raise ConfigError("spam.max_body_chars must be positive")
-        for outcome in ("spam", "not_spam", "review"):
-            action = getattr(self.actions, outcome)
-            if action.action is ActionKind.MOVE and action.destination in folders:
-                raise ConfigError(f"spam.actions.{outcome} destination must not be a source folder")
-
+        if (
+            isinstance(self.max_message_bytes, bool)
+            or not isinstance(self.max_message_bytes, int)
+            or self.max_message_bytes < 1
+        ):
+            raise ConfigError("mail.max_message_bytes must be a positive integer")
+        if (
+            isinstance(self.max_body_chars, bool)
+            or not isinstance(self.max_body_chars, int)
+            or self.max_body_chars < 1
+        ):
+            raise ConfigError("mail.max_body_chars must be a positive integer")
 
 @dataclass(frozen=True, slots=True)
 class ConfigStoreSettings:
@@ -190,32 +143,23 @@ class ConfigStoreContext:
 @dataclass(frozen=True, slots=True)
 class Settings:
     imap: ImapSettings
-    spam: SpamSettings
+    mail: MailSettings = field(default_factory=MailSettings)
     config_store: ConfigStoreSettings | None = None
 
     def __post_init__(self) -> None:
-        if self.config_store is None:
-            return
-        if not isinstance(self.config_store, ConfigStoreSettings):
+        if not isinstance(self.mail, MailSettings):
+            raise ConfigError("mail must be generic mail settings")
+        if self.config_store is not None and not isinstance(self.config_store, ConfigStoreSettings):
             raise ConfigError("config_store must be config store settings")
-        if self.config_store.folder in self.spam.folders:
-            raise ConfigError("config_store.folder must not be a spam source folder")
-        for outcome in ("spam", "not_spam", "review"):
-            action = getattr(self.spam.actions, outcome)
-            if action.action is ActionKind.MOVE and action.destination == self.config_store.folder:
-                raise ConfigError(f"config_store.folder must not be spam.actions.{outcome} destination")
-
-
-def action_for_outcome(settings: Settings, outcome: SpamOutcome) -> MessageAction:
-    return getattr(settings.spam.actions, outcome.value)
-
 
 def default_config_path() -> Path:
     base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return base / "imapledger" / "config.toml"
 
 
-def _load_config_payload(path: Path | None = None) -> tuple[Path, dict[str, object]]:
+def _load_config_payload(
+    path: Path | None = None, *, allow_legacy_spam: bool = False
+) -> tuple[Path, dict[str, object]]:
     config_path = path or default_config_path()
     try:
         payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -223,8 +167,100 @@ def _load_config_payload(path: Path | None = None) -> tuple[Path, dict[str, obje
         raise ConfigError(f"config not found: {config_path}; run `imapledger init`") from exc
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"could not read config {config_path}: {exc}") from exc
+    if "spam" in payload and not allow_legacy_spam:
+        raise ConfigError(
+            "[spam] configuration was removed. Mail behavior now belongs in rules.toml. "
+            "Run `imapledger rule migrate --preview` to inspect a migration, then "
+            "`imapledger rule migrate --apply`."
+        )
     return config_path, payload
 
+
+@dataclass(frozen=True, slots=True)
+class LegacySpamConfiguration:
+    """Parsed legacy values for explicit rule migration only."""
+
+    folders: tuple[str, ...]
+    actions: Mapping[str, MessageAction]
+    max_message_bytes: int
+    max_body_chars: int
+    policy: Mapping[str, float]
+    trusted_authserv_ids: tuple[str, ...]
+    trusted_provider_headers: tuple[str, ...]
+
+
+def load_legacy_spam_configuration(path: Path | None = None) -> LegacySpamConfiguration | None:
+    """Read the removed [spam] table for an explicit migration workflow."""
+    _, payload = _load_config_payload(path, allow_legacy_spam=True)
+    raw_spam = payload.get("spam")
+    if raw_spam is None:
+        return None
+    if not isinstance(raw_spam, dict):
+        raise ConfigError("legacy [spam] must be a table")
+
+    if "folder" in raw_spam and "folders" in raw_spam:
+        raise ConfigError("legacy spam.folder and spam.folders cannot both be configured")
+    raw_folders = raw_spam.get("folders", [raw_spam["folder"]] if "folder" in raw_spam else [])
+    if not isinstance(raw_folders, list) or any(
+        not isinstance(folder, str) or not folder.strip() for folder in raw_folders
+    ):
+        raise ConfigError("legacy spam.folders must be an array of non-empty strings")
+    folders = tuple(raw_folders)
+    if any(folder != folder.strip() for folder in folders) or len(set(folders)) != len(folders):
+        raise ConfigError("legacy spam.folders must contain unique names without surrounding whitespace")
+
+    raw_actions = raw_spam.get("actions", {})
+    if not isinstance(raw_actions, dict):
+        raise ConfigError("legacy spam.actions must be a table")
+    actions: dict[str, MessageAction] = {}
+    for outcome, action_table in raw_actions.items():
+        if outcome not in {"spam", "not_spam", "review"} or not isinstance(action_table, dict):
+            raise ConfigError(f"invalid legacy spam action: {outcome!r}")
+        if set(action_table) - {"action", "destination"} or "action" not in action_table:
+            raise ConfigError(f"invalid legacy spam.actions.{outcome} table")
+        try:
+            actions[outcome] = MessageAction(
+                ActionKind(action_table["action"]), action_table.get("destination")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"invalid legacy spam.actions.{outcome}: {exc}") from exc
+
+    raw_policy = raw_spam.get("policy", {})
+    if not isinstance(raw_policy, dict):
+        raise ConfigError("legacy spam.policy must be a table")
+    policy: dict[str, float] = {}
+    policy_keys = {
+        "legitimate_veto_at", "phishing_delete_at", "identity_deception_at",
+        "unsolicited_bulk_at", "delete_safe_at", "provider_junk_support_at",
+    }
+    if set(raw_policy) - policy_keys:
+        raise ConfigError(f"unknown key in legacy spam.policy: {sorted(set(raw_policy) - policy_keys)[0]}")
+    for name, value in raw_policy.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+            raise ConfigError(f"legacy spam.policy.{name} must be a probability")
+        policy[name] = float(value)
+
+    authentication = raw_spam.get("authentication", {})
+    provider = raw_spam.get("provider", {})
+    if not isinstance(authentication, dict) or not isinstance(provider, dict):
+        raise ConfigError("legacy spam.authentication and spam.provider must be tables")
+    mail = MailSettings(
+        max_message_bytes=raw_spam.get("max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES),
+        max_body_chars=raw_spam.get("max_body_chars", DEFAULT_MAX_BODY_CHARS),
+    )
+    return LegacySpamConfiguration(
+        folders=folders,
+        actions=actions,
+        max_message_bytes=mail.max_message_bytes,
+        max_body_chars=mail.max_body_chars,
+        policy=policy,
+        trusted_authserv_ids=_string_tuple(
+            authentication.get("trusted_authserv_ids", []), "spam.authentication.trusted_authserv_ids"
+        ),
+        trusted_provider_headers=_string_tuple(
+            provider.get("trusted_spam_headers", []), "spam.provider.trusted_spam_headers"
+        ),
+    )
 
 def _parse_imap_auth_settings(value: object) -> ImapAuthSettings:
     if not isinstance(value, dict):
@@ -247,17 +283,22 @@ def _parse_imap_auth_settings(value: object) -> ImapAuthSettings:
     )
 
 
-def _parse_classification_state_settings(value: object) -> ClassificationStateSettings:
+def _parse_mail_settings(value: object) -> MailSettings:
     if not isinstance(value, dict):
-        raise ConfigError("spam.state must be a table")
-    unknown = set(value) - {"backend"}
+        raise ConfigError("[mail] must be a table")
+    unknown = set(value) - {"max_message_bytes", "max_body_chars"}
     if unknown:
-        raise ConfigError(f"unknown key in spam.state: {sorted(unknown)[0]}")
+        raise ConfigError(f"unknown key in [mail]: {sorted(unknown)[0]}")
     try:
-        return ClassificationStateSettings(ClassificationStateBackend(value.get("backend", "none")))
+        return MailSettings(
+            max_message_bytes=value.get("max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES),
+            max_body_chars=value.get("max_body_chars", DEFAULT_MAX_BODY_CHARS),
+        )
     except (TypeError, ValueError) as exc:
-        allowed = ", ".join(item.value for item in ClassificationStateBackend)
-        raise ConfigError(f"spam.state.backend must be one of: {allowed}") from exc
+        if isinstance(exc, ConfigError):
+            raise
+        raise ConfigError(f"invalid [mail] value: {exc}") from exc
+
 
 
 def _parse_imap_settings(payload: dict[str, object]) -> ImapSettings:
@@ -315,148 +356,34 @@ def load_imap_settings(path: Path | None = None) -> ImapSettings:
 
 def load_settings(path: Path | None = None) -> Settings:
     _, payload = _load_config_payload(path)
-
-    imap = payload.get("imap")
-    spam = payload.get("spam")
-    if not isinstance(imap, dict):
-        raise ConfigError("config requires an [imap] table")
-    if not isinstance(spam, dict):
-        raise ConfigError("config requires a [spam] table")
     imap_settings = _parse_imap_settings(payload)
+    mail_settings = _parse_mail_settings(payload["mail"]) if "mail" in payload else MailSettings()
     config_store_settings = _parse_config_store_settings(payload["config_store"]) if "config_store" in payload else None
-    if "threshold" in spam:
-        warnings.warn(
-            "spam.threshold is deprecated and ignored; configure named [spam.policy] thresholds instead",
-            UserWarning,
-            stacklevel=2,
-        )
+    return Settings(imap=imap_settings, mail=mail_settings, config_store=config_store_settings)
 
-    if "folder" in spam and "folders" in spam:
-        raise ConfigError("spam.folder and spam.folders cannot both be configured")
-    if "folders" in spam:
-        folders = _folder_tuple(spam["folders"])
 
-        if not folders:
-            raise ConfigError("spam.folders must not be empty")
-    elif "folder" in spam:
-        folder = spam["folder"]
-        if not isinstance(folder, str):
-            raise ConfigError("spam.folder must be a string")
-        warnings.warn(
-            "spam.folder is deprecated; use spam.folders",
-            UserWarning,
-            stacklevel=2,
-        )
-        folders = (folder,)
+def load_legacy_settings_for_migration(
+    path: Path | None = None,
+) -> tuple[Settings, LegacySpamConfiguration | None]:
+    """Read settings while allowing the removed [spam] table for explicit migration only."""
+    config_path, payload = _load_config_payload(path, allow_legacy_spam=True)
+    legacy = load_legacy_spam_configuration(config_path)
+    if "mail" in payload:
+        mail_settings = _parse_mail_settings(payload["mail"])
+    elif legacy is not None:
+        mail_settings = MailSettings(legacy.max_message_bytes, legacy.max_body_chars)
     else:
-        folders = ()
-
-    policy_payload = spam.get("policy", {})
-    authentication = spam.get("authentication", {})
-    provider = spam.get("provider", {})
-    if not isinstance(policy_payload, dict):
-        raise ConfigError("spam.policy must be a table")
-    if not isinstance(authentication, dict):
-        raise ConfigError("spam.authentication must be a table")
-    if not isinstance(provider, dict):
-        raise ConfigError("spam.provider must be a table")
-    state_settings = _parse_classification_state_settings(spam.get("state", {}))
-
-    try:
-        return Settings(
-            imap=imap_settings,
-            config_store=config_store_settings,
-            spam=SpamSettings(
-                folders=folders,
-                state=state_settings,
-                actions=_parse_spam_actions(spam.get("actions", {}), legacy_defaults="folder" in spam),
-                max_message_bytes=int(spam.get("max_message_bytes", DEFAULT_MAX_MESSAGE_BYTES)),
-                max_body_chars=int(spam.get("max_body_chars", DEFAULT_MAX_BODY_CHARS)),
-                policy=SpamPolicy(
-                    legitimate_veto_at=float(policy_payload.get("legitimate_veto_at", 0.80)),
-                    phishing_delete_at=float(policy_payload.get("phishing_delete_at", 0.90)),
-                    identity_deception_at=float(policy_payload.get("identity_deception_at", 0.90)),
-                    unsolicited_bulk_at=float(policy_payload.get("unsolicited_bulk_at", 0.92)),
-                    delete_safe_at=float(policy_payload.get("delete_safe_at", 0.88)),
-                    provider_junk_support_at=float(policy_payload.get("provider_junk_support_at", 0.80)),
-                ),
-                trusted_authserv_ids=_string_tuple(
-                    authentication.get("trusted_authserv_ids", []), "spam.authentication.trusted_authserv_ids"
-                ),
-                trusted_provider_headers=_string_tuple(
-                    provider.get("trusted_spam_headers", []), "spam.provider.trusted_spam_headers"
-                ),
-            ),
-        )
-    except KeyError as exc:
-        raise ConfigError(f"missing config key: {exc.args[0]}") from exc
-    except (TypeError, ValueError) as exc:
-        if isinstance(exc, ConfigError):
-            raise
-        raise ConfigError(f"invalid config value: {exc}") from exc
-
-
-def _folder_tuple(value: object) -> tuple[str, ...]:
-    if not isinstance(value, list):
-        raise ConfigError("spam.folders must be an array of non-empty strings")
-    if any(not isinstance(folder, str) for folder in value):
-        raise ConfigError("spam.folders entries must be strings")
-    return tuple(value)
-
-
-def _parse_spam_actions(value: object, *, legacy_defaults: bool = False) -> SpamActions:
-    if not isinstance(value, dict):
-        raise ConfigError("spam.actions must be a table")
-    unknown_outcomes = set(value) - {"spam", "not_spam", "review"}
-    if unknown_outcomes:
-        raise ConfigError(f"unknown spam action outcome: {sorted(unknown_outcomes)[0]}")
-    defaults = SpamActions() if legacy_defaults else SpamActions(spam=MessageAction(ActionKind.KEEP))
-    parsed: dict[str, MessageAction] = {}
-    for outcome in ("spam", "not_spam", "review"):
-        if outcome not in value:
-            parsed[outcome] = getattr(defaults, outcome)
-            continue
-        table = value[outcome]
-        if not isinstance(table, dict):
-            raise ConfigError(f"spam.actions.{outcome} must be a table")
-        unknown_keys = set(table) - {"action", "destination"}
-        if unknown_keys:
-            raise ConfigError(f"unknown key in spam.actions.{outcome}: {sorted(unknown_keys)[0]}")
-        if "action" not in table:
-            raise ConfigError(f"spam.actions.{outcome} requires an action")
-        raw_action = table["action"]
-        if not isinstance(raw_action, str):
-            raise ConfigError(f"spam.actions.{outcome}.action must be a string")
-        try:
-            action = ActionKind(raw_action)
-        except ValueError as exc:
-            raise ConfigError(f"unknown action for spam.actions.{outcome}: {raw_action!r}") from exc
-        if action is ActionKind.MOVE:
-            if "destination" not in table:
-                raise ConfigError(f"move action for spam.actions.{outcome} requires a destination")
-            destination = table["destination"]
-            if not isinstance(destination, str):
-                raise ConfigError(f"spam.actions.{outcome}.destination must be a string")
-        else:
-            if "destination" in table:
-                raise ConfigError(f"{action.value} action for spam.actions.{outcome} must not have a destination")
-            destination = None
-        parsed[outcome] = MessageAction(action=action, destination=destination)
-    return SpamActions(**parsed)
-
-
-def replace_spam_action(settings: Settings, *, outcome: SpamOutcome, action: MessageAction) -> Settings:
-    if not isinstance(outcome, SpamOutcome):
-        raise ConfigError("outcome must be a SpamOutcome")
-    if not isinstance(action, MessageAction):
-        raise ConfigError("outcome action must be a MessageAction")
-    actions = replace(settings.spam.actions, **{outcome.value: action})
-    spam = replace(settings.spam, actions=actions)
-    return replace(settings, spam=spam)
+        mail_settings = MailSettings()
+    config_store = _parse_config_store_settings(payload["config_store"]) if "config_store" in payload else None
+    settings = Settings(
+        imap=_parse_imap_settings(payload),
+        mail=mail_settings,
+        config_store=config_store,
+    )
+    return settings, legacy
 
 
 def render_settings(settings: Settings) -> str:
-    thresholds = settings.spam.policy.thresholds()
     lines = [
         "[imap]",
         f'host = "{_toml_string(settings.imap.host)}"',
@@ -466,39 +393,18 @@ def render_settings(settings: Settings) -> str:
         "[imap.auth]",
         f'source = "{settings.imap.auth.source.value}"',
         f"vault_min_passphrase_length = {settings.imap.auth.vault_min_passphrase_length}",
-        "",
-        "[spam]",
-        f"max_message_bytes = {settings.spam.max_message_bytes}",
-        f"max_body_chars = {settings.spam.max_body_chars}",
-        "",
-        "[spam.state]",
-        f'backend = "{settings.spam.state.backend.value}"',
     ]
-    if settings.spam.folders:
-        lines.insert(lines.index("[spam]") + 1, f"folders = {_toml_string_array(settings.spam.folders)}")
-
     if settings.imap.auth.vault_path is not None:
-        source_line = f'source = "{settings.imap.auth.source.value}"'
-        vault_path = _toml_string(str(settings.imap.auth.vault_path))
-        lines.insert(lines.index(source_line) + 1, f'vault_path = "{vault_path}"')
-    for outcome in ("spam", "not_spam", "review"):
-        action = getattr(settings.spam.actions, outcome)
-        lines.extend(("", f"[spam.actions.{outcome}]", f'action = "{action.action.value}"'))
-        if action.destination is not None:
-            lines.append(f'destination = "{_toml_string(action.destination)}"')
-    lines.extend(("", "[spam.policy]"))
-    lines.extend(f"{name} = {value}" for name, value in thresholds.items())
-    lines.extend(
-        (
-            "",
-            "[spam.authentication]",
-            f"trusted_authserv_ids = {_toml_string_array(settings.spam.trusted_authserv_ids)}",
-            "",
-            "[spam.provider]",
-            f"trusted_spam_headers = {_toml_string_array(settings.spam.trusted_provider_headers)}",
-            "",
+        lines.append(f'vault_path = "{_toml_string(str(settings.imap.auth.vault_path))}"')
+    if settings.mail != MailSettings():
+        lines.extend(
+            (
+                "",
+                "[mail]",
+                f"max_message_bytes = {settings.mail.max_message_bytes}",
+                f"max_body_chars = {settings.mail.max_body_chars}",
+            )
         )
-    )
     if settings.config_store is not None:
         lines.extend(
             (

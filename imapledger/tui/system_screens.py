@@ -9,14 +9,10 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
 from ..config import (
-    ActionKind,
     AuthSource,
     ConfigError,
     ImapSettings,
-    MessageAction,
     Settings,
-    SpamActions,
-    SpamSettings,
     render_settings,
 )
 from .session import SessionState
@@ -213,11 +209,8 @@ class SetupDialog(ModalScreen[SetupRequest | None]):
     def compose(self) -> ComposeResult:
         settings = self.settings
         imap = settings.imap if settings else None
-        spam = settings.spam if settings else None
-        spam_action = spam.actions.spam if spam else MessageAction(ActionKind.DELETE)
-        not_spam_action = spam.actions.not_spam if spam else MessageAction(ActionKind.KEEP)
         with Vertical(id="setup-box"):
-            yield Static("Setup / Edit Connection and Classification Configuration", markup=False)
+            yield Static("Setup / Edit Connection", markup=False)
             with VerticalScroll(id="setup-form"):
                 yield Label("Config path")
                 yield Input(str(self.config_path), id="setup-path")
@@ -227,39 +220,12 @@ class SetupDialog(ModalScreen[SetupRequest | None]):
                 yield Input(str(imap.port if imap else 993), id="setup-port")
                 yield Label("IMAP username")
                 yield Input(imap.username if imap else "", id="setup-username")
-                yield Label("Configured source folders, comma separated")
-                yield Input(", ".join(spam.folders) if spam else "Spam", id="setup-folders")
-                yield Label("Spam action")
-                yield Select(
-                    self._actions(allow_delete=True),
-                    value=spam_action.action.value,
-                    allow_blank=False,
-                    id="setup-spam-action",
-                )
-                yield Label("Spam MOVE destination")
-                yield Input(spam_action.destination or "", id="setup-spam-destination")
-                yield Label("Not-spam action")
-                yield Select(
-                    self._actions(allow_delete=False),
-                    value=not_spam_action.action.value,
-                    allow_blank=False,
-                    id="setup-not-spam-action",
-                )
-                yield Label("Not-spam MOVE destination")
-                yield Input(not_spam_action.destination or "", id="setup-not-spam-destination")
                 yield Checkbox("Overwrite the target configuration file", id="setup-overwrite")
                 yield Static("Passwords are never written to the configuration file.", markup=False)
                 yield Static("", id="setup-error", markup=False)
             with Horizontal(id="setup-buttons"):
                 yield Button("Save config", id="setup-save")
                 yield Button("Cancel", id="setup-cancel")
-
-    @staticmethod
-    def _actions(*, allow_delete: bool) -> list[tuple[str, str]]:
-        actions = [ActionKind.KEEP, ActionKind.MOVE]
-        if allow_delete:
-            actions.append(ActionKind.DELETE)
-        return [(action.value, action.value) for action in actions]
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "setup-cancel":
@@ -270,49 +236,18 @@ class SetupDialog(ModalScreen[SetupRequest | None]):
             host = self.query_one("#setup-host", Input).value.strip()
             username = self.query_one("#setup-username", Input).value.strip()
             port = int(self.query_one("#setup-port", Input).value.strip())
-            folders = tuple(
-                folder.strip() for folder in self.query_one("#setup-folders", Input).value.split(",") if folder.strip()
-            )
-            spam_action = self._message_action("spam")
-            not_spam_action = self._message_action("not-spam")
             if not path.name:
                 raise ValueError("Config path is required.")
-            if not folders:
-                raise ValueError("Specify at least one configured source folder.")
             if self.settings:
                 imap = replace(self.settings.imap, host=host, port=port, username=username)
+                settings = replace(self.settings, imap=imap)
             else:
-                imap = ImapSettings(host=host, username=username, port=port)
-            actions = SpamActions(
-                spam=spam_action,
-                not_spam=not_spam_action,
-                review=self.settings.spam.actions.review if self.settings else MessageAction(ActionKind.KEEP),
-            )
-            if self.settings:
-                spam = replace(self.settings.spam, folders=folders, actions=actions)
-                settings = replace(self.settings, imap=imap, spam=spam)
-            else:
-                settings = Settings(
-                    imap=imap,
-                    spam=SpamSettings(
-                        folders=folders,
-                        actions=actions,
-                    ),
-                )
+                settings = Settings(imap=ImapSettings(host=host, username=username, port=port))
             request = SetupRequest(path, settings, self.query_one("#setup-overwrite", Checkbox).value)
         except (ConfigError, ValueError, TypeError) as exc:
             self.query_one("#setup-error", Static).update(str(exc))
             return
         self.dismiss(request)
-
-    def _message_action(self, outcome: str) -> MessageAction:
-        selected = self.query_one(f"#setup-{outcome}-action", Select).value
-        if not isinstance(selected, str):
-            raise ValueError(f"Choose a {outcome} action.")
-        action = ActionKind(selected)
-        destination = self.query_one(f"#setup-{outcome}-destination", Input).value.strip()
-        return MessageAction(action, destination if action is ActionKind.MOVE else None)
-
     def action_cancel(self) -> None:
         self.dismiss(None)
 

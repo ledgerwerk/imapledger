@@ -9,8 +9,6 @@ from email.utils import getaddresses
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
-from .classification_state import SpamOutcome, outcome_from_flags
-
 
 @dataclass(frozen=True, slots=True)
 class MailSummary:
@@ -21,7 +19,7 @@ class MailSummary:
     message_id: str
     size_bytes: int | None
     flags: frozenset[bytes | str]
-    persisted_state: SpamOutcome | None
+
     skip_reason: str | None = None
 
 
@@ -153,12 +151,6 @@ def parse_summary(
     size_bytes: int | None,
 ) -> MailSummary:
     msg = BytesHeaderParser(policy=policy.default).parsebytes(raw_headers)
-    try:
-        persisted_state = outcome_from_flags(flags)
-        skip_reason = None
-    except ValueError:
-        persisted_state = None
-        skip_reason = "conflicting classification state keywords"
     return MailSummary(
         uid=uid,
         sender=_decode_header_value(msg.get("From", "")),
@@ -167,8 +159,8 @@ def parse_summary(
         message_id=_decode_header_value(msg.get("Message-ID", "")),
         size_bytes=size_bytes,
         flags=flags,
-        persisted_state=persisted_state,
-        skip_reason=skip_reason,
+
+
     )
 
 

@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import Settings
-from .mailbox import PartialMoveError, ScopedMailbox
+from .mailbox import PartialDeleteError, PartialMoveError, ScopedMailbox
 from .preflight import preflight_source
+from .routing_actions import RuleAction
 from .routing_config import rules_fingerprint
-from .routing_models import EvaluationState, RoutingAction, RoutingPlan, RuleSet
+from .routing_models import EvaluationState, RoutingPlan, RuleSet
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,8 +56,13 @@ class RoutingActionService:
         *,
         uidvalidity: int,
         confirmed_by_user: bool,
+        allow_delete: bool = False,
     ) -> RoutingActionReceipt:
         receipt = RoutingActionReceipt(plan, uidvalidity, applied=False, confirmed=False)
+        if not isinstance(confirmed_by_user, bool):
+            raise ValueError("confirmed_by_user must be a boolean")
+        if not isinstance(allow_delete, bool):
+            raise ValueError("allow_delete must be a boolean")
         if not confirmed_by_user:
             return self._with_detail(receipt, "User confirmation is required; no changes made.")
         try:
@@ -65,18 +71,25 @@ class RoutingActionService:
         except Exception as exc:
             return self._with_detail(receipt, str(exc))
 
+        if plan.winner_rule_id is None or plan.configured_action is None:
+            return self._with_detail(receipt, "No rule matched; no action is required.")
+        action = plan.configured_action
+        if action is RuleAction.DELETE and not allow_delete:
+            return self._with_detail(receipt, "DELETE requires explicit --allow-delete authorization; no changes made.")
+        if action is RuleAction.MOVE and plan.destination is None:
+            return self._with_detail(receipt, "MOVE plan has no destination; no changes made.")
+
         destination = plan.destination
-        if destination is None:
-            return self._with_detail(receipt, "Routing plan has no MOVE destination; no changes made.")
-        if plan.action is RoutingAction.ALREADY_THERE:
-            return self._with_detail(receipt, "Already in destination; no changes made.")
+        already_there = action is RuleAction.MOVE and destination == plan.folder
+        destinations = (destination,) if action is RuleAction.MOVE and not already_there and destination else ()
+        requires_delete = action is RuleAction.DELETE
         settings = self._settings
         check = self._preflight(
             settings,
             plan.folder,
             password=self._password,
-            destinations=(destination,),
-            requires_delete=False,
+            destinations=destinations,
+            requires_delete=requires_delete,
             uid_scope=(plan.uid,),
             deep_probe=False,
             mailbox_factory=self._mailbox_factory,
@@ -92,39 +105,67 @@ class RoutingActionService:
                 username=settings.imap.username,
                 password=self._password,
                 folder=plan.folder,
-                writable=True,
-                allowed_destinations=(destination,),
-                max_message_bytes=settings.spam.max_message_bytes,
-                max_body_chars=settings.spam.max_body_chars,
+                writable=action is not RuleAction.KEEP and not already_there,
+                allowed_destinations=destinations,
+                allow_delete=requires_delete,
+                max_message_bytes=settings.mail.max_message_bytes,
+                max_body_chars=settings.mail.max_body_chars,
                 uid_scope=(plan.uid,),
             ) as mailbox:
                 snapshot = mailbox.snapshot()
                 if snapshot.uidvalidity != uidvalidity:
                     return self._with_detail(
                         receipt,
-                        "UIDVALIDITY changed since analysis; classify again before applying.",
+                        "UIDVALIDITY changed since analysis; evaluate the message again before applying.",
                     )
                 if plan.uid not in snapshot.uids:
                     return self._with_detail(receipt, "Message UID is no longer in the source folder; no changes made.")
                 self._validate_plan(plan, self._current_rules())
-                move_result = mailbox.move_uid(plan.uid, destination)
-                confirmed = plan.uid in move_result.moved
+                if action is RuleAction.KEEP:
+                    return RoutingActionReceipt(
+                        plan,
+                        uidvalidity,
+                        applied=True,
+                        confirmed=True,
+                        detail="Message kept in place; no mailbox mutation was required.",
+                    )
+                if already_there:
+                    return RoutingActionReceipt(
+                        plan,
+                        uidvalidity,
+                        applied=True,
+                        confirmed=True,
+                        detail="Message is already in the configured destination.",
+                    )
+                if action is RuleAction.MOVE:
+                    assert destination is not None
+                    result = mailbox.move_uid(plan.uid, destination)
+                    confirmed = plan.uid in result.moved
+                    return RoutingActionReceipt(
+                        plan,
+                        uidvalidity,
+                        applied=confirmed,
+                        confirmed=confirmed,
+                        detail=None if confirmed else "Server did not confirm the requested MOVE.",
+                    )
+                result = mailbox.delete_uid(plan.uid)
+                confirmed = plan.uid in result.deleted
                 return RoutingActionReceipt(
                     plan,
                     uidvalidity,
                     applied=confirmed,
                     confirmed=confirmed,
-                    detail=None if confirmed else "Server did not confirm the requested MOVE.",
+                    detail=None if confirmed else "Server did not confirm the requested DELETE.",
                 )
-        except PartialMoveError as exc:
-            moved = getattr(exc, "moved", ())
-            confirmed = plan.uid in moved
+        except (PartialMoveError, PartialDeleteError) as exc:
+            completed = getattr(exc, "moved", getattr(exc, "deleted", ()))
+            confirmed = plan.uid in completed
             return RoutingActionReceipt(
                 plan,
                 uidvalidity,
                 applied=confirmed,
                 confirmed=confirmed,
-                detail=f"PartialMoveError: {exc}",
+                detail=f"{type(exc).__name__}: {exc}",
             )
         except Exception as exc:
             return self._with_detail(receipt, f"{type(exc).__name__}: {exc}")
@@ -136,28 +177,38 @@ class RoutingActionService:
         settings = self._settings
         config_store = settings.config_store.folder if settings.config_store is not None else None
         rules.validate_destinations(plan.folder, config_store_folder=config_store)
-        fingerprint = rules_fingerprint(
-            rules,
-            spam_policy=settings.spam.policy.thresholds(),
-            spam_evidence_config={
-                "trusted_authserv_ids": list(settings.spam.trusted_authserv_ids),
-                "trusted_provider_headers": list(settings.spam.trusted_provider_headers),
-            },
-        )
-        if plan.rules_fingerprint != fingerprint:
-            raise ValueError("Rules changed since this plan was created; classify again before applying.")
+        if plan.rules_fingerprint != rules_fingerprint(rules):
+            raise ValueError("Rules changed since this plan was created; evaluate the message again before applying.")
         if any(result.state is EvaluationState.ERROR for result in plan.rule_results):
             raise ValueError("Routing plan contains an evaluation error; no action is authorized.")
-        if plan.destination is None:
+
+        candidates = rules.enabled_rules(plan.folder)
+        if plan.mode == "single-rule":
+            if plan.rule_scope is None:
+                raise ValueError("Single-rule plan has no rule scope; evaluate the message again.")
+            candidate = next((rule for rule in candidates if rule.id == plan.rule_scope), None)
+            candidates = (candidate,) if candidate is not None else ()
+        elif plan.mode != "full":
+            raise ValueError("Unknown routing plan mode.")
+        if tuple(result.rule_id for result in plan.rule_results) != tuple(rule.id for rule in candidates):
+            raise ValueError("Evaluated rules do not match the current rule scope; evaluate the message again.")
+
+        first_match = next(
+            (result.rule_id for result in plan.rule_results if result.state is EvaluationState.MATCH),
+            None,
+        )
+        if first_match != plan.winner_rule_id:
+            raise ValueError("Winning rule does not match the first evaluated rule; evaluate the message again.")
+        if plan.winner_rule_id is None:
+            if plan.configured_action is not None or plan.destination is not None:
+                raise ValueError("No-match plan contains a configured action; evaluate the message again.")
             return
-        if plan.winner_rule_id is not None:
-            winner = next((rule for rule in rules.enabled_rules(plan.folder) if rule.id == plan.winner_rule_id), None)
-            if winner is None or winner.destination != plan.destination:
-                raise ValueError("Winning rule or destination is no longer configured; classify again.")
-        elif plan.winner_rule_id is None:
-            raise ValueError("Plan destination is not the configured destination of a current rule.")
-        if config_store is not None and plan.destination == config_store:
-            raise ValueError("Config-store folder cannot be a routing destination.")
+
+        winner = next((rule for rule in candidates if rule.id == plan.winner_rule_id), None)
+        if winner is None or winner.action is not plan.configured_action or winner.destination != plan.destination:
+            raise ValueError("Winning rule action or destination changed; evaluate the message again.")
+        if winner.action is not RuleAction.MOVE and plan.destination is not None:
+            raise ValueError("Non-MOVE plan must not contain a destination.")
 
     @staticmethod
     def _with_detail(receipt: RoutingActionReceipt, detail: str) -> RoutingActionReceipt:

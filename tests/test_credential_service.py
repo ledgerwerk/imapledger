@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 import imapledger.credential_service as credential_service
-from imapledger.config import AuthSource, ConfigError, ImapAuthSettings, ImapSettings, Settings, SpamSettings
+from imapledger.config import AuthSource, ConfigError, ImapAuthSettings, ImapSettings, Settings
 from imapledger.credentials import (
     CredentialAlreadyExistsError,
     CredentialError,
@@ -46,9 +46,7 @@ def _settings(source: AuthSource) -> Settings:
             username="user@example.org",
             auth=ImapAuthSettings(source),
         ),
-        spam=SpamSettings(folders=("Spam",)),
     )
-
 
 def _record_config_writes(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
     def write_auth_config(path: Path, *, source: AuthSource, vault_path: Path | None = None) -> None:

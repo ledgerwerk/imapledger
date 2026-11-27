@@ -1,12 +1,12 @@
 # Configuration ledger
 
-imapledger can keep small, human-readable configuration files for arbitrary tools in a dedicated IMAP folder. Each push appends an immutable snapshot message. This ledger is separate from spam classification and does not change `imapledger config show`, which continues to display the effective local imapledger application configuration without prompting or connecting to IMAP.
+`imapledger` can keep small, human-readable configuration files for arbitrary tools in a dedicated IMAP folder. Each push appends an immutable snapshot message. The configuration ledger stores user-managed snapshots and does not change `imapledger config show`, which displays the effective local connection and optional store configuration without prompting or connecting to IMAP.
 
 > **Security warning:** Configuration snapshots are stored as readable email. Do not use the configuration ledger as a password, token, private-key, or secret store. Mailbox access, provider retention, and account compromise can expose every stored snapshot.
 
 ## Bootstrap and setup
 
-The config-ledger commands need only the local IMAP connection settings and a configured store folder. They do not require a `[spam]` section. Keep the information needed to discover and authenticate to IMAP locally:
+The config-ledger commands need the local IMAP connection settings and a configured store folder. Keep the information needed to discover and authenticate to IMAP locally:
 
 - IMAP host, port, and username;
 - credential source under `[imap.auth]`;

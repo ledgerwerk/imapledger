@@ -10,7 +10,7 @@ from imapledger.application import (
     RuleRunOperation,
     RuleRunRequest,
 )
-from imapledger.config import ConfigStoreSettings, ImapSettings, Settings, SpamSettings
+from imapledger.config import ConfigStoreSettings, ImapSettings, Settings
 from imapledger.mailbox import FolderInfo
 from imapledger.processing_engine import ProcessedMessage
 from imapledger.routing_models import RoutingRule, RuleSet, RuleType
@@ -20,7 +20,6 @@ from imapledger.rules import RuleMatch
 def _settings(*, config_store: str | None = None) -> Settings:
     return Settings(
         imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-        spam=SpamSettings(folders=()),
         config_store=ConfigStoreSettings(config_store) if config_store else None,
     )
 
@@ -87,7 +86,7 @@ def test_rule_run_executes_each_folder_through_the_same_operation(monkeypatch, t
             pass
 
         def run(self, _mailbox, **kwargs: object):
-            message = ProcessedMessage(10, "match", destination="Archive", confirmed=True)
+            message = ProcessedMessage(10, "moved", destination="Archive", confirmed=True)
             progress = SimpleNamespace(scanned_count=1)
             on_result = kwargs["on_result"]
             if on_result is not None:
@@ -145,14 +144,15 @@ def test_rule_apply_message_operation_delegates_confirmation_and_uidvalidity() -
     receipt = object()
 
     class Action:
-        def apply(self, plan, *, uidvalidity, confirmed_by_user):
+        def apply(self, plan, *, uidvalidity, confirmed_by_user, allow_delete):
             assert plan is expected_plan
             assert uidvalidity == 7
             assert confirmed_by_user is True
+            assert allow_delete is True
             return receipt
 
     expected_plan = object()
 
     operation = RuleApplyMessageOperation(Action())
 
-    assert operation.apply(expected_plan, uidvalidity=7, confirmed_by_user=True) is receipt
+    assert operation.apply(expected_plan, uidvalidity=7, confirmed_by_user=True, allow_delete=True) is receipt

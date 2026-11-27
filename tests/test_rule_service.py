@@ -1,133 +1,97 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from imapledger.config import ActionKind, MessageAction
-from imapledger.mailbox import MailboxItem, MessageSelection
-from imapledger.message import MailMessage
-from imapledger.rule_service import RuleService
-from imapledger.rule_test_service import RuleTestService
-from imapledger.rules import MailRule, RuleError, RuleMatch, RuleSet, load_rules, write_rules
+from imapledger.routing_actions import RuleAction
+from imapledger.routing_config import (
+    RoutingConfigError,
+    rules_content_fingerprint,
+    write_routing_rules,
+)
+from imapledger.routing_models import RoutingRule, RuleEvidenceSettings, RuleSet, RuleType
+from imapledger.routing_rule_service import RoutingRuleService
+from imapledger.rule_recipes import materialize_recipe
+from imapledger.rules import RuleMatch
 
 
-def _rule(
-    rule_id: str = "first",
-    *,
-    match: RuleMatch | None = None,
-    action: MessageAction | None = None,
-    enabled: bool = True,
-    source_folders: tuple[str, ...] = ("INBOX.Junk",),
-) -> MailRule:
-    return MailRule(
-        id=rule_id,
-        enabled=enabled,
-        source_folders=source_folders,
-        action=action or MessageAction(ActionKind.MOVE, "INBOX.Trash"),
-        match=match or RuleMatch(from_address=f"{rule_id}@example.org"),
+def test_rule_mutations_preserve_actions_recipes_options_scope_and_evidence(tmp_path: Path) -> None:
+    recipe = materialize_recipe(
+        "spam",
+        rule_id="spam",
+        action=RuleAction.KEEP,
+        source_folders=("INBOX",),
+        options={"phishing_match_at": 0.93},
     )
-
-
-def test_service_add_update_toggle_remove_and_reorder_preserves_order(tmp_path: Path) -> None:
+    rules = RuleSet(
+        (recipe,),
+        default_match_at=0.84,
+        evidence=RuleEvidenceSettings(trusted_provider_headers=("X-Spam-Flag",)),
+    )
     path = tmp_path / "rules.toml"
-    service = RuleService(path, source_folders=("INBOX.Junk",))
-    service.add(_rule("first"))
-    service.add(_rule("second"))
+    write_routing_rules(rules, path)
+    service = RoutingRuleService(path)
 
-    service.move("second", -1)
-    assert [rule.id for rule in load_rules(path).rules] == ["second", "first"]
+    service.set_enabled("spam", False)
+    saved = service.load()
 
-    replacement = _rule("second", action=MessageAction(ActionKind.KEEP))
-    service.update("second", replacement)
-    service.set_enabled("second", False)
-    assert not load_rules(path).rules[0].enabled
+    assert saved.rules[0].enabled is False
+    assert saved.rules[0].id == "spam"
+    assert saved.rules[0].action is RuleAction.KEEP
+    assert saved.rules[0].recipe == "spam"
+    assert saved.rules[0].options == recipe.options
+    assert saved.rules[0].source_folders == ("INBOX",)
+    assert saved.default_match_at == 0.84
+    assert saved.evidence == rules.evidence
 
-    service.remove("second")
-    assert [rule.id for rule in load_rules(path).rules] == ["first"]
 
-
-def test_service_reloads_disk_before_add_and_rejects_duplicate_id(tmp_path: Path) -> None:
+def test_learned_matcher_preserves_rule_behavior_and_shared_evidence(tmp_path: Path) -> None:
+    rule = RoutingRule(
+        id="expected-sender",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        action=RuleAction.KEEP,
+        description="Expected messages from a known sender",
+        source_folders=("INBOX",),
+    )
+    rules = RuleSet(
+        (rule,),
+        evidence=RuleEvidenceSettings(trusted_authserv_ids=("mx.example.org",)),
+    )
     path = tmp_path / "rules.toml"
-    service = RuleService(path, source_folders=("INBOX.Junk",))
-    write_rules(RuleSet((_rule("external"),)), path)
+    write_routing_rules(rules, path)
+    service = RoutingRuleService(path)
+    matcher = RuleMatch(from_address="sender@example.org")
 
-    with pytest.raises(RuleError, match="duplicate rule ID"):
-        service.add(_rule("external", match=RuleMatch(list_id="external-list")))
-
-
-def test_service_rejects_equivalent_and_conflicting_matchers(tmp_path: Path) -> None:
-    service = RuleService(tmp_path / "rules.toml", source_folders=("INBOX.Junk",))
-    service.add(_rule("first"))
-
-    with pytest.raises(RuleError, match="equivalent rule already exists: first"):
-        service.add(_rule("second", match=RuleMatch(from_address="first@example.org")))
-    with pytest.raises(RuleError, match="conflicting rule already exists: first"):
-        service.add(
-            _rule(
-                "second",
-                match=RuleMatch(from_address="first@example.org"),
-                action=MessageAction(ActionKind.KEEP),
-            )
-        )
-
-
-def test_service_rejects_unconfigured_sources_and_invalid_order_offset(tmp_path: Path) -> None:
-    service = RuleService(tmp_path / "rules.toml", source_folders=("INBOX.Junk",))
-    with pytest.raises(RuleError, match="not configured in spam.folders"):
-        service.add(_rule("outside", source_folders=("INBOX",)))
-    with pytest.raises(RuleError, match="offset must be"):
-        service.move("missing", 2)
-
-
-def test_rule_test_service_is_bounded_read_only_and_only_reports_matches(monkeypatch: pytest.MonkeyPatch) -> None:
-    message = MailMessage(
-        uid=7,
-        subject="matched subject",
-        sender="test@example.org",
-        recipients=(),
-        date="",
-        body="",
-        from_address="test@example.org",
+    service.add_learned_matcher(
+        "expected-sender",
+        matcher,
+        source_folder="INBOX",
+        expected_rules_fingerprint=rules_content_fingerprint(rules),
     )
-    calls: list[dict[str, object]] = []
+    saved = service.load()
 
-    class FakeMailbox:
-        def __init__(self, **kwargs: object) -> None:
-            calls.append(kwargs)
+    assert saved.rules[0].action is RuleAction.KEEP
+    assert saved.rules[0].source_folders == ("INBOX",)
+    assert saved.rules[0].match_any == (matcher,)
+    assert saved.evidence == rules.evidence
 
-        def __enter__(self) -> FakeMailbox:
-            return self
 
-        def __exit__(self, *_: object) -> None:
-            return None
-
-        def iter_messages(self, selection: MessageSelection):
-            assert selection.limit == 2
-            yield MailboxItem(uid=7, message=message)
-            yield MailboxItem(uid=8, skip_reason="oversized")
-
-    monkeypatch.setattr("imapledger.rule_test_service.ScopedMailbox", FakeMailbox)
-    settings = SimpleNamespace(
-        imap=SimpleNamespace(host="example.org", port=993, username="user"),
-        spam=SimpleNamespace(folders=("INBOX.Junk",), max_message_bytes=1000, max_body_chars=100),
+def test_duplicate_rule_ids_are_rejected_and_spam_id_is_not_reserved(tmp_path: Path) -> None:
+    rule = RoutingRule(
+        id="spam",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        action=RuleAction.KEEP,
+        description="Messages about canned meat",
     )
-    result = RuleTestService(settings, "secret").test(_rule("test"), limit=2)  # type: ignore[arg-type]
+    path = tmp_path / "rules.toml"
+    write_routing_rules(RuleSet((rule,)), path)
+    service = RoutingRuleService(path)
 
-    assert result.scanned == 2
-    assert [(item.uid, item.subject) for item in result.matches] == [(7, "matched subject")]
-    assert calls[0]["writable"] is False
-    assert calls[0]["password"] == "secret"
+    with pytest.raises(RoutingConfigError, match="duplicate rule ID: spam"):
+        service.add(rule)
 
-
-def test_rule_test_service_rejects_unbounded_or_out_of_scope_test() -> None:
-    settings = SimpleNamespace(
-        imap=SimpleNamespace(host="example.org", port=993, username="user"),
-        spam=SimpleNamespace(folders=("INBOX.Junk",), max_message_bytes=1000, max_body_chars=100),
-    )
-    service = RuleTestService(settings, "secret")  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="positive integer"):
-        service.test(_rule("test"), limit=0)
-    with pytest.raises(RuleError, match="not configured in spam.folders"):
-        service.test(_rule("test", source_folders=("INBOX",)), limit=5)
+    service.remove("spam")
+    assert service.load().rules == ()

@@ -11,7 +11,6 @@ from imapledger.config import (
     ImapAuthSettings,
     ImapSettings,
     Settings,
-    SpamSettings,
     load_settings,
     write_auth_config,
     write_settings,
@@ -22,10 +21,7 @@ from imapledger.tui.app import MailReviewApp
 from imapledger.tui.session import AppSession, SessionState
 from imapledger.tui.system_screens import ConnectDialog, CredentialSetDialog, SetupDialog, SystemScreen
 
-SETTINGS = Settings(
-    imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-    spam=SpamSettings(folders=("Spam",)),
-)
+SETTINGS = Settings(imap=ImapSettings(host="imap.example.org", username="user@example.org"))
 
 
 class _Closable:

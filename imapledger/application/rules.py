@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..message import MailMessage
+from ..routing_actions import RuleAction
 from ..routing_config import (
     RoutingConfigError,
     RuleMigrationResult,
@@ -44,7 +45,9 @@ class RuleMigrationOperation:
             raise RoutingConfigError(f"could not read rules file {self.path}: {exc}") from exc
         return RuleMigrationPreview(sha256(source).hexdigest(), result)
 
-    def apply(self, preview: RuleMigrationPreview) -> RuleMigrationResult:
+    def apply(self, preview: RuleMigrationPreview, *, allow_delete: bool = False) -> RuleMigrationResult:
+        if any(rule.action is RuleAction.DELETE for rule in preview.result.rules.rules) and not allow_delete:
+            raise RoutingConfigError("migration creates a destructive DELETE rule; authorize deletion before applying")
         try:
             current = self.path.read_bytes()
         except OSError as exc:

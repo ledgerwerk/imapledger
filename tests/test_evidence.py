@@ -143,14 +143,14 @@ def test_links_are_normalized_deduplicated_and_bounded_without_urls() -> None:
     )
 
     evidence = build_message_evidence(message)
-    state = build_jev_state(evidence, message, context=MailboxContext("junk", True))
+    state = build_jev_state(evidence, message, context=MailboxContext(source_folder="INBOX.Junk"))
 
     assert evidence.links.distinct_domain_count == MAX_LINK_DOMAINS
     assert len(evidence.links.domains) == MAX_LINK_DOMAINS
     assert evidence.links.from_domain_matches_any is False
     assert "token" not in repr(state)
     assert "/path" not in repr(state)
-    assert "folder_role" in state["mailbox_context"]
+    assert "source_folder" in state["mailbox_context"]
 
 
 def test_idn_domain_and_unicode_sender_facts_are_preserved() -> None:

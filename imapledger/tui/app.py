@@ -25,19 +25,12 @@ from ..application import (
     ErrorPresentation,
     OperationContext,
     ProgressOperation,
-    ReviewOperation,
-    ReviewRequest,
     RuleEvaluationOperation,
     RuleRunOperation,
     RuleRunRequest,
-    StateFolderStatus,
-    StateOperation,
-    StateResetRequest,
-    StateResetResult,
 )
 from ..application.clean import CleanResult as RuleRunFolderResult
 from ..application.rules import RuleLearningOperation, RuleLearningPreview, RuleMigrationOperation, RuleMigrationPreview
-from ..classification_state import ClassificationStateBackend
 from ..config import AuthSource, Settings, write_settings
 from ..config_errors import ConfigLedgerError, SensitiveConfigError
 from ..config_ledger import ConfigLedger, ConfigPullPreview
@@ -58,14 +51,12 @@ from ..processing_engine import ProcessedMessage, ProcessingReport
 from ..progress_store import MessageResult, ProgressRun
 from ..remote_images import RemoteImageLoader
 from ..routing_action_service import RoutingActionReceipt
-from ..routing_config import routing_rules_path_for_config
-from ..routing_models import RoutingAction, RoutingPlan, RoutingRule, RuleType
+from ..routing_actions import RuleAction
+from ..routing_config import RULE_SCHEMA, routing_rules_path_for_config
+from ..routing_models import RoutingAction, RoutingPlan, RoutingRule
 from ..routing_models import RuleSet as RoutingRuleSet
 from ..routing_rule_service import RoutingRuleService
-from ..rule_service import RuleService
-from ..rule_test_service import RuleTestService
-from ..rules import RuleSet, rules_path_for_config
-from ..settings_service import SettingsService
+from ..rule_recipes import get_recipe, materialize_recipe
 from .command_center import CommandCenterScreen
 from .config_ledger_screens import (
     ConfigLedgerScreen,
@@ -84,7 +75,8 @@ from .rule_screens import (
     RuleLearnPreviewScreen,
     RuleLearnTargetScreen,
     RuleMigrationPreviewScreen,
-    RulePresetScreen,
+    RuleRecipeCatalogScreen,
+    RuleRemovalConfirmation,
     RuleTestResultScreen,
 )
 from .session import AppSession, SessionState
@@ -131,16 +123,13 @@ def _format_action(action: Any) -> str:
 
 
 class FolderListItem(ListItem):
-    def __init__(self, folder_name: str | None, label: str) -> None:
+    def __init__(self, folder_name: str, label: str) -> None:
         super().__init__(Label(label))
         self.folder_name = folder_name
 
-    @property
-    def is_review(self) -> bool:
-        return self.folder_name is None
 
 
-class ApplyConfirmation(ModalScreen[bool]):
+class ApplyConfirmation(ModalScreen[tuple[bool, bool]]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
     CSS = """
     ApplyConfirmation { align: center middle; }
@@ -155,196 +144,46 @@ class ApplyConfirmation(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         plan = self.plan
-        yield Static(
-            "Apply current routing plan?\n\n"
-            f"UID: {plan.uid}\nSource: {plan.folder}\n"
-            f"Rule: {plan.winner_rule_id or 'none'}\nDestination: {plan.destination}\n\n"
-            "MOVE this exact message?",
-            markup=False,
-        )
-        with Horizontal(id="confirm-buttons"):
-            yield Button("Move message", id="apply", variant="primary")
-            yield Button("Cancel", id="cancel")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "apply")
-
-    def action_cancel(self) -> None:
-        self.dismiss(False)
-
-
-class StateScreen(ModalScreen[tuple[str, str] | None]):
-    CSS = """
-    StateScreen { align: center middle; }
-    #state-box { width: 94%; height: 88%; border: round $accent; padding: 1 2; background: $surface; }
-    #state-table { height: 1fr; }
-    #state-buttons { height: 3; align-horizontal: right; }
-    #state-buttons Button { margin-left: 1; }
-    """
-
-    def __init__(
-        self,
-        statuses: tuple[StateFolderStatus, ...],
-        errors: tuple[tuple[str, str], ...] = (),
-    ) -> None:
-        super().__init__()
-        self.statuses = statuses
-        self.errors = errors
-        self.folders = tuple(item.folder for item in statuses) + tuple(folder for folder, _ in errors)
-        self.selected_folder: str | None = self.folders[0] if self.folders else None
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="state-box"):
-            yield Static("Classification State", markup=False)
-            yield DataTable(id="state-table", cursor_type="row")
-            with Horizontal(id="state-buttons"):
-                yield Button("Reset state…", id="state-reset", disabled=not bool(self.folders))
-                yield Button("Close", id="state-close")
-
-    def on_mount(self) -> None:
-        table = self.query_one("#state-table", DataTable)
-        table.add_columns(
-            "Folder",
-            "UIDVALIDITY",
-            "Backend",
-            "Persistence",
-            "Total",
-            "Spam",
-            "Not spam",
-            "Review",
-            "Unclassified",
-            "Conflicts",
-        )
-        for item in self.statuses:
-            table.add_row(
-                item.folder,
-                str(item.uidvalidity),
-                item.backend.value,
-                item.keyword_persistence,
-                str(item.total),
-                str(item.spam),
-                str(item.notspam),
-                str(item.review),
-                str(item.unclassified),
-                str(item.conflicts),
-            )
-        for folder, error_type in self.errors:
-            table.add_row(folder, "-", "-", f"ERROR: {error_type}", "-", "-", "-", "-", "-", "-")
-        if self.folders:
-            table.move_cursor(row=0)
-
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id == "state-table" and 0 <= event.cursor_row < len(self.folders):
-            self.selected_folder = self.folders[event.cursor_row]
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "state-reset" and self.selected_folder is not None:
-            self.dismiss(("reset", self.selected_folder))
-        elif event.button.id == "state-close":
-            self.dismiss(None)
-
-
-class StateResetDialog(ModalScreen[StateResetRequest | None]):
-    CSS = """
-    StateResetDialog { align: center middle; }
-    #state-reset-box { width: 78; height: auto; border: round $accent; padding: 1 2; background: $surface; }
-    #state-reset-buttons { height: 3; align-horizontal: right; }
-    #state-reset-buttons Button { margin-left: 1; }
-    """
-
-    def __init__(self, folder: str, settings: Settings) -> None:
-        super().__init__()
-        self.folder = folder
-        self.settings = settings
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="state-reset-box"):
-            yield Static(f"Preview classification-state reset\nSelected source: {self.folder}", markup=False)
-            yield Input(placeholder="Exact UID (leave blank for folder-wide reset)", id="state-reset-uid")
-            yield Checkbox("Reset all marked UIDs in this folder", id="state-reset-all")
-            yield Checkbox("Include all configured source folders", id="state-reset-all-folders")
-            yield Checkbox("I intend to apply after reviewing the preview", id="state-reset-apply")
+        is_delete = plan.configured_action is RuleAction.DELETE
+        action = "DELETE" if is_delete else "MOVE"
+        destination = f"\nDestination: {plan.destination}" if plan.destination else ""
+        with Vertical(id="confirm-box"):
             yield Static(
-                "Choose an exact UID or explicitly select all marked UIDs.",
-                id="state-reset-warning",
+                f"Apply current routing plan?\n\nUID: {plan.uid}\nSource: {plan.folder}\n"
+                f"Rule: {plan.winner_rule_id or 'none'}\nAction: {action}{destination}",
                 markup=False,
             )
-            with Horizontal(id="state-reset-buttons"):
-                yield Button("Preview reset", id="state-reset-preview")
-                yield Button("Cancel", id="state-reset-cancel")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "state-reset-cancel":
-            self.dismiss(None)
-            return
-        try:
-            uid_text = self.query_one("#state-reset-uid", Input).value.strip()
-            uid = int(uid_text) if uid_text else None
-            all_folders = self.query_one("#state-reset-all-folders", Checkbox).value
-            request = StateResetRequest(
-                folder=None if all_folders else self.folder,
-                uid=uid,
-                reset_all=self.query_one("#state-reset-all", Checkbox).value,
-                all_folders=all_folders,
-                apply=self.query_one("#state-reset-apply", Checkbox).value,
-            )
-            StateOperation(self.settings).reset_folders(request)
-            self.dismiss(request)
-        except (ValueError, TypeError) as exc:
-            self.query_one("#state-reset-warning", Static).update(str(exc))
-
-
-class StateResetPreviewScreen(ModalScreen[bool]):
-    CSS = """
-    StateResetPreviewScreen { align: center middle; }
-    #state-preview-box { width: 82; height: 82%; border: round $warning; padding: 1 2; background: $surface; }
-    #state-preview-scroll { height: 1fr; }
-    #state-preview-buttons { height: 3; align-horizontal: right; }
-    #state-preview-buttons Button { margin-left: 1; }
-    """
-
-    def __init__(self, request: StateResetRequest, results: tuple[StateResetResult, ...]) -> None:
-        super().__init__()
-        self.request = request
-        self.results = results
-
-    def compose(self) -> ComposeResult:
-        scope = (
-            "All configured source folders: " + ", ".join(result.folder for result in self.results)
-            if self.request.all_folders
-            else f"Exact source folder: {self.request.folder}"
-        )
-        if self.request.uid is not None:
-            scope += f"\nExact UID: {self.request.uid}"
-        else:
-            scope += "\nTarget: all marked state UIDs in the selected folder scope"
-        counts = (
-            "\n".join(
-                f"{result.folder}: {len(result.targeted_uids)} UID(s) "
-                f"[{', '.join(map(str, result.targeted_uids)) or 'none'}], {result.marker_count} marker(s)"
-                for result in self.results
-            )
-            or "No state markers found."
-        )
-        intent = (
-            "Apply was selected. Confirm below to remove only these markers."
-            if self.request.apply
-            else "Preview only. No changes will be made."
-        )
-        with Vertical(id="state-preview-box"):
-            with VerticalScroll(id="state-preview-scroll"):
-                yield Static(f"Classification-state reset preview\n\n{scope}\n\n{counts}\n\n{intent}", markup=False)
-            with Horizontal(id="state-preview-buttons"):
-                yield Button(
-                    "Apply exact reset",
-                    id="state-reset-confirm",
-                    disabled=not self.request.apply,
-                    variant="error",
+            if is_delete:
+                yield Static(
+                    "This permanently deletes the exact message after UID and fingerprint checks.",
+                    markup=False,
                 )
-                yield Button("Close", id="state-preview-close")
+                yield Checkbox("Authorize deletion of this message", id="apply-delete-authorized")
+            with Horizontal(id="confirm-buttons"):
+                yield Button(
+                    "Delete message" if is_delete else "Move message",
+                    id="apply",
+                    variant="error" if is_delete else "primary",
+                    disabled=is_delete,
+                )
+                yield Button("Cancel", id="cancel")
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id == "apply-delete-authorized":
+            self.query_one("#apply", Button).disabled = not event.checkbox.value
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "state-reset-confirm")
+        if event.button.id == "cancel":
+            self.dismiss((False, False))
+            return
+        allow_delete = self.plan.configured_action is RuleAction.DELETE and self.query_one(
+            "#apply-delete-authorized", Checkbox
+        ).value
+        self.dismiss((True, allow_delete))
+
+    def action_cancel(self) -> None:
+        self.dismiss((False, False))
+
 
 
 class ProgressScreen(ModalScreen[tuple[str, ProgressRun] | None]):
@@ -591,6 +430,7 @@ class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
             yield Label("Sort order")
             yield Input(value="oldest", id="rule-run-sort")
             yield Checkbox("Apply rules", value=self.default_apply, id="rule-run-apply")
+            yield Checkbox("Explicitly authorize configured DELETE actions", id="rule-run-allow-delete")
             yield Checkbox("Start a new run", id="rule-run-new-run")
             yield Checkbox("Retry errors", id="rule-run-retry-errors")
             yield Static("CLI equivalent: imapledger rule preview", id="rule-run-command", markup=False)
@@ -607,7 +447,9 @@ class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
     def on_input_changed(self, _event: Input.Changed) -> None:
         self._update_command()
 
-    def on_checkbox_changed(self, _event: Checkbox.Changed) -> None:
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.checkbox.id == "rule-run-apply" and not event.checkbox.value:
+            self.query_one("#rule-run-allow-delete", Checkbox).value = False
         self._update_command()
 
     def _request(self) -> RuleRunRequest:
@@ -617,20 +459,26 @@ class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
         except ValueError as exc:
             raise ValueError("Limit must be a positive integer or blank for unlimited.") from exc
         sort = self.query_one("#rule-run-sort", Input).value.strip().lower() or "oldest"
+        apply = self.query_one("#rule-run-apply", Checkbox).value
+        allow_delete = apply and self.query_one("#rule-run-allow-delete", Checkbox).value
         return RuleRunRequest(
             folders=(self.folder,),
-            apply=self.query_one("#rule-run-apply", Checkbox).value,
+            apply=apply,
             limit=limit,
             sort=sort,
             rule_scope=self.query_one("#rule-run-rule", Input).value.strip() or None,
             new_run=self.query_one("#rule-run-new-run", Checkbox).value,
             retry_errors=self.query_one("#rule-run-retry-errors", Checkbox).value,
+            allow_delete=allow_delete,
         )
 
     def _update_command(self) -> None:
         if not self.is_mounted:
             return
-        command = "apply" if self.query_one("#rule-run-apply", Checkbox).value else "preview"
+        apply = self.query_one("#rule-run-apply", Checkbox).value
+        allow_delete = self.query_one("#rule-run-allow-delete", Checkbox)
+        allow_delete.disabled = not apply
+        command = "apply" if apply else "preview"
         parts = ["imapledger", "rule", command, "--folder", shlex.quote(self.folder)]
         limit = self.query_one("#rule-run-limit", Input).value.strip()
         if limit:
@@ -644,10 +492,14 @@ class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
             parts.append("--new-run")
         if self.query_one("#rule-run-retry-errors", Checkbox).value:
             parts.append("--retry-errors")
+        if apply and allow_delete.value:
+            parts.append("--allow-delete")
         self.query_one("#rule-run-command", Static).update("CLI equivalent: " + " ".join(parts))
-        self.query_one("#rule-run-start", Button).label = (
-            "Apply rules" if self.query_one("#rule-run-apply", Checkbox).value else "Preview rules"
-        )
+        if apply:
+            label = "Authorize and apply" if allow_delete.value else "Apply rules"
+        else:
+            label = "Preview rules"
+        self.query_one("#rule-run-start", Button).label = label
         try:
             self._request()
         except ValueError as exc:
@@ -712,14 +564,19 @@ class RuleRunApplyConfirmation(ModalScreen[bool]):
                 f"Source: {request.folders[0]}\nMaximum messages: {request.limit or 'unlimited'}\n"
                 f"Sort: {request.sort}\nRule scope: {request.rule_scope or 'all enabled rules'}\n"
                 f"Possible destinations: {', '.join(self.destinations) or 'none'}\n"
+                f"DELETE actions: {'explicitly authorized' if request.allow_delete else 'not authorized'}\n"
                 f"Progress DB: {request.progress_db}\n\n"
-                "Moves are applied message-by-message. This is best-effort, not transactional.\n"
-                "Already confirmed moves are not rolled back if a later message fails.",
+                "Moves and authorized deletes are applied message-by-message. This is best-effort, not transactional.\n"
+                "Already confirmed actions are not rolled back if a later message fails.",
                 markup=False,
             )
             with Horizontal(id="rule-run-confirm-buttons"):
                 yield Button("Cancel", id="rule-run-confirm-cancel")
-                yield Button("Apply", id="rule-run-confirm-apply", variant="error")
+                yield Button(
+                    "Authorize and apply" if self.request.allow_delete else "Apply",
+                    id="rule-run-confirm-apply",
+                    variant="error",
+                )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "rule-run-confirm-apply")
@@ -1079,7 +936,6 @@ class MailReviewApp(App[None]):
         Binding("c", "evaluate_rules", "Evaluate rules"),
         Binding("e", "explain", "Explain evaluation"),
         Binding("l", "learn_rule", "Learn rule"),
-        Binding("S", "state", "State"),
         Binding("s", "system", "System"),
         Binding("a", "apply", "Action"),
         Binding("R", "rules", "Rules"),
@@ -1122,14 +978,8 @@ class MailReviewApp(App[None]):
         session: AppSession | None = None,
         password: str = "",
         mail_service: Any | None = None,
-        review_operation: ReviewOperation | None = None,
         settings: Settings | None = None,
-        rules: RuleSet | None = None,
-        rule_service: RuleService | None = None,
-        routing_rules: RoutingRuleSet | None = None,
         routing_rule_service: RoutingRuleService | None = None,
-        rule_test_service: RuleTestService | None = None,
-        settings_service: SettingsService | None = None,
         analysis_service: Any | None = None,
         action_service: Any | None = None,
         image_analysis_service: Any | None = None,
@@ -1137,12 +987,12 @@ class MailReviewApp(App[None]):
     ) -> None:
         super().__init__()
         self.session = session
+        routing_rules = RoutingRuleSet()
         if session is not None:
             config = session.config_path
             password = session.password
             mail_service = session.mail_service
             settings = session.settings
-            review_operation = ReviewOperation(settings) if settings is not None else None
             routing_rules = session.routing_rules
             routing_rule_service = session.routing_rule_service
             analysis_service = session.analysis_service
@@ -1150,16 +1000,9 @@ class MailReviewApp(App[None]):
         self.config = config
         self._password = password
         self.mail_service = mail_service
-        self.review_operation = review_operation
         self.settings = settings
-        self.settings_service = settings_service or (SettingsService(config) if settings else None)
-        self.rules = rules or RuleSet()
-        self.rule_service = rule_service or (
-            RuleService(rules_path_for_config(config), source_folders=settings.spam.folders) if settings else None
-        )
         self.routing_rules = routing_rules or RoutingRuleSet()
         self.routing_rule_service = routing_rule_service
-        self.rule_test_service = rule_test_service
         self.analysis_service = analysis_service
         self.action_service = action_service
         self.image_analysis_service = image_analysis_service
@@ -1173,14 +1016,12 @@ class MailReviewApp(App[None]):
         self._image_cache: dict[tuple[str, int, int], ImageAnalysisReport] = {}
         self.folders: tuple[FolderInfo, ...] = ()
         self._folder_item_by_name: dict[str, FolderListItem] = {}
-        self._review_item: FolderListItem | None = None
         self._rows: list[tuple[str, MailSummary]] = []
         self._page_limit = 50
         self._page_offset = 0
         self._page_sort = MessageSort.NEWEST
         self._page_has_previous = False
         self._page_has_next = False
-        self._review_filter: str | None = None
         self._list_folder: str | None = None
         self._selected_folder: str | None = None
         self._loading_folder: str | None = None
@@ -1200,7 +1041,7 @@ class MailReviewApp(App[None]):
         yield Header()
         with Horizontal(id="workspace"):
             with Vertical(id="folder-pane", classes="pane"):
-                yield Static("Folders and smart views", markup=False)
+                yield Static("Folders", markup=False)
                 yield FolderListView(id="folders")
             with Vertical(id="message-pane", classes="pane"):
                 yield Static("Messages", markup=False)
@@ -1211,7 +1052,6 @@ class MailReviewApp(App[None]):
                     with Horizontal():
                         yield Button("Sort", id="mail-sort")
                         yield Button("Size", id="mail-size")
-                        yield Button("Source", id="review-filter", disabled=True)
                     with Horizontal():
                         yield Button("Preview 10", id="mail-preview-rules")
                         yield Button("Apply rules…", id="mail-apply-rules")
@@ -1250,7 +1090,7 @@ class MailReviewApp(App[None]):
             self.query_one("#activity").styles.height = 8
 
     def on_mount(self) -> None:
-        self.query_one("#messages", DataTable).add_columns("Folder", "State", "UID", "From", "Subject", "Date", "Size")
+        self.query_one("#messages", DataTable).add_columns("Folder", "Read", "UID", "From", "Subject", "Date", "Size")
         self._render_mail_controls(total=0)
         if self.mail_service is None:
             state = self.session.status if self.session is not None else SessionState.DISCONNECTED
@@ -1290,30 +1130,22 @@ class MailReviewApp(App[None]):
 
     def _getting_started_text(self) -> str:
         active_rules = self.routing_rules.enabled_rules()
-        spam_rule = next((rule for rule in self.routing_rules.rules if rule.type is RuleType.SPAM), None)
         if not active_rules:
             return (
                 "No active rules yet.\n\n"
-                "[Set up Spam rule] Check the Spam destination in Rules.\n"
-                "[Add common rule] Choose a preset in the Rules workbench.\n"
+                "[Add a rule] Choose a recipe or create a rule in the Rules workbench.\n"
                 "[Open Rules] Press R to review all rules.\n\n"
                 "Nothing is moved during Preview."
             )
-        spam_status = (
-            f"Spam -> {spam_rule.destination}  {'Enabled' if spam_rule.enabled else 'Disabled'}"
-            if spam_rule is not None
-            else "Spam rule is not configured"
-        )
         return (
             "Getting started\n\n"
             "1. Select a folder on the left.\n"
             "2. Preview rules on 10 messages with x.\n"
             "3. Open Rules with R to add or edit automation.\n"
             "4. Select a message and press l to teach an existing rule.\n\n"
-            f"Spam: {spam_status}\n\n"
+            f"{len(active_rules)} active rule(s).\n\n"
             "Nothing is moved during Preview. Press h for all shortcuts."
         )
-
     def _folder_label(self, folder: FolderInfo) -> str:
         counts = f"  {folder.total}" if folder.total is not None else ""
         unread = f" ({folder.unread} unread)" if folder.unread else ""
@@ -1324,11 +1156,9 @@ class MailReviewApp(App[None]):
         view = self.query_one("#folders", ListView)
         current_names = tuple(self._folder_item_by_name)
         folder_names = tuple(folder.name for folder in folders)
-        if self._review_item is None or current_names != folder_names:
+        if current_names != folder_names:
             view.clear()
             self._folder_item_by_name = {}
-            self._review_item = FolderListItem(None, "Review smart view")
-            view.append(self._review_item)
             for folder in folders:
                 item = FolderListItem(folder.name, self._folder_label(folder))
                 self._folder_item_by_name[folder.name] = item
@@ -1337,15 +1167,11 @@ class MailReviewApp(App[None]):
 
         for folder in folders:
             self._folder_item_by_name[folder.name].query_one(Label).update(self._folder_label(folder))
-
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id != "folders" or not isinstance(event.item, FolderListItem):
             return
-        folder = "Review" if event.item.is_review else event.item.folder_name
-        if folder is None:
-            return
+        folder = event.item.folder_name
         self._page_offset = 0
-        self._review_filter = None
         generation = self._begin_folder_load(folder)
         self.run_worker(
             self._select_folder(folder, generation),
@@ -1353,7 +1179,6 @@ class MailReviewApp(App[None]):
             exclusive=True,
             exit_on_error=False,
         )
-
     def _begin_folder_load(self, folder: str) -> int:
         self._folder_generation += 1
         self._message_generation += 1
@@ -1384,61 +1209,24 @@ class MailReviewApp(App[None]):
         if generation is None:
             generation = self._begin_folder_load(folder)
         try:
-            review_errors = False
-            if folder == "Review":
-                request = ReviewRequest(
-                    folder=self._review_filter,
-                    limit=self._page_limit,
-                    offset=self._page_offset,
-                    sort=self._page_sort,
-                )
-                if self.review_operation is not None:
-                    page = await asyncio.to_thread(
-                        self.review_operation.run,
-                        request,
-                        password=self._password,
-                    )
-                    page_rows = page.items
-                    self._page_has_previous = page.has_previous
-                    self._page_has_next = page.has_next
-                    total = page.total
-                    review_errors = bool(page.errors)
-                    if page.errors:
-                        self._set_status(
-                            f"Review loaded with {len(page.errors)} source error(s): "
-                            f"{', '.join(type(error).__name__ for _, error in page.errors)}"
-                        )
-                else:
-                    rows = await asyncio.to_thread(
-                        self.mail_service.review_messages,
-                        limit=self._page_limit,
-                        offset=self._page_offset,
-                    )
-                    page_rows = tuple(rows)
-                    total = len(page_rows)
-                    self._page_has_previous = self._page_offset > 0
-                    self._page_has_next = len(page_rows) >= self._page_limit
-            else:
-                page = await asyncio.to_thread(
-                    self.mail_service.list_messages,
-                    folder,
-                    limit=self._page_limit,
-                    offset=self._page_offset,
-                    sort=self._page_sort,
-                )
-                page_rows = tuple((folder, item) for item in page.items)
-                self._page_has_previous = page.has_previous
-                self._page_has_next = page.has_next
-                total = page.total
+            page = await asyncio.to_thread(
+                self.mail_service.list_messages,
+                folder,
+                limit=self._page_limit,
+                offset=self._page_offset,
+                sort=self._page_sort,
+            )
+            page_rows = tuple((folder, item) for item in page.items)
             if generation != self._folder_generation:
                 return
+            self._page_has_previous = page.has_previous
+            self._page_has_next = page.has_next
             self._populate_rows(page_rows)
             self._loading_folder = None
-            if not review_errors:
-                self._set_status(
-                    f"{folder}: {len(page_rows)} messages loaded, page {self._page_offset // self._page_limit + 1}."
-                )
-            self._render_mail_controls(total=total)
+            self._set_status(
+                f"{folder}: {len(page_rows)} messages loaded, page {self._page_offset // self._page_limit + 1}."
+            )
+            self._render_mail_controls(total=page.total)
         except Exception as exc:
             if generation == self._folder_generation:
                 self._loading_folder = None
@@ -1451,21 +1239,18 @@ class MailReviewApp(App[None]):
                 )
                 self._render_mail_controls(total=0)
                 self._set_status(f"Could not load {folder}: {type(exc).__name__}")
-
     def _populate_rows(self, rows: tuple[tuple[str, MailSummary], ...]) -> None:
         self._rows = list(rows)
         table = self.query_one("#messages", DataTable)
         table.clear()
         for index, (folder, summary) in enumerate(rows):
-            state = summary.persisted_state.value.upper() if summary.persisted_state else "?"
             flags = {
                 flag.decode("ascii", errors="replace") if isinstance(flag, bytes) else flag for flag in summary.flags
             }
-            if "\\Seen" not in flags:
-                state = "● " + state
+            read = "yes" if "\\Seen" in flags else "no"
             table.add_row(
                 folder,
-                state,
+                read,
                 str(summary.uid),
                 summary.sender,
                 summary.subject,
@@ -1473,23 +1258,19 @@ class MailReviewApp(App[None]):
                 str(summary.size_bytes or "-"),
                 key=str(index),
             )
-
     def _render_mail_controls(self, *, total: int) -> None:
         self.query_one("#mail-previous", Button).disabled = not self._page_has_previous
         self.query_one("#mail-next", Button).disabled = not self._page_has_next
-        review_enabled = self._list_folder == "Review" and self.settings is not None
-        self.query_one("#review-filter", Button).disabled = not review_enabled
         page_number = self._page_offset // self._page_limit + 1
-        source = self._review_filter or "all sources" if self._list_folder == "Review" else self._list_folder or "none"
+        folder = self._list_folder or "none"
         self.query_one("#mail-page-info", Static).update(
-            f"Page {page_number} · {self._page_sort.value} · {self._page_limit} · {source} · {len(self._rows)}/{total}"
+            f"Page {page_number} · {self._page_sort.value} · {self._page_limit} · {folder} · {len(self._rows)}/{total}"
         )
-        has_real_folder = self._selected_folder not in (None, "Review")
-        self.query_one("#mail-preview-rules", Button).disabled = not has_real_folder
-        self.query_one("#mail-apply-rules", Button).disabled = not has_real_folder
+        has_folder = self._selected_folder is not None
+        self.query_one("#mail-preview-rules", Button).disabled = not has_folder
+        self.query_one("#mail-apply-rules", Button).disabled = not has_folder
         self.query_one("#mail-open-rules", Button).disabled = self.routing_rule_service is None
         self.query_one("#mail-learn-rule", Button).disabled = self._detail is None or self._detail.item.message is None
-
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "mail-previous":
             self._change_page(-1)
@@ -1504,8 +1285,6 @@ class MailReviewApp(App[None]):
             self._page_limit = sizes[(sizes.index(self._page_limit) + 1) % len(sizes)]
             self._page_offset = 0
             self._reload_current_page()
-        elif event.button.id == "review-filter":
-            self._cycle_review_filter()
 
         elif event.button.id == "mail-preview-rules":
             self.action_preview_rules_ten()
@@ -1522,17 +1301,6 @@ class MailReviewApp(App[None]):
         self._page_offset = max(0, self._page_offset + direction * self._page_limit)
         self._reload_current_page()
 
-    def _cycle_review_filter(self) -> None:
-        if self.settings is None or self._list_folder != "Review":
-            return
-        filters = (None, *self.settings.spam.folders)
-        try:
-            index = filters.index(self._review_filter)
-        except ValueError:
-            index = 0
-        self._review_filter = filters[(index + 1) % len(filters)]
-        self._page_offset = 0
-        self._reload_current_page()
 
     def _reload_current_page(self) -> None:
         if self._list_folder is None:
@@ -1611,7 +1379,7 @@ class MailReviewApp(App[None]):
             f"Body source: {message.body_source}",
         ]
         if message.body_truncated:
-            parts.append(f"Body truncated at max_body_chars={self.settings.spam.max_body_chars}.")
+            parts.append(f"Body truncated at max_body_chars={self.settings.mail.max_body_chars}.")
         if message.has_attachments:
             parts.append(f"Attachments: {message.attachment_count} (not opened by imapledger)")
         return "\n".join(parts)
@@ -1891,106 +1659,6 @@ class MailReviewApp(App[None]):
         lines.extend(("", "Next", next_step))
         self.query_one("#analysis", Static).update("\n".join(lines))
 
-    def action_state(self) -> None:
-        if self.settings is None or not self._password:
-            self._set_status("Classification state requires a connected IMAP session.")
-            return
-        self.run_worker(self._open_state(), group="state-status", exclusive=True, exit_on_error=False)
-
-    async def _open_state(self) -> None:
-        if self.settings is None:
-            return
-        operation = StateOperation(self.settings)
-        statuses: list[StateFolderStatus] = []
-        errors: list[tuple[str, str]] = []
-        for folder in self.settings.spam.folders:
-            try:
-                status = await asyncio.to_thread(
-                    operation.status,
-                    folder,
-                    password=self._password,
-                )
-            except Exception as exc:
-                errors.append((folder, type(exc).__name__))
-            else:
-                statuses.append(status)
-        self.push_screen(StateScreen(tuple(statuses), tuple(errors)), self._state_screen_choice)
-
-    def _state_screen_choice(self, choice: tuple[str, str] | None) -> None:
-        if choice is None or self.settings is None:
-            return
-        action, folder = choice
-        if action == "reset":
-            self.push_screen(StateResetDialog(folder, self.settings), self._state_reset_request)
-
-    def _state_reset_request(self, request: StateResetRequest | None) -> None:
-        if request is None:
-            return
-        self.run_worker(
-            self._preview_state_reset(request),
-            group="state-reset-preview",
-            exclusive=True,
-            exit_on_error=False,
-        )
-
-    async def _preview_state_reset(self, request: StateResetRequest) -> None:
-        if self.settings is None:
-            return
-        operation = StateOperation(self.settings)
-        try:
-            folders = operation.reset_folders(request)
-            preview_request = replace(request, apply=False)
-            results = tuple(
-                [
-                    await asyncio.to_thread(
-                        operation.reset_folder,
-                        folder,
-                        preview_request,
-                        password=self._password,
-                    )
-                    for folder in folders
-                ]
-            )
-            self.push_screen(
-                StateResetPreviewScreen(request, results),
-                lambda confirmed: self._apply_state_reset(request) if confirmed and request.apply else None,
-            )
-        except Exception as exc:
-            self._set_status(f"State reset preview failed: {type(exc).__name__}.")
-
-    def _apply_state_reset(self, request: StateResetRequest) -> None:
-        if self.settings is None or not request.apply:
-            return
-        self.run_worker(
-            self._apply_state_reset_job(request),
-            group="state-reset-apply",
-            exclusive=True,
-            exit_on_error=False,
-        )
-
-    async def _apply_state_reset_job(self, request: StateResetRequest) -> None:
-        if self.settings is None:
-            return
-        operation = StateOperation(self.settings)
-        try:
-            applied_request = replace(request, apply=True)
-            folders = operation.reset_folders(applied_request)
-            results = []
-            for folder in folders:
-                results.append(
-                    await asyncio.to_thread(
-                        operation.reset_folder,
-                        folder,
-                        applied_request,
-                        password=self._password,
-                    )
-                )
-            self._activity.append(f"Classification state reset applied to {len(results)} configured source folder(s).")
-            self._render_activity()
-            self._set_status("Classification state reset completed.")
-            await self._open_state()
-        except Exception as exc:
-            self._set_status(f"State reset failed: {type(exc).__name__}.")
 
     def action_progress(self) -> None:
         if self.settings is None:
@@ -2075,25 +1743,22 @@ class MailReviewApp(App[None]):
         if self.settings is None:
             return
         operation = DoctorOperation(self.settings)
-        actions = self.settings.spam.actions
-        action_destinations = [
-            action.destination
-            for action in (actions.spam, actions.not_spam, actions.review)
-            if action.destination is not None
-        ]
-        requires_delete = any(
-            action.action.value == "delete" for action in (actions.spam, actions.not_spam, actions.review)
-        )
+        operation = DoctorOperation(self.settings)
         results: list[SourcePreflightResult] = []
-        for folder in self.settings.spam.folders:
-            destinations = list(action_destinations)
-            routes = self.routing_rules.enabled_rules(folder)
-            destinations.extend(rule.destination for rule in routes)
+        for folder_info in self.folders:
+            if not folder_info.selectable:
+                continue
+            folder = folder_info.name
+            rules = self.routing_rules.enabled_rules(folder)
+            destinations = tuple(
+                rule.destination
+                for rule in rules
+                if rule.action.value == "move" and rule.destination is not None
+            )
             request = DoctorRequest(
                 folder=folder,
                 destinations=tuple(dict.fromkeys(destinations)),
-                requires_delete=requires_delete,
-                require_state_persistence=self.settings.spam.state.backend is ClassificationStateBackend.IMAP_KEYWORDS,
+                requires_delete=any(rule.action.value == "delete" for rule in rules),
                 deep_probe=True,
             )
             try:
@@ -2112,14 +1777,14 @@ class MailReviewApp(App[None]):
 
     def action_preview_rules_ten(self) -> None:
         folder = self._selected_folder
-        if folder is None or folder == "Review" or folder not in self._folder_item_by_name:
+        if folder is None or folder not in self._folder_item_by_name:
             self._set_status("Select a real folder before previewing rules on the next 10 messages.")
             return
         self._begin_rule_run(RuleRunRequest(folders=(folder,), limit=10, apply=False, sort="oldest"))
 
     def action_apply_rules_dialog(self) -> None:
         folder = self._selected_folder
-        if folder is None or folder == "Review" or folder not in self._folder_item_by_name:
+        if folder is None or folder not in self._folder_item_by_name:
             self._set_status("Select a real folder before opening Apply Rules")
             return
         self.push_screen(RuleRunDialog(folder, apply=True), self._rule_run_dialog_result)
@@ -2329,8 +1994,17 @@ class MailReviewApp(App[None]):
         if self._analysis_read_only:
             self._set_status("This is a read-only explanation. Press c to create an actionable analysis.")
             return
-        if analysis.destination is None:
-            self._set_status("The current plan has no MOVE destination.")
+        if analysis.action is RoutingAction.KEEP_IN_PLACE:
+            self._set_status("The current rule plan keeps this message in place. No action is needed.")
+            return
+        if analysis.action is RoutingAction.ALREADY_THERE:
+            self._set_status("The message is already in the rule's destination.")
+            return
+        if analysis.action is RoutingAction.ERROR:
+            self._set_status("The rule evaluation has errors. Resolve them before applying a rule.")
+            return
+        if analysis.action is RoutingAction.MOVE and analysis.destination is None:
+            self._set_status("The MOVE plan has no destination.")
             return
         self._confirm_action(analysis)
 
@@ -2455,26 +2129,26 @@ class MailReviewApp(App[None]):
             preview = await asyncio.to_thread(operation.preview)
             self.push_screen(
                 RuleMigrationPreviewScreen(path, preview),
-                lambda confirmed: self._apply_rule_migration(preview) if confirmed else None,
+                lambda choice: self._apply_rule_migration(preview, choice[1]) if choice and choice[0] else None,
             )
         except Exception as exc:
             self._set_status(f"Rule migration preview failed: {type(exc).__name__}.")
 
-    def _apply_rule_migration(self, preview: RuleMigrationPreview) -> None:
+    def _apply_rule_migration(self, preview: RuleMigrationPreview, allow_delete: bool = False) -> None:
         self.run_worker(
-            self._apply_rule_migration_job(preview),
+            self._apply_rule_migration_job(preview, allow_delete),
             group="rule-migration-apply",
             exclusive=True,
             exit_on_error=False,
         )
 
-    async def _apply_rule_migration_job(self, preview: RuleMigrationPreview) -> None:
+    async def _apply_rule_migration_job(self, preview: RuleMigrationPreview, allow_delete: bool) -> None:
         try:
             operation = RuleMigrationOperation(routing_rules_path_for_config(self.config))
-            result = await asyncio.to_thread(operation.apply, preview)
+            result = await asyncio.to_thread(operation.apply, preview, allow_delete=allow_delete)
             self._replace_routing_rules(result.rules)
             await self._reanalyze_current_message()
-            self._activity.append(f"Migrated {len(result.rules.rules)} routing rule(s) to schema 3.")
+            self._activity.append(f"Migrated {len(result.rules.rules)} routing rule(s) to schema {RULE_SCHEMA}.")
             self._render_activity()
             self._set_status("Rule migration applied.")
             self._open_routing_rules()
@@ -2495,18 +2169,20 @@ class MailReviewApp(App[None]):
                 exit_on_error=False,
             )
             return
-        if action == "presets":
-            self.push_screen(
-                RulePresetScreen(self._routing_folders()),
-                lambda rule: self._routing_rule_saved(rule, None),
-            )
+        if action == "recipes":
+            self.push_screen(RuleRecipeCatalogScreen(), self._recipe_catalog_selected)
             return
         if action == "test-all":
             self.run_worker(self._test_routing_rules(), group="routing-rule-test", exclusive=True)
             return
         if action == "new":
             self.push_screen(
-                RoutingRuleEditorScreen(None, self._routing_folders()),
+                RoutingRuleEditorScreen(
+                    None,
+                    self._routing_folders(),
+                    self.routing_rules,
+                    rules_path=routing_rules_path_for_config(self.config),
+                ),
                 lambda rule: self._routing_rule_saved(rule, None),
             )
             return
@@ -2516,11 +2192,22 @@ class MailReviewApp(App[None]):
             return
         if action == "edit":
             self.push_screen(
-                RoutingRuleEditorScreen(rule, self._routing_folders()),
+                RoutingRuleEditorScreen(
+                    rule,
+                    self._routing_folders(),
+                    self.routing_rules,
+                    existing_id=rule.id,
+                    rules_path=routing_rules_path_for_config(self.config),
+                ),
                 lambda replacement: self._routing_rule_saved(replacement, rule.id),
             )
         elif action == "test":
             self.run_worker(self._test_routing_rules(rule.id), group="routing-rule-test", exclusive=True)
+        elif action == "remove":
+            self.push_screen(
+                RuleRemovalConfirmation(rule),
+                lambda confirmed: self._rule_removal_confirmed(rule.id, confirmed),
+            )
         else:
             self.run_worker(
                 self._mutate_routing_rule(action, rule.id),
@@ -2528,6 +2215,48 @@ class MailReviewApp(App[None]):
                 exclusive=True,
                 exit_on_error=False,
             )
+
+    def _recipe_catalog_selected(self, recipe_id: str | None) -> None:
+        if recipe_id is None:
+            return
+        spec = get_recipe(recipe_id)
+        rule_id = spec.default_rule_id
+        existing_ids = {rule.id for rule in self.routing_rules.rules}
+        suffix = 2
+        while rule_id in existing_ids:
+            rule_id = f"{spec.default_rule_id}-{suffix}"
+            suffix += 1
+        folders = self._routing_folders()
+        action = spec.default_action
+        destination = folders[0] if action is RuleAction.MOVE and folders else None
+        if action is RuleAction.MOVE and destination is None:
+            action = RuleAction.KEEP
+        rule = materialize_recipe(
+            recipe_id,
+            rule_id=rule_id,
+            action=action,
+            destination=destination,
+        )
+        self.push_screen(
+            RoutingRuleEditorScreen(
+                rule,
+                folders,
+                self.routing_rules,
+                rules_path=routing_rules_path_for_config(self.config),
+            ),
+            lambda replacement: self._routing_rule_saved(replacement, None),
+        )
+
+    def _rule_removal_confirmed(self, rule_id: str, confirmed: bool) -> None:
+        if not confirmed:
+            self._open_routing_rules()
+            return
+        self.run_worker(
+            self._mutate_routing_rule("remove", rule_id),
+            group="routing-rule-mutation",
+            exclusive=True,
+            exit_on_error=False,
+        )
 
     def _routing_rule_saved(self, rule: RoutingRule | None, existing_id: str | None) -> None:
         if rule is None:
@@ -2567,10 +2296,6 @@ class MailReviewApp(App[None]):
             elif action == "down":
                 result = await asyncio.to_thread(self.routing_rule_service.move, rule_id, 1)
             elif action == "remove":
-                rule = next(item for item in self.routing_rules.rules if item.id == rule_id)
-                if rule.built_in:
-                    self._set_status("The built-in Spam rule cannot be removed.")
-                    return
                 result = await asyncio.to_thread(self.routing_rule_service.remove, rule_id)
             else:
                 return
@@ -2643,14 +2368,17 @@ class MailReviewApp(App[None]):
 
     def _confirmed_action(
         self,
-        confirmed: bool,
+        choice: tuple[bool, bool] | None,
         analysis: RoutingPlan,
         detail: MessageDetail,
     ) -> None:
+        if choice is None:
+            return
+        confirmed, allow_delete = choice
         if confirmed and not self._action_running:
             self._action_running = True
             self.run_worker(
-                self._apply_confirmed(analysis, detail),
+                self._apply_confirmed(analysis, detail, allow_delete),
                 group="action",
                 exit_on_error=False,
             )
@@ -2659,12 +2387,14 @@ class MailReviewApp(App[None]):
         self,
         plan: RoutingPlan,
         detail: MessageDetail,
+        allow_delete: bool,
     ) -> None:
         if self.action_service is None:
             self._set_status("Mailbox action service is unavailable.")
             self._action_running = False
             return
-        self._set_status("Applying the confirmed rule plan in a background thread…")
+        action_name = plan.configured_action.value.upper() if plan.configured_action is not None else "KEEP"
+        self._set_status(f"Applying the confirmed {action_name} rule plan in a background thread…")
         started = time.monotonic()
         try:
             receipt: RoutingActionReceipt = await asyncio.to_thread(
@@ -2672,10 +2402,12 @@ class MailReviewApp(App[None]):
                 plan,
                 uidvalidity=detail.uidvalidity,
                 confirmed_by_user=True,
+                allow_delete=allow_delete,
             )
             result = "confirmed" if receipt.applied and receipt.confirmed else "not confirmed"
             _LOG.debug("ui.rule_apply duration_ms=%.1f result=%s", (time.monotonic() - started) * 1000, result)
-            activity = f"{plan.folder} UID {plan.uid}: MOVE {result} to {plan.destination}"
+            destination = f" to {plan.destination}" if plan.destination is not None else ""
+            activity = f"{plan.folder} UID {plan.uid}: {action_name} {result}{destination}"
             if receipt.detail:
                 activity += f" ({receipt.detail})"
             self._activity.append(activity)
@@ -2701,7 +2433,7 @@ class MailReviewApp(App[None]):
                         "Select a message to read its text content."
                     )
                     self.query_one("#analysis", Static).update("No rule evaluation yet. Press c to evaluate a message.")
-                self._set_status("MOVE confirmed. Updating folder counts…")
+                self._set_status(f"{action_name} confirmed. Updating folder counts…")
                 self._adjust_folder_count(plan.folder, -1, summary=summary)
                 targets = tuple(dict.fromkeys(folder for folder in (plan.folder, plan.destination) if folder))
                 self.run_worker(self._refresh_action_counts(targets), group="folder-counts", exit_on_error=False)
@@ -2815,7 +2547,7 @@ class MailReviewApp(App[None]):
             config=settings is not None,
             credential=bool(self._password),
             connected=self.mail_service is not None,
-            selected_folder=self._selected_folder in self._folder_item_by_name and self._selected_folder != "Review",
+            selected_folder=self._selected_folder in self._folder_item_by_name,
             selected_message=self._detail is not None and self._detail.item.message is not None,
             routing_rules=self.routing_rule_service is not None,
             config_store=settings is not None and settings.config_store is not None,
@@ -2872,16 +2604,10 @@ class MailReviewApp(App[None]):
             self.action_rules()
         elif operation_id.startswith("progress."):
             self.action_progress()
-        elif operation_id.startswith("state."):
-            self.action_state()
         elif operation_id == "mail.list":
             self.action_refresh()
         elif operation_id == "mail.show":
             self._focus_pane(2)
-        elif operation_id == "mail.classify":
-            self.action_evaluate_rules()
-        elif operation_id == "review.list":
-            self._open_review_view()
         elif operation_id.startswith("config_ledger."):
             self.action_config_ledger()
 
@@ -3163,15 +2889,6 @@ class MailReviewApp(App[None]):
         self.push_screen(ConfigTextScreen("Config Ledger pull result", body))
         self._config_ledger_mutation_running = False
 
-    def _open_review_view(self) -> None:
-        if self._selected_folder != "Review":
-            generation = self._begin_folder_load("Review")
-            self.run_worker(
-                self._select_folder("Review", generation),
-                group="folder-page",
-                exclusive=True,
-                exit_on_error=False,
-            )
 
     def _ensure_session(self) -> AppSession:
         if self.session is None:
@@ -3282,17 +2999,8 @@ class MailReviewApp(App[None]):
         self.action_service = session.action_service
         self.routing_rules = session.routing_rules
         self.routing_rule_service = session.routing_rule_service
-        self.review_operation = ReviewOperation(self.settings) if self.settings is not None else None
-        self.settings_service = SettingsService(self.config) if self.settings is not None else None
-        self.rule_service = (
-            RuleService(rules_path_for_config(self.config), source_folders=self.settings.spam.folders)
-            if self.settings is not None
-            else None
-        )
-        self.rules = RuleSet()
         self.folders = ()
         self._folder_item_by_name = {}
-        self._review_item = None
         self._rows = []
         self._page_offset = 0
         self._selected_folder = None

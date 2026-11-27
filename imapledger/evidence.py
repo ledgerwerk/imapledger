@@ -72,8 +72,7 @@ class LinkEvidence:
 
 @dataclass(frozen=True, slots=True)
 class MailboxContext:
-    folder_role: str = "junk"
-    already_in_configured_junk_folder: bool = True
+    source_folder: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,8 +176,7 @@ def build_jev_state(
     sender = evidence.from_address
     return {
         "mailbox_context": {
-            "folder_role": context.folder_role,
-            "already_in_configured_junk_folder": context.already_in_configured_junk_folder,
+            "source_folder": context.source_folder,
         },
         "message": {"subject": message.subject, "date": message.date, "body": redact_urls(message.body)},
         "sender": {

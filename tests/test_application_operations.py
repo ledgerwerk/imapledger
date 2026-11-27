@@ -2,16 +2,13 @@ from __future__ import annotations
 
 from imapledger.application.doctor import DoctorOperation, DoctorRequest
 from imapledger.application.progress import ProgressOperation
-from imapledger.config import ImapSettings, Settings, SpamSettings
+from imapledger.config import ImapSettings, Settings
 from imapledger.preflight import SourcePreflightResult
 from imapledger.progress_store import ProgressStore, account_identity_key
 
 
 def _settings() -> Settings:
-    return Settings(
-        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-        spam=SpamSettings(folders=("Spam",)),
-    )
+    return Settings(imap=ImapSettings(host="imap.example.org", username="user@example.org"))
 
 
 def test_progress_operation_queries_errors_and_resets_exact_folder(tmp_path) -> None:
@@ -65,10 +62,8 @@ def test_doctor_operation_delegates_read_only_preflight(monkeypatch) -> None:
         folder="Spam",
         destinations=("Archive",),
         requires_delete=True,
-        require_state_persistence=True,
         deep_probe=True,
     )
-
     actual = operation.run(request, password="secret", event_callback=events.append)
 
     assert actual is result
@@ -77,7 +72,6 @@ def test_doctor_operation_delegates_read_only_preflight(monkeypatch) -> None:
     assert observed["password"] == "secret"
     assert observed["destinations"] == ("Archive",)
     assert observed["requires_delete"] is True
-    assert observed["require_state_persistence"] is True
     assert observed["deep_probe"] is True
     assert observed["mailbox_factory"] is mailbox_factory
     assert events == ["connected"]

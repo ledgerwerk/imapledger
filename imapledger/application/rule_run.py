@@ -24,6 +24,7 @@ class RuleRunRequest:
     rule_scope: str | None = None
     new_run: bool = False
     retry_errors: bool = False
+    allow_delete: bool = False
     progress_db: Path = field(default_factory=default_progress_path)
 
     def __post_init__(self) -> None:
@@ -37,6 +38,10 @@ class RuleRunRequest:
         object.__setattr__(self, "folders", folders)
         if not isinstance(self.apply, bool):
             raise ValueError("apply must be a boolean")
+        if not isinstance(self.allow_delete, bool):
+            raise ValueError("allow_delete must be a boolean")
+        if self.allow_delete and not self.apply:
+            raise ValueError("--allow-delete requires apply mode")
         if self.limit is not None and (
             isinstance(self.limit, bool) or not isinstance(self.limit, int) or self.limit < 1
         ):
@@ -116,6 +121,7 @@ class RuleRunOperation:
                         rule_scope=request.rule_scope,
                         new_run=request.new_run,
                         retry_errors=request.retry_errors,
+                        allow_delete=request.allow_delete,
                         progress_db=request.progress_db,
                     )
                 )
@@ -151,6 +157,7 @@ class RuleRunOperation:
                     rule_scope=request.rule_scope,
                     new_run=request.new_run,
                     retry_errors=request.retry_errors,
+                    allow_delete=request.allow_delete,
                     progress_db=request.progress_db,
                 ),
                 password=password,
@@ -184,8 +191,20 @@ class RuleApplyMessageOperation:
     def __init__(self, service: RoutingActionService) -> None:
         self._service = service
 
-    def apply(self, plan: RoutingPlan, *, uidvalidity: int, confirmed_by_user: bool) -> RoutingActionReceipt:
-        return self._service.apply(plan, uidvalidity=uidvalidity, confirmed_by_user=confirmed_by_user)
+    def apply(
+        self,
+        plan: RoutingPlan,
+        *,
+        uidvalidity: int,
+        confirmed_by_user: bool,
+        allow_delete: bool = False,
+    ) -> RoutingActionReceipt:
+        return self._service.apply(
+            plan,
+            uidvalidity=uidvalidity,
+            confirmed_by_user=confirmed_by_user,
+            allow_delete=allow_delete,
+        )
 
     def set_rules(self, rules: RuleSet) -> None:
         self._service.set_rules(rules)

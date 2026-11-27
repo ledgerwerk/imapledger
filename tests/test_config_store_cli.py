@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
 
 from imapledger import cli, config_store_cli
 from imapledger.application import doctor as doctor_operations
-from imapledger.config import ConfigStoreSettings, ImapSettings, Settings, SpamSettings
+from imapledger.config import ConfigStoreSettings, ImapSettings, Settings
 from imapledger.config_mailbox import ConfigStoreMailbox
 from imapledger.config_snapshot import create_snapshot, serialize_snapshot
 from imapledger.preflight import SourcePreflightResult
 from imapledger.routing_models import RoutingRule, RuleType
 from imapledger.routing_models import RuleMatch as RoutingRuleMatch
 from imapledger.routing_models import RuleSet as RoutingRuleSet
-from imapledger.rules import RuleSet
 from tests.fakes import ConfigStoreFakeClient
 
 STORE_FOLDER = "INBOX.imapledger.Config"
@@ -226,11 +226,10 @@ def test_doctor_checks_config_store_folder_read_only(monkeypatch, tmp_path, stor
     store_folder = STORE_FOLDER
     settings = Settings(
         imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-        spam=SpamSettings(folders=("Spam",)),
         config_store=ConfigStoreSettings(folder=store_folder),
     )
     source_result = SourcePreflightResult(
-        folder="Spam",
+        folder="INBOX",
         opened=True,
         probe=None,
         capabilities=frozenset(),
@@ -240,8 +239,25 @@ def test_doctor_checks_config_store_folder_read_only(monkeypatch, tmp_path, stor
     )
     store_folders = {store_folder: {}} if store_exists else {"INBOX": {}}
     store_fake = ConfigStoreFakeClient(store_folders)
+
+    class FakeFolderCatalog:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_folders(self, *, include_counts=False):
+            names = ["INBOX"]
+            if store_exists:
+                names.append(store_folder)
+            return tuple(SimpleNamespace(name=name, selectable=True) for name in names)
     monkeypatch.setattr(cli_module, "load_settings", lambda path: settings)
-    monkeypatch.setattr(cli_module, "load_rules", lambda path, *, source_folders: RuleSet())
+    monkeypatch.setattr(cli_module, "load_routing_rules", lambda path: RoutingRuleSet())
+    monkeypatch.setattr(cli_module, "FolderCatalog", lambda **kwargs: FakeFolderCatalog())
     monkeypatch.setattr(doctor_operations, "preflight_source", lambda *args, **kwargs: source_result)
     monkeypatch.setattr(cli_module, "_resolve_password", lambda imap: "password")
     monkeypatch.setattr(
@@ -255,7 +271,7 @@ def test_doctor_checks_config_store_folder_read_only(monkeypatch, tmp_path, stor
 
     result = CliRunner().invoke(cli_module.app, ["doctor", "--config", str(tmp_path / "unused.toml")])
 
-    expected = "OK" if store_exists else "MISSING"
+    expected = "OK" if store_exists else "FAILED"
     assert f"config store folder: {store_folder}: {expected}" in result.output
     assert store_fake.readonly_selections == ([True] if store_exists else [])
     assert (result.exit_code == 0) is store_exists
@@ -265,7 +281,6 @@ def test_doctor_checks_config_store_folder_read_only(monkeypatch, tmp_path, stor
 def test_clean_rejects_rule_destination_matching_config_store_before_credentials(monkeypatch):
     settings = Settings(
         imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-        spam=SpamSettings(folders=("Spam",)),
         config_store=ConfigStoreSettings(folder=STORE_FOLDER),
     )
     rules = RoutingRuleSet(

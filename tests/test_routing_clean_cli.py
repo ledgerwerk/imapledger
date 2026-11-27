@@ -4,16 +4,13 @@ import pytest
 from typer.testing import CliRunner
 
 from imapledger import cli
-from imapledger.config import ImapSettings, Settings, SpamSettings
+from imapledger.config import ImapSettings, Settings
 from imapledger.progress_store import ProgressStore, account_identity_key
 from imapledger.routing_config import load_routing_rules
 
 
 def _settings() -> Settings:
-    return Settings(
-        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-        spam=SpamSettings(folders=("Spam",)),
-    )
+    return Settings(imap=ImapSettings(host="imap.example.org", username="user@example.org"))
 
 
 def _create_run(store: ProgressStore):
@@ -102,7 +99,7 @@ def test_rule_migrate_cli_previews_then_applies_explicitly(tmp_path) -> None:
     )
     assert preview.exit_code == 0, preview.output
     assert "Preview only" in preview.output
-    assert "schema: 1 -> 3" in preview.output
+    assert "schema: 1 -> 4" in preview.output
     assert path.read_text(encoding="utf-8") == original
 
     applied = CliRunner().invoke(
@@ -111,7 +108,7 @@ def test_rule_migrate_cli_previews_then_applies_explicitly(tmp_path) -> None:
     )
     assert applied.exit_code == 0, applied.output
     assert "Migration applied" in applied.output
-    assert "schema = 3" in path.read_text(encoding="utf-8")
+    assert "schema = 4" in path.read_text(encoding="utf-8")
 
 
 def test_rule_preview_and_apply_dispatch_shared_run_options(monkeypatch, tmp_path) -> None:
@@ -207,7 +204,7 @@ def test_progress_show_errors_and_reset_are_account_scoped(monkeypatch, tmp_path
         ["progress", "list", "--progress-db", str(database)],
     )
     assert listed.exit_code == 0
-    assert "INBOX" in listed.output
+    assert "Routing progress" in listed.output
 
     shown = CliRunner().invoke(
         cli.app,
