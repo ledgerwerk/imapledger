@@ -5,7 +5,7 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Button, Input, Select, Static
+from textual.widgets import Button, Input, Select, Static, TextArea
 
 from imapledger.config import ImapSettings, Settings
 from imapledger.routing_actions import RuleAction
@@ -172,6 +172,55 @@ def test_recipe_editor_exposes_generic_actions_scope_and_advanced_options() -> N
             await pilot.pause()
             assert not editor.query_one("#destination-fields", Vertical).display
             assert editor.query_one("#delete-warning", Static).display
+
+    asyncio.run(scenario())
+
+
+def test_semantic_rule_editor_uses_multiline_text_area(advertising_description: str) -> None:
+    rule = RoutingRule(
+        id="advertising",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        action=RuleAction.KEEP,
+        match_at=0.9,
+        description=advertising_description,
+    )
+
+    async def scenario() -> None:
+        app = _ScreenHost()
+        editor = RoutingRuleEditorScreen(rule, ("INBOX",), RuleSet((rule,)), existing_id="advertising")
+        async with app.run_test(size=(110, 40)) as pilot:
+            app.push_screen(editor)
+            await pilot.pause()
+
+            description = editor.query_one("#routing-rule-description", TextArea)
+            assert description.text == advertising_description
+            assert description.soft_wrap is True
+            assert description.show_line_numbers is False
+            assert description.size.height >= 12
+            assert not isinstance(description, Input)
+
+    asyncio.run(scenario())
+
+
+def test_semantic_rule_editor_saves_multiline_description_without_flattening(advertising_description: str) -> None:
+    async def scenario() -> None:
+        app = _ScreenHost()
+        editor = RoutingRuleEditorScreen(None, ("INBOX",), RuleSet())
+        saved: list[RoutingRule | None] = []
+
+        async with app.run_test(size=(110, 40)) as pilot:
+            app.push_screen(editor, saved.append)
+            await pilot.pause()
+            editor.query_one("#routing-rule-id", Input).value = "advertising"
+            editor.query_one("#routing-rule-description", TextArea).text = f"\n{advertising_description}\n  "
+            editor.query_one("#routing-rule-action", Select).value = RuleAction.KEEP.value
+            await pilot.click("#save")
+            await pilot.pause()
+
+        assert len(saved) == 1
+        assert saved[0] is not None
+        assert saved[0].description == advertising_description
 
     asyncio.run(scenario())
 

@@ -88,6 +88,27 @@ def test_schema_four_rules_round_trip_with_evidence_recipes_actions_and_order(tm
     assert 'match_any = [{ list_id = "weekly.example.com" }, { from_address = "news@example.org" }]' in serialized
 
 
+def test_multiline_semantic_description_round_trips_through_rules_toml(
+    tmp_path: Path, advertising_description: str
+) -> None:
+    rule = RoutingRule(
+        id="advertising",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        action=RuleAction.KEEP,
+        description=advertising_description,
+        match_at=0.9,
+    )
+    rules = RuleSet((rule,))
+    path = tmp_path / "rules.toml"
+
+    write_routing_rules(rules, path)
+    loaded = load_routing_rules(path)
+
+    assert loaded.rules[0].description == advertising_description
+    assert loaded == rules
+
+
 def test_semantic_spam_id_is_not_special_and_empty_rules_are_safe(tmp_path: Path) -> None:
     path = tmp_path / "rules.toml"
     path.write_text(

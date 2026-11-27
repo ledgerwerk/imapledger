@@ -4,7 +4,17 @@ from pathlib import Path
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Checkbox, Input, Label, ListItem, ListView, Select, Static
+from textual.widgets import (
+    Button,
+    Checkbox,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    Select,
+    Static,
+    TextArea,
+)
 
 from ..application.rules import RuleLearningPreview, RuleMigrationPreview
 from ..routing_actions import RuleAction
@@ -177,6 +187,10 @@ class RoutingRuleEditorScreen(KeyboardModalScreen[RoutingRule | None]):
     #routing-rule-editor-box { width: 94%; height: 94%; border: round $accent; padding: 1 2; background: $surface; }
     #routing-rule-editor { height: 1fr; }
     #routing-rule-editor-box Horizontal { height: 3; align-horizontal: right; }
+    #routing-rule-description {
+        height: 18;
+        min-height: 12;
+    }
     #routing-rule-editor-box Button { margin-left: 1; }
     """
 
@@ -220,9 +234,12 @@ class RoutingRuleEditorScreen(KeyboardModalScreen[RoutingRule | None]):
                 )
                 with Vertical(id="semantic-fields"):
                     yield Label("What mail should this rule match?")
-                    yield Input(
+                    yield TextArea(
                         rule.description or "" if rule else "",
-                        placeholder="Rule description",
+                        placeholder="Describe the mail this rule should match. Multi-line definitions are supported.",
+                        soft_wrap=True,
+                        show_line_numbers=False,
+                        tab_behavior="focus",
                         id="routing-rule-description",
                     )
                     yield Label("Semantic match threshold")
@@ -367,7 +384,7 @@ class RoutingRuleEditorScreen(KeyboardModalScreen[RoutingRule | None]):
         recipe = None
         options: dict[str, object] = {}
         if rule_type is RuleType.SEMANTIC:
-            description = self.query_one("#routing-rule-description", Input).value.strip() or None
+            description = self.query_one("#routing-rule-description", TextArea).text.strip() or None
             if description is None:
                 raise ValueError("A semantic rule requires a description.")
             threshold_text = self.query_one("#routing-rule-threshold", Input).value.strip()

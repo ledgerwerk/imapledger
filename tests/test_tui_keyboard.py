@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from textual.app import App, ComposeResult
-from textual.widgets import Button, DataTable, Input, Select, Static
+from textual.widgets import Button, DataTable, Input, Select, Static, TextArea
 
 from imapledger.application import RuleRunRequest
 from imapledger.application.operation_registry import OPERATION_SPECS, OperationContext
@@ -221,6 +221,33 @@ def test_hidden_rule_editor_fields_and_disabled_credential_fields_are_skipped() 
             for _ in range(8):
                 await pilot.press("tab")
                 assert all(not field.has_focus for field in passphrase_fields)
+
+    asyncio.run(scenario())
+
+
+def test_rule_description_enter_inserts_newline_and_tab_navigates() -> None:
+    async def scenario() -> None:
+        app = _ScreenHost()
+        editor = RoutingRuleEditorScreen(None, ("INBOX",), RuleSet())
+
+        async with app.run_test(size=(110, 40)) as pilot:
+            app.push_screen(editor)
+            await pilot.pause()
+            description = editor.query_one("#routing-rule-description", TextArea)
+            description.text = "Line one"
+            description.focus()
+            description.move_cursor((0, len("Line one")))
+
+            await pilot.press("enter", "x")
+            assert description.text == "Line one\nx"
+
+            await pilot.press("tab")
+            assert editor.query_one("#routing-rule-threshold", Input).has_focus
+            assert "\t" not in description.text
+
+            await pilot.press("shift+tab")
+            assert description.has_focus
+            assert "\t" not in description.text
 
     asyncio.run(scenario())
 
