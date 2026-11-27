@@ -440,6 +440,7 @@ class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
         ("t", "test_rule", "Test selected"),
         ("T", "test_all", "Evaluate all"),
         ("m", "migrate_rules", "Migrate legacy"),
+        ("p", "preset_rules", "Presets"),
     ]
     CSS = """
     RoutingRuleCenterScreen { align: center middle; }
@@ -466,13 +467,12 @@ class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
                 id="routing-rule-list",
             )
             yield Static(
-                f"Fallback: {self.rules.fallback_destination or '(not configured)'}\n"
-                "Priority is top to bottom. First matching rule wins.",
+                "No match keeps mail in its current folder. Priority is top to bottom; the first match wins.",
                 markup=False,
             )
-            yield Input(self.rules.fallback_destination or "", placeholder="INBOX.Processed", id="routing-fallback")
             with Horizontal():
                 yield Button("New", id="new")
+                yield Button("Presets", id="presets")
                 yield Button("Edit", id="edit")
                 yield Button("Enable/disable", id="toggle")
                 yield Button("Move up", id="up")
@@ -482,7 +482,6 @@ class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
                 yield Button("Evaluate all", id="test-all")
                 yield Button("Migrate legacy rules…", id="migrate")
                 yield Button("Delete", id="remove")
-                yield Button("Save fallback", id="fallback")
                 yield Button("Close", id="close")
 
     def on_mount(self) -> None:
@@ -496,11 +495,7 @@ class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         action = event.button.id or "close"
-        if action == "fallback":
-            value = self.query_one("#routing-fallback", Input).value.strip() or None
-            self.dismiss((action, value))
-        else:
-            self.dismiss((action, self._selected_rule_id()))
+        self.dismiss((action, self._selected_rule_id()))
 
     def action_new_rule(self) -> None:
         self.dismiss(("new", None))
@@ -525,6 +520,9 @@ class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
 
     def action_test_all(self) -> None:
         self.dismiss(("test-all", None))
+
+    def action_preset_rules(self) -> None:
+        self.dismiss(("presets", None))
 
     def action_migrate_rules(self) -> None:
         self.dismiss(("migrate", None))
@@ -570,12 +568,17 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
 
     def compose(self) -> ComposeResult:
         rule = self.rule
-        match = rule.match.as_dict() if rule is not None and rule.match is not None else {}
+        match = rule.match_any[0].as_dict() if rule is not None and rule.match_any else {}
         with Vertical(id="routing-rule-editor-box"):
             with VerticalScroll(id="routing-rule-editor"):
                 yield Static("Edit rule" if rule else "New rule", markup=False)
                 yield Label("ID")
-                yield Input(rule.id if rule else "", placeholder="newsletter", id="routing-rule-id")
+                yield Input(
+                    rule.id if rule else "",
+                    placeholder="newsletter",
+                    id="routing-rule-id",
+                    disabled=bool(rule and rule.built_in),
+                )
                 yield Checkbox("Enabled", value=rule.enabled if rule else True, id="routing-rule-enabled")
                 yield Label("Type")
                 yield Select(
@@ -583,6 +586,7 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
                     value=rule.type.value if rule else RuleType.SEMANTIC.value,
                     allow_blank=False,
                     id="routing-rule-type",
+                    disabled=bool(rule and rule.built_in),
                 )
                 yield Label("Destination")
                 yield Select(
@@ -592,28 +596,45 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
                     allow_blank=False,
                     id="routing-rule-destination",
                 )
-                yield Label("Category description, required for semantic rules")
-                yield Input(
-                    rule.description or "" if rule else "",
-                    placeholder="Define the category",
-                    id="routing-rule-description",
-                )
-                yield Label("Match threshold, semantic rules only")
-                yield Input(
-                    str(rule.match_at if rule and rule.match_at is not None else 0.90),
-                    id="routing-rule-threshold",
-                )
-                yield Static("Header matcher fields, combined with AND", markup=False)
-                for field in MATCH_FIELDS:
-                    yield Input(match.get(field, ""), placeholder=field, id=f"routing-match-{field}")
-                yield Static(
-                    "Spam uses the built-in conservative spam evidence policy. All rules route with MOVE.",
-                    markup=False,
-                )
+                with Vertical(id="semantic-fields"):
+                    yield Label("Category description")
+                    yield Input(
+                        rule.description or "" if rule else "",
+                        placeholder="Define the category",
+                        id="routing-rule-description",
+                    )
+                    yield Label("Semantic match threshold")
+                    yield Input(
+                        str(rule.match_at if rule and rule.match_at is not None else 0.90),
+                        id="routing-rule-threshold",
+                    )
+                with Vertical(id="header-fields"):
+                    yield Static("Header matcher fields, combined with AND", markup=False)
+                    for field in MATCH_FIELDS:
+                        yield Input(match.get(field, ""), placeholder=field, id=f"routing-match-{field}")
+                with Vertical(id="spam-fields"):
+                    yield Static("Spam uses the built-in conservative spam evidence policy.", markup=False)
+                yield Static("Matching rules move mail to their destination. No match keeps it in place.", markup=False)
                 yield Static("", id="routing-rule-error", markup=False)
             with Horizontal():
                 yield Button("Save", id="save")
                 yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self._update_type_fields()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "routing-rule-type":
+            self._update_type_fields()
+
+    def _update_type_fields(self) -> None:
+        selected = self.query_one("#routing-rule-type", Select).value
+        if not isinstance(selected, str):
+            return
+        rule_type = RuleType(selected)
+        self.query_one("#semantic-fields", Vertical).display = rule_type is RuleType.SEMANTIC
+        self.query_one("#header-fields", Vertical).display = rule_type is RuleType.HEADER
+        self.query_one("#spam-fields", Vertical).display = rule_type is RuleType.SPAM
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel":
@@ -644,7 +665,16 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
             for field in MATCH_FIELDS
             if (widget := self.query_one(f"#routing-match-{field}", Input)).value.strip()
         }
-        match = RuleMatch(**values) if rule_type is RuleType.HEADER else None
+        match = None
+        match_any: tuple[RuleMatch, ...] = ()
+        if rule_type is RuleType.HEADER:
+            match = RuleMatch(**values)
+            existing_extra = (
+                self.rule.match_any[1:] if self.rule is not None and self.rule.type is RuleType.HEADER else ()
+            )
+            match_any = (match, *existing_extra)
+        elif rule_type is RuleType.SEMANTIC and self.rule is not None:
+            match_any = self.rule.match_any
         return RoutingRule(
             id=rule_id,
             enabled=self.query_one("#routing-rule-enabled", Checkbox).value,
@@ -654,56 +684,48 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
             match_at=match_at,
             match=match,
             source_folders=self.rule.source_folders if self.rule else (),
+            match_any=match_any,
+            built_in=self.rule.built_in if self.rule else False,
         )
 
 
-class RuleLearnDialog(ModalScreen[tuple[str, str | None] | None]):
+class RuleLearnTargetScreen(ModalScreen[str | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
-    RuleLearnDialog { align: center middle; }
-    #learn-rule-box { width: 72; height: auto; border: round $accent; padding: 1 2; background: $surface; }
-    #learn-rule-buttons { height: 3; align-horizontal: right; }
-    #learn-rule-buttons Button { margin-left: 1; }
+    RuleLearnTargetScreen { align: center middle; }
+    #learn-target-box { width: 72; height: auto; border: round $accent; padding: 1 2; background: $surface; }
+    #learn-target-buttons { height: 3; align-horizontal: right; }
+    #learn-target-buttons Button { margin-left: 1; }
     """
 
-    def __init__(self, folder: str, uid: int, destinations: tuple[str, ...]) -> None:
+    def __init__(self, folder: str, uid: int, rules: RoutingRuleSet) -> None:
         super().__init__()
         self.folder = folder
         self.uid = uid
-        self.destinations = destinations
+        self.rules = tuple(rule for rule in rules.rules if rule.type is RuleType.SEMANTIC)
 
     def compose(self) -> ComposeResult:
-        options = [(folder, folder) for folder in self.destinations]
-        with Vertical(id="learn-rule-box"):
-            yield Static(f"Learn a routing rule from {self.folder} UID {self.uid}", markup=False)
-            yield Label("Move destination")
+        options = [(f"{rule.id} · {rule.description}", rule.id) for rule in self.rules]
+        with Vertical(id="learn-target-box"):
+            yield Static(f"Learn this mail from {self.folder} UID {self.uid}", markup=False)
+            yield Label("Strengthen an existing semantic rule")
             yield Select(
                 options,
-                value=self.destinations[0] if self.destinations else Select.BLANK,
-                id="learn-destination",
+                value=self.rules[0].id if self.rules else Select.BLANK,
+                allow_blank=False,
+                id="learn-target-rule",
             )
-            yield Label("Optional rule ID")
-            yield Input(placeholder="generated from the selected matcher", id="learn-rule-id")
-            yield Static("A proposal is read-only. Only an automatically safe proposal can be saved.", markup=False)
-            with Horizontal(id="learn-rule-buttons"):
-                yield Button("Preview proposal", id="learn-preview", disabled=not bool(self.destinations))
+            yield Static("Learning only adds a deterministic matcher. The example message is not moved.", markup=False)
+            with Horizontal(id="learn-target-buttons"):
+                yield Button("Preview matcher", id="learn-preview", disabled=not bool(self.rules), variant="primary")
                 yield Button("Cancel", id="learn-cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "learn-cancel":
             self.dismiss(None)
             return
-        destination = self.query_one("#learn-destination", Select).value
-        if not isinstance(destination, str):
-            return
-        try:
-            name = self.query_one("#learn-rule-id", Input).value.strip() or None
-            if name is not None:
-                validate_rule_id(name)
-        except ValueError as exc:
-            self.query_one("#learn-rule-id", Input).placeholder = str(exc)
-            return
-        self.dismiss((destination, name))
+        rule_id = self.query_one("#learn-target-rule", Select).value
+        self.dismiss(rule_id if isinstance(rule_id, str) else None)
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -717,39 +739,104 @@ class RuleLearnPreviewScreen(ModalScreen[bool]):
     #learn-preview-buttons Button { margin-left: 1; }
     """
 
-    def __init__(self, folder: str, uid: int, destination: str, preview: RuleLearningPreview) -> None:
+    def __init__(self, folder: str, uid: int, preview: RuleLearningPreview) -> None:
         super().__init__()
         self.folder = folder
         self.uid = uid
-        self.destination = destination
         self.preview = preview
 
     def compose(self) -> ComposeResult:
-        proposal = self.preview.proposal
-        lines = [f"Source: {self.folder} UID {self.uid}", f"Status: {proposal.status}"]
-        if proposal.candidate is not None:
+        preview = self.preview
+        lines = [
+            f"Source: {self.folder} UID {self.uid}",
+            f"Target rule: {preview.target_rule_id}",
+            f"Proposal status: {preview.status}",
+        ]
+        if preview.semantic_fit is not None:
+            lines.append(f"Semantic fit: {preview.semantic_fit:.2f}")
+        if preview.selected_candidate is not None:
             lines.extend(
                 (
-                    f"Candidate: {proposal.candidate.description}",
-                    f"Match: {describe_match(proposal.candidate.match)}",
+                    f"Candidate: {preview.selected_candidate.description}",
+                    f"Matcher: {describe_match(preview.selected_candidate.match)}",
                 )
             )
-        if proposal.candidate_confidence is not None:
-            lines.append(f"Jev confidence: {proposal.candidate_confidence:.2f}")
-        if proposal.safe_probability is not None:
-            lines.append(f"Generalization safety: {proposal.safe_probability:.2f}")
-        if self.preview.rule is not None:
-            lines.extend((f"Proposed rule: {self.preview.rule.id}", f"Action: move to {self.destination}"))
-        else:
-            lines.append("No rule can be saved. This proposal did not meet the safe automatic thresholds.")
+        if preview.candidate_confidence is not None:
+            lines.append(f"Candidate confidence: {preview.candidate_confidence:.2f}")
+        if preview.safe_probability is not None:
+            lines.append(f"Generalization safety: {preview.safe_probability:.2f}")
+        if preview.conflict_rule_id is not None:
+            lines.append(f"Conflict: the same matcher is attached to higher-priority rule {preview.conflict_rule_id}.")
+        saveable = preview.status == "auto" and preview.proposed_matcher is not None
+        if not saveable:
+            lines.append("No matcher can be saved from this proposal.")
         with Vertical(id="learn-preview-box"):
             yield Static("\n".join(lines), markup=False)
             with Horizontal(id="learn-preview-buttons"):
-                yield Button("Save rule", id="learn-save", disabled=self.preview.rule is None)
+                yield Button("Save matcher", id="learn-save", disabled=not saveable, variant="primary")
                 yield Button("Close", id="learn-close")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "learn-save")
+
+
+class RulePresetScreen(ModalScreen[RoutingRule | None]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    RulePresetScreen { align: center middle; }
+    #rule-preset-box { width: 76; height: auto; border: round $accent; padding: 1 2; background: $surface; }
+    #rule-preset-buttons { height: 3; align-horizontal: right; }
+    #rule-preset-buttons Button { margin-left: 1; }
+    """
+    PRESETS = (
+        ("newsletter", "Newsletter", "Regular newsletters and mailing-list messages"),
+        ("delivery-failure", "Delivery failure", "Mail delivery failure notices"),
+        ("receipt", "Receipt", "Purchase receipts and order confirmations"),
+    )
+
+    def __init__(self, folders: tuple[str, ...]) -> None:
+        super().__init__()
+        self.folders = folders
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rule-preset-box"):
+            yield Static("Add a common semantic rule", markup=False)
+            yield Label("Rule preset")
+            yield Select([(label, rule_id) for rule_id, label, _ in self.PRESETS], value="newsletter", id="rule-preset")
+            yield Label("Destination")
+            yield Select(
+                [(folder, folder) for folder in self.folders],
+                value=self.folders[0] if self.folders else Select.BLANK,
+                allow_blank=False,
+                id="rule-preset-destination",
+            )
+            with Horizontal(id="rule-preset-buttons"):
+                yield Button("Add rule", id="rule-preset-add", disabled=not bool(self.folders), variant="primary")
+                yield Button("Cancel", id="rule-preset-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "rule-preset-cancel":
+            self.dismiss(None)
+            return
+        selected = self.query_one("#rule-preset", Select).value
+        destination = self.query_one("#rule-preset-destination", Select).value
+        preset = next((item for item in self.PRESETS if item[0] == selected), None)
+        if preset is None or not isinstance(destination, str):
+            self.dismiss(None)
+            return
+        rule_id, _label, description = preset
+        self.dismiss(
+            RoutingRule(
+                id=rule_id,
+                enabled=True,
+                type=RuleType.SEMANTIC,
+                destination=destination,
+                description=description,
+            )
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class RuleMigrationPreviewScreen(ModalScreen[bool]):
@@ -769,18 +856,16 @@ class RuleMigrationPreviewScreen(ModalScreen[bool]):
         result = self.preview.result
         lines = [
             f"Rules file: {self.path}",
-            f"Schema: {result.source_schema} to 2",
+            f"Schema: {result.source_schema} to 3",
             f"Converted rules: {len(result.rules.rules)}",
-            f"Fallback: {result.rules.fallback_destination or '(not configured)'}",
         ]
         lines.extend(
-            f"{rule.id}: {rule.destination} from "
-            f"{', '.join(rule.source_folders) or 'all configured sources'}; "
-            f"match {describe_match(rule.match) if rule.match else '(none)'}"
+            f"{rule.id}: {rule.type.value} -> {rule.destination}; "
+            f"matchers: {' OR '.join(describe_match(match) for match in rule.match_any) or '(none)'}"
             for rule in result.rules.rules
         )
         lines.extend(result.warnings)
-        lines.append("Preview only. Applying writes the converted schema-2 rules to this file.")
+        lines.append("No match keeps mail in place. Applying writes schema-3 rules to this file.")
         with Vertical(id="rule-migration-box"):
             yield Static("\n".join(lines), markup=False)
             with Horizontal(id="rule-migration-buttons"):

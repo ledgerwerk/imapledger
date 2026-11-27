@@ -7,18 +7,14 @@ from typer.testing import CliRunner
 
 from imapledger import cli, config_store_cli
 from imapledger.application import doctor as doctor_operations
-from imapledger.config import (
-    ActionKind,
-    ConfigStoreSettings,
-    ImapSettings,
-    MessageAction,
-    Settings,
-    SpamSettings,
-)
+from imapledger.config import ConfigStoreSettings, ImapSettings, Settings, SpamSettings
 from imapledger.config_mailbox import ConfigStoreMailbox
 from imapledger.config_snapshot import create_snapshot, serialize_snapshot
 from imapledger.preflight import SourcePreflightResult
-from imapledger.rules import MailRule, RuleMatch, RuleSet
+from imapledger.routing_models import RoutingRule, RuleType
+from imapledger.routing_models import RuleMatch as RoutingRuleMatch
+from imapledger.routing_models import RuleSet as RoutingRuleSet
+from imapledger.rules import RuleSet
 from tests.fakes import ConfigStoreFakeClient
 
 STORE_FOLDER = "INBOX.imapledger.Config"
@@ -272,25 +268,25 @@ def test_clean_rejects_rule_destination_matching_config_store_before_credentials
         spam=SpamSettings(folders=("Spam",)),
         config_store=ConfigStoreSettings(folder=STORE_FOLDER),
     )
-    rules = RuleSet(
-        rules=(
-            MailRule(
+    rules = RoutingRuleSet(
+        (
+            RoutingRule(
                 id="route-to-store",
                 enabled=True,
-                source_folders=("Spam",),
-                action=MessageAction(ActionKind.MOVE, STORE_FOLDER),
-                match=RuleMatch(subject="test"),
+                type=RuleType.HEADER,
+                destination=STORE_FOLDER,
+                match_any=(RoutingRuleMatch(subject="test"),),
             ),
         )
     )
     monkeypatch.setattr(cli, "load_settings", lambda path: settings)
-    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: rules)
+    monkeypatch.setattr(cli, "load_routing_rules", lambda path: rules)
     monkeypatch.setattr(cli, "_resolve_password", lambda imap: pytest.fail("reserved-folder check prompted"))
 
-    result = CliRunner().invoke(cli.app, ["clean"])
+    result = CliRunner().invoke(cli.app, ["clean", "Spam", "--config", "unused.toml"])
 
     assert result.exit_code == 2
-    assert "move destination" in result.output
+    assert "config-store folder cannot be a routing destination" in result.output
 
 
 def test_config_cli_reports_history_conflict_and_supports_explicit_version(monkeypatch, tmp_path):

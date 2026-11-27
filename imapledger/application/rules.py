@@ -4,17 +4,22 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from ..config import ActionKind, MessageAction
 from ..message import MailMessage
-from ..routing_config import RoutingConfigError, RuleMigrationResult, migrate_legacy_rules, write_routing_rules
-from ..routing_models import RoutingRule, RuleType
+from ..routing_config import (
+    RoutingConfigError,
+    RuleMigrationResult,
+    migrate_legacy_rules,
+    rules_content_fingerprint,
+    write_routing_rules,
+)
 from ..routing_models import RuleSet as RoutingRuleSet
+from ..routing_models import RuleType
 from ..routing_rule_service import RoutingRuleMutationResult, RoutingRuleService
-from ..rule_candidates import build_rule_candidates
-from ..rule_learning import RuleProposal, learn_rule_proposal
-from ..rules import generate_rule_id, validate_rule_id
+from ..rule_candidates import RuleCandidate, build_rule_candidates
+from ..rule_learning import learn_existing_rule_proposal
+from ..rules import RuleMatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,68 +57,92 @@ class RuleMigrationOperation:
 
 @dataclass(frozen=True, slots=True)
 class RuleLearningPreview:
-    proposal: RuleProposal
-    rule: RoutingRule | None
-    base_rules: RoutingRuleSet
+    target_rule_id: str
+    base_rules_fingerprint: str
+    source_folder: str
+    uid: int
+    semantic_fit: float | None
+    selected_candidate: RuleCandidate | None
+    candidate_confidence: float | None
+    safe_probability: float | None
+    proposed_matcher: RuleMatch | None
+    status: Literal["auto", "review", "no-safe-candidate", "message-does-not-fit-rule", "conflict"]
+    conflict_rule_id: str | None = None
+    model: str | None = None
+    request_id: str | None = None
 
 
 class RuleLearningOperation:
-    """Propose and save one narrow header rule from selected-message evidence."""
+    """Propose and save a safe deterministic matcher for an existing semantic rule."""
 
     def propose(
         self,
         message: MailMessage,
         *,
         folder: str,
-        destination: str,
+        target_rule_id: str,
         existing_rules: RoutingRuleSet,
-        name: str | None = None,
         jev_factory: Callable[[], Any] | None = None,
     ) -> RuleLearningPreview:
-        if name is not None:
-            validate_rule_id(name)
-        candidates = build_rule_candidates(message)
-        if jev_factory is None:
-            from pyjev import Jev
-
-            jev_factory = Jev
-        with jev_factory() as jev:
-            proposal = learn_rule_proposal(
-                jev,
-                message=message,
-                candidates=candidates,
-                requested_action=MessageAction(ActionKind.MOVE, destination),
-            )
-        rule = None
-        if proposal.status == "auto" and proposal.candidate is not None:
-            rule_id = name or generate_rule_id(
-                proposal.candidate.match,
-                [item.id for item in existing_rules.rules],
-            )
-            rule = RoutingRule(
-                id=rule_id,
-                enabled=True,
-                type=RuleType.HEADER,
-                destination=destination,
-                description=proposal.candidate.description,
-                match=proposal.candidate.match,
-                source_folders=(folder,),
-            )
-        return RuleLearningPreview(proposal, rule, existing_rules)
+        target_index = next(
+            (index for index, rule in enumerate(existing_rules.rules) if rule.id == target_rule_id),
+            None,
+        )
+        if target_index is None:
+            raise RoutingConfigError(f"rule not found: {target_rule_id}")
+        target = existing_rules.rules[target_index]
+        if target.type is not RuleType.SEMANTIC:
+            raise RoutingConfigError("learning can only strengthen an existing semantic rule")
+        candidates = tuple(
+            candidate for candidate in build_rule_candidates(message) if candidate.match not in target.match_any
+        )
+        proposal = learn_existing_rule_proposal(
+            message=message,
+            target_rule=target,
+            candidates=candidates,
+            match_threshold=target.match_at if target.match_at is not None else existing_rules.default_match_at,
+            jev_factory=jev_factory,
+        )
+        status = proposal.status
+        conflict_rule_id = None
+        if proposal.candidate is not None and status == "auto":
+            for earlier in existing_rules.rules[:target_index]:
+                if (
+                    earlier.enabled
+                    and earlier.applies_to_source(folder)
+                    and proposal.candidate.match in earlier.match_any
+                ):
+                    status = "conflict"
+                    conflict_rule_id = earlier.id
+                    break
+        return RuleLearningPreview(
+            target_rule_id=target_rule_id,
+            base_rules_fingerprint=rules_content_fingerprint(existing_rules),
+            source_folder=folder,
+            uid=message.uid,
+            semantic_fit=proposal.semantic_fit,
+            selected_candidate=proposal.candidate,
+            candidate_confidence=proposal.candidate_confidence,
+            safe_probability=proposal.safe_probability,
+            proposed_matcher=proposal.candidate.match if proposal.candidate is not None else None,
+            status=status,
+            conflict_rule_id=conflict_rule_id,
+            model=proposal.model,
+            request_id=proposal.request_id,
+        )
 
     def save(
         self,
         preview: RuleLearningPreview,
         service: RoutingRuleService,
     ) -> RoutingRuleMutationResult:
-        if preview.rule is None:
-            raise RoutingConfigError("only an automatically accepted rule proposal can be saved")
-        current = service.load()
-        if current != preview.base_rules:
-            raise RoutingConfigError("rules changed after proposal; analyze the selected message again")
-        if any(
-            item.source_folders == preview.rule.source_folders and item.match == preview.rule.match
-            for item in current.rules
-        ):
-            raise RoutingConfigError("an equivalent matcher and source scope already exists")
-        return service.add(preview.rule)
+        if preview.conflict_rule_id is not None:
+            raise RoutingConfigError(f"matcher is already attached to higher-priority rule {preview.conflict_rule_id}")
+        if preview.status != "auto" or preview.proposed_matcher is None:
+            raise RoutingConfigError("only an automatically accepted matcher proposal can be saved")
+        return service.add_learned_matcher(
+            preview.target_rule_id,
+            preview.proposed_matcher,
+            source_folder=preview.source_folder,
+            expected_rules_fingerprint=preview.base_rules_fingerprint,
+        )

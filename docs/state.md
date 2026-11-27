@@ -1,6 +1,6 @@
 # Persistent classification state
 
-imapledger can store a coarse classification outcome on each message as an IMAP keyword. The keyword lives in the recipient's mailbox, not in the message headers, so a sender cannot supply or forge imapledger state by adding a header.
+Legacy category classification can store a coarse outcome on each message as an IMAP keyword. The keyword lives in the recipient's mailbox, not in message headers, so a sender cannot supply or forge this state. The unified rule runner does not read or write these classification markers.
 
 ## Configuration and server support
 
@@ -22,7 +22,7 @@ Supported values are:
 
 The selected source mailbox must advertise persistent custom keywords in `PERMANENTFLAGS`: either `\\*` or the exact keyword must be listed. A successful IMAP `STORE` response alone is not sufficient. imapledger verifies keyword state after writes. `doctor` reports support as `OK`, `UNSUPPORTED`, or `UNKNOWN` when a read-only probe cannot determine it.
 
-In deprecated bare-clean compatibility mode, when `imap-keywords` is enabled and an applied run can keep an outcome, preflight checks keyword persistence before classification. Unsupported persistence fails closed before classifier work. If persistence fails during processing, that message is not reported as successfully persisted, the run stops, and later messages are not processed. Preflight is best-effort and does not make mailbox operations transactional. Positional `clean FOLDER` uses the separate local progress database described below.
+In legacy category classification, when `imap-keywords` is enabled and an applied run can keep an outcome, preflight checks keyword persistence before classification. Unsupported persistence fails closed before classifier work. If persistence fails during processing, that message is not reported as successfully persisted, the run stops, and later messages are not processed. Preflight is best-effort and does not make mailbox operations transactional. The unified rule runner uses the separate local progress database described below.
 
 ## Markers and versioning
 
@@ -36,11 +36,9 @@ The v1 markers identify only the coarse outcome:
 
 The `v1` component is a marker schema epoch. It is not the imapledger package version or the pyjev model version. Do not rename or manually add these markers. A future incompatible marker format should use an explicit migration rather than silently changing the meaning of v1.
 
-The markers do not store confidence, model or request IDs, policy reasons, timestamps, hashes, message content, or audit history. Only outcomes that finish with a configured `keep` action are persisted, and only when bare `clean --apply` uses the legacy classification workflow. Move and delete actions do not need a source marker. Dry runs never write state.
+The markers do not store confidence, model or request IDs, policy reasons, timestamps, hashes, message content, or audit history. Only outcomes that finish with a configured `keep` action are persisted by legacy category classification. Move and delete actions do not need a source marker. Dry runs never write state.
 
-With the keyword backend enabled, bare `clean` excludes messages carrying any imapledger state marker before applying `--offset` and `--limit`. This avoids repeatedly classifying marked messages and ensures selection bounds apply to unclassified messages. Positional `clean FOLDER` does not consult these markers. Conflicting markers are not resolved by guessing; `state status` counts conflicts and `explain` reports a state error for the affected UID.
-
-Use bare `clean --reclassify` to ignore existing classification state for that compatibility run. A reclassification is still read-only without `--apply`. If an applied reclassification ends in `keep`, imapledger replaces the old outcome marker with the current outcome and verifies the result.
+Use `imapledger mail classify UID --folder FOLDER --reclassify` to ignore an existing classification marker and evaluate the message again. The command is read-only unless `--apply` is supplied. If an applied classification ends in `keep`, imapledger replaces the old outcome marker with the current outcome and verifies the result. Use `rule evaluate` to inspect unified routing rules.
 
 ## Inspect state
 
@@ -103,7 +101,7 @@ IMAP keywords do not alter message headers or body. State status and review list
 
 ## Resumable routing progress
 
-The positional `clean FOLDER` pipeline uses a separate local SQLite database, not IMAP keywords. It defaults to `$XDG_STATE_HOME/imapledger/progress.sqlite3`, or `~/.local/state/imapledger/progress.sqlite3` when `XDG_STATE_HOME` is unset; `--progress-db PATH` selects another file. Progress records identify the IMAP account with a hash and store the source folder, UIDVALIDITY, fixed run UID bounds, rules fingerprint, mode, scope, sort direction, counters, and safe per-UID outcome/error codes. They do not store passwords or message bodies.
+The unified rule-run pipeline uses a separate local SQLite database, not IMAP keywords. It defaults to `$XDG_STATE_HOME/imapledger/progress.sqlite3`, or `~/.local/state/imapledger/progress.sqlite3` when `XDG_STATE_HOME` is unset; `--progress-db PATH` selects another file. Progress records identify the IMAP account with a hash and store the source folder, UIDVALIDITY, fixed run UID bounds, rules fingerprint, mode, scope, sort direction, counters, and safe per-UID outcome/error codes. They do not store passwords or message bodies.
 
 ```bash
 imapledger progress list

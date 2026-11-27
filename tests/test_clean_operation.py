@@ -17,7 +17,7 @@ def _settings() -> Settings:
     )
 
 
-def _rules(*, fallback: str | None = "Archive") -> RuleSet:
+def _rules() -> RuleSet:
     return RuleSet(
         (
             RoutingRule(
@@ -28,7 +28,6 @@ def _rules(*, fallback: str | None = "Archive") -> RuleSet:
                 match=RuleMatch(subject="invoice"),
             ),
         ),
-        fallback_destination=fallback,
     )
 
 
@@ -55,11 +54,13 @@ class _Engine:
         return self.report
 
 
-def test_clean_preflight_requires_full_routing_fallback() -> None:
-    operation = CleanOperation(_settings(), _rules(fallback=None))
+def test_clean_preflight_does_not_require_a_fallback_destination() -> None:
+    operation = CleanOperation(_settings(), _rules())
 
-    with pytest.raises(ValueError, match="full routing requires rules.fallback_destination"):
-        operation.preflight(CleanRequest(folder="INBOX"))
+    result = operation.preflight(CleanRequest(folder="INBOX"))
+
+    assert result.mode == "full"
+    assert result.destinations == ("Invoices",)
 
 
 def test_clean_preflight_limits_destinations_to_selected_enabled_rule() -> None:
@@ -100,7 +101,7 @@ def test_clean_operation_passes_request_and_reports_touched_folders(monkeypatch,
     result = operation.run(request, password="secret")
 
     assert stores == [tmp_path / "progress.db"]
-    assert mailboxes[0].kwargs["allowed_destinations"] == ("Invoices", "Archive")
+    assert mailboxes[0].kwargs["allowed_destinations"] == ("Invoices",)
     assert mailboxes[0].kwargs["writable"] is True
     assert result.report is report
     assert result.touched_folders == ("INBOX", "Invoices")

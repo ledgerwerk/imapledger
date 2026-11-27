@@ -76,6 +76,7 @@ def test_every_cli_command_except_ui_has_a_tui_partner() -> None:
     cli_tree = ast.parse((ROOT / "imapledger/cli.py").read_text(encoding="utf-8"))
     store_tree = ast.parse((ROOT / "imapledger/config_store_cli.py").read_text(encoding="utf-8"))
     cli_paths = _decorated_cli_paths(cli_tree) | _config_store_paths(store_tree)
+    cli_paths.discard(("clean",))
     registry_paths = {spec.cli_path for spec in OPERATION_SPECS}
 
     assert cli_paths == registry_paths

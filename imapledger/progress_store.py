@@ -17,7 +17,7 @@ from .config import ImapSettings, Settings
 
 RunMode = Literal["full", "single-rule"]
 SortDirection = Literal["oldest", "newest"]
-_RESULT_OUTCOMES = {"match", "fallback", "no_match", "error", "reconciled_missing"}
+_RESULT_OUTCOMES = {"match", "no_match", "already_there", "error", "reconciled_missing"}
 _ERROR_CODE = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 
 

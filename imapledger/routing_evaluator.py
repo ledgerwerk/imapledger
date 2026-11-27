@@ -96,7 +96,16 @@ class SemanticRoutingEvaluator:
                 raise RoutingEvaluationError(f"enabled rule not found for source {folder}: {rule_scope}")
             candidates = (candidate,)
 
-        model_rules = tuple(rule for rule in candidates if rule.type in {RuleType.SPAM, RuleType.SEMANTIC})
+        deterministic_matches = {
+            rule.id
+            for rule in candidates
+            if rule.type is RuleType.SEMANTIC and any(matcher.matches(message) for matcher in rule.match_any)
+        }
+        model_rules = tuple(
+            rule
+            for rule in candidates
+            if rule.type is RuleType.SPAM or (rule.type is RuleType.SEMANTIC and rule.id not in deterministic_matches)
+        )
         probabilities: dict[str, float] = {}
         evidence = None
         model: str | None = None
@@ -129,11 +138,14 @@ class SemanticRoutingEvaluator:
 
         evaluations: list[RuleEvaluation] = []
         for rule in candidates:
-            if model_error is not None and rule.type in {RuleType.SPAM, RuleType.SEMANTIC}:
+            if (
+                model_error is not None
+                and rule.type in {RuleType.SPAM, RuleType.SEMANTIC}
+                and rule.id not in deterministic_matches
+            ):
                 evaluations.append(RuleEvaluation(rule.id, EvaluationState.ERROR, detail=model_error))
             elif rule.type is RuleType.HEADER:
-                assert rule.match is not None
-                matched = rule.match.matches(message)
+                matched = any(matcher.matches(message) for matcher in rule.match_any)
                 evaluations.append(
                     RuleEvaluation(
                         rule.id,
@@ -141,6 +153,8 @@ class SemanticRoutingEvaluator:
                         detail="deterministic header match" if matched else None,
                     )
                 )
+            elif rule.id in deterministic_matches:
+                evaluations.append(RuleEvaluation(rule.id, EvaluationState.MATCH, detail="deterministic matcher match"))
             elif rule.type is RuleType.SPAM:
                 assert evidence is not None
                 signals = SemanticSpamSignals(**{name: probabilities[name] for name in SIGNAL_NAMES})
@@ -180,8 +194,6 @@ class SemanticRoutingEvaluator:
         if not has_error:
             if winner is not None:
                 destination = winner.destination
-            elif mode == "full":
-                destination = rules.fallback_destination
         return RoutingPlan(
             folder=folder,
             uid=message.uid,

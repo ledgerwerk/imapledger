@@ -18,9 +18,9 @@ imapledger init \
 
 imapledger config show
 imapledger doctor
-imapledger ui  # press R to create schema-2 rules and configure a fallback
-imapledger clean INBOX.Junk
-imapledger clean INBOX.Junk --apply
+imapledger ui  # press R to set up Spam and add global rules
+imapledger rule preview INBOX.Junk
+imapledger rule apply INBOX.Junk
 imapledger progress list
 ```
 

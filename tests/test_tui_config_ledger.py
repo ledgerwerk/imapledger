@@ -40,7 +40,7 @@ def test_command_center_shows_actionable_disabled_reasons() -> None:
         async with app.run_test() as pilot:
             app.push_screen(screen)
             await pilot.pause()
-            screen._update_selection("clean")
+            screen._update_selection("rule.preview")
 
             detail = str(screen.query_one("#command-center-detail", Static).render())
             assert "Unavailable: load a valid configuration" in detail

@@ -4,11 +4,14 @@ from pathlib import Path
 
 import pytest
 
+from imapledger.mailbox import FolderInfo
 from imapledger.routing_config import (
     RoutingConfigError,
+    ensure_builtin_spam_rule,
     load_routing_rules,
     migrate_legacy_rules,
     render_routing_rules,
+    resolve_spam_destination,
     rules_fingerprint,
     write_routing_rules,
 )
@@ -16,7 +19,13 @@ from imapledger.routing_models import RoutingModelError, RoutingRule, RuleSet, R
 from imapledger.rules import RuleMatch
 
 
-def _semantic(rule_id: str, destination: str, *, match_at: float = 0.9) -> RoutingRule:
+def _semantic(
+    rule_id: str,
+    destination: str,
+    *,
+    match_at: float = 0.9,
+    match_any: tuple[RuleMatch, ...] = (),
+) -> RoutingRule:
     return RoutingRule(
         id=rule_id,
         enabled=True,
@@ -24,23 +33,28 @@ def _semantic(rule_id: str, destination: str, *, match_at: float = 0.9) -> Routi
         destination=destination,
         description=f"Category {rule_id}\nfor retained mail.",
         match_at=match_at,
+        match_any=match_any,
     )
 
 
-def test_schema_two_rules_round_trip_and_keep_priority_order(tmp_path: Path) -> None:
+def test_schema_three_rules_round_trip_and_keep_priority_order(tmp_path: Path) -> None:
     rules = RuleSet(
         (
             RoutingRule("spam", True, RuleType.SPAM, "INBOX.Trash", description="Spam policy"),
-            _semantic("newsletter", "INBOX.Newsletter", match_at=0.88),
+            _semantic(
+                "newsletter",
+                "INBOX.Newsletter",
+                match_at=0.88,
+                match_any=(RuleMatch(list_id="weekly.example.com"), RuleMatch(from_address="news@example.org")),
+            ),
             RoutingRule(
                 "github",
                 True,
                 RuleType.HEADER,
                 "INBOX.Development",
-                match=RuleMatch(from_domain="github.com"),
+                match_any=(RuleMatch(from_domain="github.com"),),
             ),
         ),
-        fallback_destination="INBOX.Processed",
         default_match_at=0.91,
     )
     path = tmp_path / "rules.toml"
@@ -49,7 +63,10 @@ def test_schema_two_rules_round_trip_and_keep_priority_order(tmp_path: Path) -> 
 
     assert load_routing_rules(path) == rules
     assert [rule.id for rule in load_routing_rules(path).rules] == ["spam", "newsletter", "github"]
-    assert 'fallback_destination = "INBOX.Processed"' in path.read_text(encoding="utf-8")
+    assert "schema = 3" in path.read_text(encoding="utf-8")
+    serialized = path.read_text(encoding="utf-8")
+    assert 'match_any = [{ list_id = "weekly.example.com" }, { from_address = "news@example.org" }]' in serialized
+    assert "fallback_destination" not in path.read_text(encoding="utf-8")
 
 
 def test_missing_schema_two_file_returns_empty_rule_set(tmp_path: Path) -> None:
@@ -65,7 +82,7 @@ def test_missing_schema_two_file_returns_empty_rule_set(tmp_path: Path) -> None:
             'description = "A newsletter"\nmatch_at = 1.1',
             "between 0 and 1",
         ),
-        ('id = "header"\ntype = "header"\ndestination = "INBOX.Dev"', "requires a header match"),
+        ('id = "header"\ntype = "header"\ndestination = "INBOX.Dev"', "requires at least one matcher"),
         (
             'id = "spam"\ntype = "spam"\ndestination = "INBOX.Trash"\nmatch_at = 0.9',
             "only valid for semantic",
@@ -98,25 +115,29 @@ def test_duplicate_ids_and_missing_destination_are_rejected(tmp_path: Path) -> N
 
 def test_fingerprint_is_stable_and_tracks_enabled_behavior_and_spam_config() -> None:
     disabled = RoutingRule("later", False, RuleType.SPAM, "INBOX.Trash")
-    first = RuleSet((_semantic("newsletter", "INBOX.Newsletter"), disabled), "INBOX.Processed")
-    reordered = RuleSet((disabled, _semantic("newsletter", "INBOX.Newsletter")), "INBOX.Processed")
+    first = RuleSet((_semantic("newsletter", "INBOX.Newsletter"), disabled))
+    reordered = RuleSet((disabled, _semantic("newsletter", "INBOX.Newsletter")))
 
     fingerprint = rules_fingerprint(first, spam_policy={"delete_safe_at": 0.88})
     assert fingerprint == rules_fingerprint(first, spam_policy={"delete_safe_at": 0.88})
     assert fingerprint == rules_fingerprint(reordered, spam_policy={"delete_safe_at": 0.88})
     assert fingerprint != rules_fingerprint(first, spam_policy={"delete_safe_at": 0.89})
-    assert fingerprint != rules_fingerprint(RuleSet(first.rules, "INBOX.Archive"))
+    assert fingerprint != rules_fingerprint(
+        RuleSet((_semantic("newsletter", "INBOX.Newsletter", match_any=(RuleMatch(list_id="weekly"),)), disabled))
+    )
     assert fingerprint != rules_fingerprint(RuleSet((_semantic("newsletter", "INBOX.Newsletter", match_at=0.91),)))
 
 
-def test_source_and_config_store_destination_invariants() -> None:
-    rules = RuleSet((_semantic("newsletter", "INBOX.Newsletter"),), "INBOX.Processed")
-    rules.validate_destinations("INBOX.Archive", config_store_folder="INBOX.Config")
+def test_config_store_destinations_remain_protected_but_same_source_is_a_noop() -> None:
+    rules = RuleSet((_semantic("newsletter", "INBOX.Newsletter"),))
+    rules.validate_destinations("INBOX.Newsletter", config_store_folder="INBOX.Config")
 
-    with pytest.raises(RoutingModelError, match="source folder"):
-        RuleSet((_semantic("newsletter", "INBOX.Archive"),)).validate_destinations("INBOX.Archive")
     with pytest.raises(RoutingModelError, match="config-store"):
-        rules.validate_destinations("INBOX.Archive", config_store_folder="INBOX.Processed")
+        RuleSet((_semantic("newsletter", "INBOX.Config"),)).validate_destinations(
+            "INBOX.Archive", config_store_folder="INBOX.Config"
+        )
+    with pytest.raises(RoutingModelError, match="config-store"):
+        rules.validate_destinations("INBOX.Config", config_store_folder="INBOX.Config")
 
 
 def test_schema_one_migration_preview_does_not_write_and_apply_converts_rules(tmp_path: Path) -> None:
@@ -140,7 +161,7 @@ def test_schema_one_migration_preview_does_not_write_and_apply_converts_rules(tm
 
     assert applied.applied is True
     assert load_routing_rules(path) == applied.rules
-    assert "schema = 2" in path.read_text(encoding="utf-8")
+    assert "schema = 3" in path.read_text(encoding="utf-8")
 
 
 def test_schema_one_keep_action_migration_refuses_unsafe_conversion(tmp_path: Path) -> None:
@@ -161,3 +182,50 @@ def test_schema_two_rendering_is_deterministic() -> None:
     rules = RuleSet((_semantic("newsletter", "INBOX.Newsletter"),), "INBOX.Processed")
 
     assert render_routing_rules(rules) == render_routing_rules(rules)
+
+
+def test_schema_two_migration_drops_fallback_and_maps_match_to_match_any(tmp_path: Path) -> None:
+    path = tmp_path / "rules.toml"
+    path.write_text(
+        '[rules]\nschema = 2\nfallback_destination = "INBOX.Processed"\n\n'
+        '[[rules.rule]]\nid = "github"\ntype = "header"\ndestination = "INBOX.Dev"\n'
+        'match = { from_address = "ci@example.org" }\n',
+        encoding="utf-8",
+    )
+
+    preview = migrate_legacy_rules(path)
+
+    assert preview.source_schema == 2
+    assert preview.rules.fallback_destination is None
+    assert preview.rules.rules[0].match_any == (RuleMatch(from_address="ci@example.org"),)
+    assert any("fallback destination" in warning for warning in preview.warnings)
+    applied = migrate_legacy_rules(path, apply=True, spam_destination="INBOX.Trash")
+    assert applied.rules.rules[0].id == "spam"
+    assert applied.rules.rules[0].built_in is True
+    assert applied.rules.rules[1].source_folders == ()
+    assert "schema = 3" in path.read_text(encoding="utf-8")
+    assert "fallback_destination" not in path.read_text(encoding="utf-8")
+
+
+def test_spam_bootstrap_uses_only_a_valid_conservative_destination() -> None:
+    folders = (
+        FolderInfo("INBOX.Config", ".", frozenset(), None, None),
+        FolderInfo("INBOX.Trash", ".", frozenset({b"\\TRASH"}), None, None),
+        FolderInfo("INBOX.Archive", ".", frozenset(), None, None),
+    )
+    rules = RuleSet((_semantic("newsletter", "INBOX.Newsletter"),))
+
+    assert resolve_spam_destination("INBOX.Archive", folders, config_store_folder="INBOX.Config") == "INBOX.Archive"
+    assert resolve_spam_destination("missing", folders, config_store_folder="INBOX.Config") == "INBOX.Trash"
+    assert ensure_builtin_spam_rule(rules, "INBOX.Trash").rules[0].id == "spam"
+    assert ensure_builtin_spam_rule(rules, None) == rules
+
+
+def test_spam_bootstrap_does_not_guess_when_trash_is_ambiguous_or_unselectable() -> None:
+    folders = (
+        FolderInfo("INBOX.Trash", ".", frozenset({b"\\TRASH"}), None, None),
+        FolderInfo("Other.Trash", ".", frozenset({b"\\TRASH"}), None, None),
+        FolderInfo("INBOX.Deleted", ".", frozenset({b"\\NOSELECT"}), None, None),
+    )
+
+    assert resolve_spam_destination(None, folders) is None

@@ -8,7 +8,7 @@ from .config import Settings
 from .mailbox import PartialMoveError, ScopedMailbox
 from .preflight import preflight_source
 from .routing_config import rules_fingerprint
-from .routing_models import EvaluationState, RoutingPlan, RuleSet
+from .routing_models import EvaluationState, RoutingAction, RoutingPlan, RuleSet
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +68,8 @@ class RoutingActionService:
         destination = plan.destination
         if destination is None:
             return self._with_detail(receipt, "Routing plan has no MOVE destination; no changes made.")
+        if plan.action is RoutingAction.ALREADY_THERE:
+            return self._with_detail(receipt, "Already in destination; no changes made.")
         settings = self._settings
         check = self._preflight(
             settings,
@@ -152,12 +154,8 @@ class RoutingActionService:
             winner = next((rule for rule in rules.enabled_rules(plan.folder) if rule.id == plan.winner_rule_id), None)
             if winner is None or winner.destination != plan.destination:
                 raise ValueError("Winning rule or destination is no longer configured; classify again.")
-        elif plan.mode == "full" and rules.fallback_destination == plan.destination:
-            pass
-        else:
+        elif plan.winner_rule_id is None:
             raise ValueError("Plan destination is not the configured destination of a current rule.")
-        if plan.destination == plan.folder:
-            raise ValueError("Routing destination must not equal the source folder.")
         if config_store is not None and plan.destination == config_store:
             raise ValueError("Config-store folder cannot be a routing destination.")
 

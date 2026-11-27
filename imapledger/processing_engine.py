@@ -92,8 +92,6 @@ class ProcessingEngine:
             raise ProcessingError(str(exc)) from exc
         if rule_scope is not None and not any(rule.id == rule_scope for rule in self.rules.enabled_rules(folder)):
             raise ProcessingError(f"enabled rule not found for source {folder}: {rule_scope}")
-        if mode == "full" and self.rules.fallback_destination is None:
-            raise ProcessingError("full routing requires rules.fallback_destination")
 
         destinations = self._destinations(folder, rule_scope)
         metadata = mailbox.metadata()
@@ -297,7 +295,20 @@ class ProcessingEngine:
                 )
             return ProcessedMessage(uid, outcome, plan=plan), run, False
 
-        outcome = "fallback" if plan.winner_rule_id is None else "match"
+        if plan.destination == mailbox.folder:
+            if apply:
+                run = self.progress_store.record_result(
+                    run.id,
+                    uid=uid,
+                    outcome="already_there",
+                    winner_rule_id=plan.winner_rule_id,
+                    destination=plan.destination,
+                    model=plan.model,
+                    request_id=plan.request_id,
+                )
+            return ProcessedMessage(uid, "already_there", plan=plan, destination=plan.destination), run, False
+
+        outcome = "match"
         if not apply:
             return ProcessedMessage(uid, outcome, plan=plan, destination=plan.destination), run, False
 
@@ -481,10 +492,7 @@ class ProcessingEngine:
         rules = self.rules.enabled_rules(folder)
         if rule_scope is not None:
             rules = tuple(rule for rule in rules if rule.id == rule_scope)
-        destinations = [rule.destination for rule in rules]
-        if rule_scope is None and self.rules.fallback_destination is not None:
-            destinations.append(self.rules.fallback_destination)
-        return tuple(dict.fromkeys(destinations))
+        return tuple(dict.fromkeys(rule.destination for rule in rules if rule.destination != folder))
 
 
 def _plan_matches_run(
@@ -519,8 +527,7 @@ def _plan_matches_run(
         return winner is not None and first_match == winner.id and plan.destination == winner.destination
     if any(result.state is EvaluationState.MATCH for result in plan.rule_results):
         return False
-    expected_destination = rules.fallback_destination if run.mode == "full" else None
-    return plan.destination == expected_destination
+    return plan.destination is None
 
 
 def _safe_error_code(exc: Exception) -> str:

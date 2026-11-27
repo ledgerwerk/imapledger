@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,10 +11,11 @@ from pathlib import Path
 from ledgercore import AtomicWriteError, atomic_write_text
 
 from .config import ActionKind, default_config_path
+from .mailbox import FolderInfo
 from .routing_models import RULE_ID_PATTERN, RoutingModelError, RoutingRule, RuleSet, RuleType
 from .rules import RuleError, RuleMatch, load_rules
 
-RULE_SCHEMA = 2
+RULE_SCHEMA = 3
 
 try:
     import tomllib
@@ -58,11 +60,20 @@ def load_routing_rules(path: Path | None = None) -> RuleSet:
     if unknown:
         raise RoutingConfigError(f"unknown key in [rules]: {sorted(unknown)[0]}")
     schema = table.get("schema")
-    if isinstance(schema, bool) or not isinstance(schema, int) or schema != RULE_SCHEMA:
-        raise RoutingConfigError(f"rules schema must be {RULE_SCHEMA}; use `imapledger rule migrate` for schema 1")
+    if isinstance(schema, bool) or not isinstance(schema, int) or schema not in {2, RULE_SCHEMA}:
+        raise RoutingConfigError(
+            f"rules schema must be 2 or {RULE_SCHEMA}; use `imapledger rule migrate` for explicit migration"
+        )
     fallback = table.get("fallback_destination")
     if fallback is not None and not isinstance(fallback, str):
         raise RoutingConfigError("rules.fallback_destination must be a string")
+    if fallback is not None:
+        warnings.warn(
+            f"Old fallback destination {fallback} is not used by the rule model; "
+            "unmatched messages stay in their current folder.",
+            UserWarning,
+            stacklevel=2,
+        )
     default_match_at = table.get("default_match_at", 0.90)
     if isinstance(default_match_at, bool) or not isinstance(default_match_at, (float, int)):
         raise RoutingConfigError("rules.default_match_at must be a probability")
@@ -72,13 +83,15 @@ def load_routing_rules(path: Path | None = None) -> RuleSet:
     if not isinstance(raw_rules, list):
         raise RoutingConfigError("rules.rule must be an array of tables")
     try:
-        rules = tuple(_parse_routing_rule(value, index) for index, value in enumerate(raw_rules, start=1))
-        return RuleSet(rules, fallback_destination=fallback, default_match_at=float(default_match_at))
+        rules = tuple(
+            _parse_routing_rule(value, index, schema=schema) for index, value in enumerate(raw_rules, start=1)
+        )
+        return RuleSet(rules, default_match_at=float(default_match_at))
     except RoutingModelError as exc:
         raise RoutingConfigError(str(exc)) from exc
 
 
-def _parse_routing_rule(value: object, index: int) -> RoutingRule:
+def _parse_routing_rule(value: object, index: int, *, schema: int = RULE_SCHEMA) -> RoutingRule:
     label = f"rules.rule[{index}]"
     if not isinstance(value, dict):
         raise RoutingConfigError(f"{label} must be a table")
@@ -90,6 +103,7 @@ def _parse_routing_rule(value: object, index: int) -> RoutingRule:
         "description",
         "match_at",
         "match",
+        "match_any",
         "source_folders",
     }
     unknown = set(value) - allowed
@@ -117,18 +131,28 @@ def _parse_routing_rule(value: object, index: int) -> RoutingRule:
     match_at = value.get("match_at")
     if match_at is not None and (isinstance(match_at, bool) or not isinstance(match_at, (float, int))):
         raise RoutingConfigError(f"{label}.match_at must be a probability")
-    match_value = value.get("match")
-    if match_value is not None and not isinstance(match_value, dict):
-        raise RoutingConfigError(f"{label}.match must be a table")
-    match = None
-    if match_value is not None:
-        unknown_fields = set(match_value) - set(RuleMatch.__dataclass_fields__)
+    if schema == 2:
+        if "match_any" in value:
+            raise RoutingConfigError(f"{label}.match_any is only valid in schema 3")
+        raw_matchers = [value["match"]] if "match" in value else []
+    else:
+        if "match" in value:
+            raise RoutingConfigError(f"{label}.match is only valid in schema 2")
+        raw_matchers = value.get("match_any", [])
+        if not isinstance(raw_matchers, list):
+            raise RoutingConfigError(f"{label}.match_any must be an array of tables")
+    matchers: list[RuleMatch] = []
+    for matcher_index, raw_matcher in enumerate(raw_matchers, start=1):
+        matcher_label = f"{label}.match_any[{matcher_index}]"
+        if not isinstance(raw_matcher, dict):
+            raise RoutingConfigError(f"{matcher_label} must be a table")
+        unknown_fields = set(raw_matcher) - set(RuleMatch.__dataclass_fields__)
         if unknown_fields:
-            raise RoutingConfigError(f"unknown match key in {label}: {sorted(unknown_fields)[0]}")
-        if any(not isinstance(item, str) for item in match_value.values()):
-            raise RoutingConfigError(f"{label}.match values must be strings")
+            raise RoutingConfigError(f"unknown match key in {matcher_label}: {sorted(unknown_fields)[0]}")
+        if any(not isinstance(item, str) for item in raw_matcher.values()):
+            raise RoutingConfigError(f"{matcher_label} values must be strings")
         try:
-            match = RuleMatch(**match_value)
+            matchers.append(RuleMatch(**raw_matcher))
         except (RuleError, TypeError) as exc:
             raise RoutingConfigError(f"invalid matcher in {label}: {exc}") from exc
     source_folders = value.get("source_folders", [])
@@ -142,8 +166,9 @@ def _parse_routing_rule(value: object, index: int) -> RoutingRule:
             destination=destination,
             description=description,
             match_at=match_at,
-            match=match,
+            match_any=tuple(matchers),
             source_folders=tuple(source_folders),
+            built_in=rule_id == "spam",
         )
     except RoutingModelError as exc:
         raise RoutingConfigError(f"invalid {label}: {exc}") from exc
@@ -151,8 +176,6 @@ def _parse_routing_rule(value: object, index: int) -> RoutingRule:
 
 def render_routing_rules(rules: RuleSet) -> str:
     lines = ["[rules]", f"schema = {RULE_SCHEMA}", f"default_match_at = {rules.default_match_at:g}"]
-    if rules.fallback_destination is not None:
-        lines.append(f"fallback_destination = {_toml_string(rules.fallback_destination)}")
     for rule in rules.rules:
         lines.extend(
             (
@@ -170,9 +193,12 @@ def render_routing_rules(rules: RuleSet) -> str:
             lines.append(f"match_at = {rule.match_at:g}")
         if rule.source_folders:
             lines.append(f"source_folders = {_toml_string_array(rule.source_folders)}")
-        if rule.match is not None:
-            fields = ", ".join(f"{key} = {_toml_string(value)}" for key, value in rule.match.as_dict().items())
-            lines.append(f"match = {{ {fields} }}")
+        if rule.match_any:
+            matchers = []
+            for matcher in rule.match_any:
+                fields = ", ".join(f"{key} = {_toml_string(value)}" for key, value in matcher.as_dict().items())
+                matchers.append("{ " + fields + " }")
+            lines.append("match_any = [" + ", ".join(matchers) + "]")
     return "\n".join(lines) + "\n"
 
 
@@ -199,7 +225,6 @@ def rules_fingerprint(
     payload = {
         "schema": RULE_SCHEMA,
         "default_match_at": rules.default_match_at,
-        "fallback_destination": rules.fallback_destination,
         "rules": [_rule_fingerprint_data(rule) for rule in rules.enabled_rules()],
         "spam_policy": dict(spam_policy or {}),
         "spam_evidence_config": dict(spam_evidence_config or {}),
@@ -208,55 +233,132 @@ def rules_fingerprint(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def rules_content_fingerprint(rules: RuleSet) -> str:
+    payload = {
+        "schema": RULE_SCHEMA,
+        "fallback_destination": rules.fallback_destination,
+        "default_match_at": rules.default_match_at,
+        "rules": [{"enabled": rule.enabled, **_rule_fingerprint_data(rule)} for rule in rules.rules],
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _rule_fingerprint_data(rule: RoutingRule) -> dict[str, object]:
-    data: dict[str, object] = {
+    return {
         "id": rule.id,
         "type": rule.type.value,
         "destination": rule.destination,
         "description": rule.description,
         "match_at": rule.match_at,
         "source_folders": list(rule.source_folders),
+        "built_in": rule.built_in,
+        "match_any": [matcher.as_dict() for matcher in rule.match_any],
     }
-    if rule.match is not None:
-        data["match"] = rule.match.as_dict()
-    return data
 
 
-def migrate_legacy_rules(path: Path, *, apply: bool = False) -> RuleMigrationResult:
+def migrate_legacy_rules(
+    path: Path,
+    *,
+    apply: bool = False,
+    spam_destination: str | None = None,
+) -> RuleMigrationResult:
     try:
         payload = tomllib.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise RoutingConfigError(f"rules file not found: {path}") from exc
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise RoutingConfigError(f"could not read schema-1 rules file {path}: {exc}") from exc
+        raise RoutingConfigError(f"could not read rules file {path}: {exc}") from exc
     table = payload.get("rules") if isinstance(payload, dict) else None
     schema = table.get("schema") if isinstance(table, dict) else None
-    if isinstance(schema, bool) or schema != 1:
-        raise RoutingConfigError("rule migration requires a schema-1 rules file")
+    if isinstance(schema, bool) or schema not in {1, 2}:
+        raise RoutingConfigError("rule migration requires a schema-1 or schema-2 rules file")
+
+    warnings: list[str] = []
+    if schema == 1:
+        try:
+            legacy = load_rules(path)
+        except RuleError as exc:
+            raise RoutingConfigError(f"invalid schema-1 rules: {exc}") from exc
+        converted: list[RoutingRule] = []
+        for rule in legacy.rules:
+            if rule.action.action is not ActionKind.MOVE or rule.action.destination is None:
+                raise RoutingConfigError(
+                    f"rule {rule.id} uses {rule.action.action.value}; only MOVE rules can be migrated safely"
+                )
+            converted.append(
+                RoutingRule(
+                    id=rule.id,
+                    enabled=rule.enabled,
+                    type=RuleType.HEADER,
+                    destination=rule.action.destination,
+                    match_any=(rule.match,),
+                    source_folders=rule.source_folders,
+                )
+            )
+        default_match_at = 0.90
+    else:
+        raw_rules = table.get("rule", [])
+        if not isinstance(raw_rules, list):
+            raise RoutingConfigError("rules.rule must be an array of tables")
+        converted = [_parse_routing_rule(value, index, schema=2) for index, value in enumerate(raw_rules, 1)]
+        default_match_at = table.get("default_match_at", 0.90)
+        fallback = table.get("fallback_destination")
+        if fallback is not None:
+            if not isinstance(fallback, str):
+                raise RoutingConfigError("rules.fallback_destination must be a string")
+            warnings.append(
+                f"Old fallback destination {fallback} is not used by the new rule model. "
+                "Unmatched messages will stay in their current folder."
+            )
+    if spam_destination is not None:
+        if not isinstance(spam_destination, str) or not spam_destination.strip():
+            raise RoutingConfigError("Spam rule destination must be a non-empty folder name")
+        if not any(rule.id == "spam" for rule in converted):
+            converted.insert(
+                0,
+                RoutingRule("spam", True, RuleType.SPAM, spam_destination, built_in=True),
+            )
+            warnings.append(
+                f"Migrated the legacy Spam MOVE destination into the built-in Spam rule: {spam_destination}."
+            )
     try:
-        legacy = load_rules(path)
-    except RuleError as exc:
-        raise RoutingConfigError(f"invalid schema-1 rules: {exc}") from exc
-    converted: list[RoutingRule] = []
-    for rule in legacy.rules:
-        if rule.action.action is not ActionKind.MOVE or rule.action.destination is None:
-            raise RoutingConfigError(
-                f"rule {rule.id} uses {rule.action.action.value}; only MOVE rules can be migrated safely"
-            )
-        converted.append(
-            RoutingRule(
-                id=rule.id,
-                enabled=rule.enabled,
-                type=RuleType.HEADER,
-                destination=rule.action.destination,
-                match=rule.match,
-                source_folders=rule.source_folders,
-            )
-        )
-    migrated = RuleSet(tuple(converted))
+        migrated = RuleSet(tuple(converted), default_match_at=float(default_match_at))
+    except (RoutingModelError, TypeError, ValueError) as exc:
+        raise RoutingConfigError(f"invalid rules during migration: {exc}") from exc
     if apply:
         write_routing_rules(migrated, path)
-    return RuleMigrationResult(migrated, 1, apply)
+    return RuleMigrationResult(migrated, schema, apply, tuple(warnings))
+
+
+def resolve_spam_destination(
+    legacy_destination: str | None,
+    folders: tuple[FolderInfo, ...],
+    *,
+    config_store_folder: str | None = None,
+) -> str | None:
+    selectable = tuple(folder for folder in folders if folder.selectable and folder.name != config_store_folder)
+    names = {folder.name for folder in selectable}
+    if legacy_destination in names:
+        return legacy_destination
+    trash = tuple(folder.name for folder in selectable if b"\\TRASH" in folder.flags)
+    if len(trash) == 1:
+        return trash[0]
+    if trash:
+        return None
+    recognizable = tuple(
+        folder.name
+        for folder in selectable
+        if folder.name.rsplit(folder.delimiter or "/", 1)[-1].casefold() in {"trash", "deleted", "deleted items"}
+    )
+    return recognizable[0] if len(recognizable) == 1 else None
+
+
+def ensure_builtin_spam_rule(rules: RuleSet, destination: str | None) -> RuleSet:
+    if any(rule.id == "spam" for rule in rules.rules) or destination is None:
+        return rules
+    spam_rule = RoutingRule("spam", True, RuleType.SPAM, destination, built_in=True)
+    return RuleSet((spam_rule, *rules.rules), default_match_at=rules.default_match_at)
 
 
 def _toml_string(value: str) -> str:

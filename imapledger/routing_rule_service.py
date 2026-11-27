@@ -3,8 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .routing_config import RoutingConfigError, load_routing_rules, write_routing_rules
-from .routing_models import RoutingRule, RuleSet
+from .routing_config import (
+    RoutingConfigError,
+    load_routing_rules,
+    rules_content_fingerprint,
+    write_routing_rules,
+)
+from .routing_models import RoutingRule, RuleSet, RuleType
+from .rules import RuleMatch
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +42,46 @@ class RoutingRuleService:
         updated[index] = replacement
         return self._save(RuleSet(tuple(updated), rules.fallback_destination, rules.default_match_at), replacement.id)
 
+    def add_learned_matcher(
+        self,
+        rule_id: str,
+        matcher: RuleMatch,
+        *,
+        source_folder: str,
+        expected_rules_fingerprint: str,
+    ) -> RoutingRuleMutationResult:
+        rules = self.load()
+        if rules_content_fingerprint(rules) != expected_rules_fingerprint:
+            raise RoutingConfigError("rules changed after proposal; analyze the selected message again")
+        index = self._index(rules, rule_id)
+        current = rules.rules[index]
+        if current.type is not RuleType.SEMANTIC:
+            raise RoutingConfigError("learned matchers can only be added to semantic rules")
+        if matcher in current.match_any:
+            raise RoutingConfigError(f"matcher is already attached to rule {rule_id}")
+        for earlier in rules.rules[:index]:
+            if earlier.enabled and earlier.applies_to_source(source_folder) and matcher in earlier.match_any:
+                raise RoutingConfigError(f"matcher is already attached to higher-priority rule {earlier.id}")
+        replacement = RoutingRule(
+            id=current.id,
+            enabled=current.enabled,
+            type=current.type,
+            destination=current.destination,
+            description=current.description,
+            match_at=current.match_at,
+            match=current.match,
+            source_folders=current.source_folders,
+            match_any=(*current.match_any, matcher),
+            built_in=current.built_in,
+        )
+        updated = list(rules.rules)
+        updated[index] = replacement
+        return self._save(
+            RuleSet(tuple(updated), rules.fallback_destination, rules.default_match_at),
+            rule_id,
+            "Saved learned matcher to",
+        )
+
     def set_enabled(self, rule_id: str, enabled: bool) -> RoutingRuleMutationResult:
         rules = self.load()
         index = self._index(rules, rule_id)
@@ -48,6 +94,8 @@ class RoutingRuleService:
             description=current.description,
             match_at=current.match_at,
             match=current.match,
+            match_any=current.match_any,
+            built_in=current.built_in,
             source_folders=current.source_folders,
         )
         updated = list(rules.rules)
@@ -69,7 +117,9 @@ class RoutingRuleService:
 
     def remove(self, rule_id: str) -> RoutingRuleMutationResult:
         rules = self.load()
-        self._index(rules, rule_id)
+        index = self._index(rules, rule_id)
+        if rules.rules[index].built_in:
+            raise RoutingConfigError("the built-in Spam rule cannot be removed")
         updated = tuple(rule for rule in rules.rules if rule.id != rule_id)
         return self._save(RuleSet(updated, rules.fallback_destination, rules.default_match_at), rule_id, "Removed")
 

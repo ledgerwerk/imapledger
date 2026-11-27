@@ -9,7 +9,7 @@ from pyjev.results import BundleResult, NoulResult
 from imapledger.classifier import SIGNAL_NAMES
 from imapledger.message import MailMessage
 from imapledger.routing_evaluator import SemanticRoutingEvaluator
-from imapledger.routing_models import EvaluationState, RoutingRule, RuleSet, RuleType
+from imapledger.routing_models import EvaluationState, RoutingAction, RoutingRule, RuleSet, RuleType
 from imapledger.rules import RuleMatch
 
 
@@ -137,7 +137,7 @@ def test_first_semantic_match_wins_even_when_later_rule_also_matches(monkeypatch
     assert plan.destination == "INBOX.Advertising"
 
 
-def test_no_match_uses_fallback_and_selected_rule_never_uses_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_match_keeps_in_place_and_selected_rule_never_uses_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeJev({})
     _install_jev(monkeypatch, fake)
     rules = RuleSet(
@@ -150,7 +150,8 @@ def test_no_match_uses_fallback_and_selected_rule_never_uses_fallback(monkeypatc
         selected_plan = evaluator.plan("INBOX.Archive", _message(), rules, rule_scope="invoice")
 
     assert full_plan.winner_rule_id is None
-    assert full_plan.destination == "INBOX.Processed"
+    assert full_plan.destination is None
+    assert full_plan.action is RoutingAction.KEEP_IN_PLACE
     assert selected_plan.mode == "single-rule"
     assert selected_plan.rule_results[0].rule_id == "invoice"
     assert selected_plan.rule_results[0].state is EvaluationState.NO_MATCH
@@ -192,7 +193,20 @@ def test_spam_review_remains_a_no_match_with_review_detail(monkeypatch: pytest.M
     assert plan.rule_results[0].state is EvaluationState.NO_MATCH
     assert plan.rule_results[0].detail is not None
     assert plan.rule_results[0].detail.startswith("review:")
-    assert plan.destination == "INBOX.Processed"
+    assert plan.destination is None
+    assert plan.action is RoutingAction.KEEP_IN_PLACE
+
+
+def test_winning_rule_to_current_folder_is_already_there(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_jev(monkeypatch, FakeJev({_routing_key("newsletter"): 0.95}))
+    rules = RuleSet((_semantic("newsletter", "INBOX"),))
+
+    with SemanticRoutingEvaluator() as evaluator:
+        plan = evaluator.plan("INBOX", _message(), rules)
+
+    assert plan.winner_rule_id == "newsletter"
+    assert plan.destination == "INBOX"
+    assert plan.action is RoutingAction.ALREADY_THERE
 
 
 def test_model_exception_produces_error_and_never_selects_a_destination(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -245,3 +259,24 @@ def test_evaluator_requires_open_context_and_valid_rule_scope(monkeypatch: pytes
     with evaluator:
         with pytest.raises(ValueError, match="enabled rule not found"):
             evaluator.plan("INBOX.Archive", _message(), rules, rule_scope="unknown")
+
+
+def test_deterministic_matcher_on_semantic_rule_skips_model_evaluation(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeJev({})
+    _install_jev(monkeypatch, fake)
+    rule = RoutingRule(
+        id="invoice",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        destination="INBOX.Trash",
+        description="Invoice notices",
+        match_any=(RuleMatch(from_address="sender@example.org"),),
+    )
+
+    with SemanticRoutingEvaluator() as evaluator:
+        plan = evaluator.plan("INBOX.Archive", _message(), RuleSet((rule,)))
+
+    assert fake.calls == []
+    assert plan.rule_results[0].state is EvaluationState.MATCH
+    assert plan.rule_results[0].detail == "deterministic matcher match"
+    assert plan.winner_rule_id == "invoice"

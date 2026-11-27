@@ -4,7 +4,6 @@ from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
-import pyjev
 import pytest
 from rich.console import Console
 from typer.testing import CliRunner
@@ -36,16 +35,16 @@ from imapledger.mailbox import (
     MailboxProbe,
     MessageSelection,
     MessageSort,
-    MoveResult,
     PartialDeleteError,
-    PartialMoveError,
     ScopedMailbox,
 )
 from imapledger.message import MailMessage
 from imapledger.policy import SpamVerdict
-from imapledger.rule_learning import RuleCandidate, RuleProposal
-from imapledger.rules import MailRule, RuleMatch, RuleSet
-from tests.fakes import FolderAwareFakeClient, raw_message
+from imapledger.routing_config import load_routing_rules, write_routing_rules
+from imapledger.routing_models import RoutingRule, RuleType
+from imapledger.routing_models import RuleSet as RoutingRuleSet
+from imapledger.rules import RuleMatch, RuleSet
+from tests.fakes import FolderAwareFakeClient
 
 
 class FailingMailbox:
@@ -66,45 +65,27 @@ class FailingMailbox:
         return None
 
 
-def test_clean_debug_error_is_phase_aware_and_hides_exception_payload(monkeypatch):
-    settings = Settings(
-        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-        spam=SpamSettings(folders=("Spam",)),
-    )
-    monkeypatch.setattr(cli, "load_settings", lambda path: settings)
-    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
-    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
-    monkeypatch.setattr(legacy_clean, "ScopedMailbox", FailingMailbox)
+def test_clean_without_folder_is_usage_error(monkeypatch):
+    monkeypatch.setattr(cli, "_resolve_password", lambda _imap: pytest.fail("must not connect"))
 
-    result = CliRunner().invoke(cli.app, ["clean", "--debug"])
+    result = CliRunner().invoke(cli.app, ["clean"])
 
-    assert result.exit_code == 1
-    assert "error [imap_login]" in result.output
-    assert "server_error_type=RuntimeError" in result.output
-    assert "hint: run imapledger doctor --verbose" in result.output
-    assert "Traceback (most recent call last)" in result.output
-    assert "Caused by: RuntimeError" in result.output
-    assert "password=secret" not in result.output
-    assert "private@example.org" not in result.output
+    assert result.exit_code == 2
+    assert "Missing argument 'folder'" in result.output
+    assert "spam.folders" not in result.output
 
 
-def test_clean_help_exposes_verbose_and_debug_options():
+def test_clean_help_exposes_unified_rule_options():
     result = CliRunner().invoke(cli.app, ["clean", "--help"])
 
     assert result.exit_code == 0
     assert "--verbose" in result.output
-    assert "--debug" in result.output
+    assert "--apply" in result.output
     assert "--limit" in result.output
-    assert "--offset" in result.output
-    assert "--sort" in result.output
-    assert "--progress" in result.output
-    assert "--no-progress" in result.output
-    assert "--reclassify" in result.output
-
-    assert "final configured" in result.output
-    assert "action as it" in result.output
-    assert "category actions" in result.output
-    assert "spam.folders" in result.output
+    assert "--rule" in result.output
+    assert "--retry-errors" in result.output
+    assert "Deprecated alias" in result.output
+    assert "category actions" not in result.output
 
 
 class CleanFakeMailbox:
@@ -246,37 +227,6 @@ def _stream_report(*, apply=False):
     )
 
 
-def test_clean_forwards_selection_arguments(monkeypatch):
-    output = StringIO()
-    report = CleanReport(folder="Spam", apply=False, results=[])
-    mailbox, observed = _configure_clean(monkeypatch, report, output)
-
-    result = CliRunner().invoke(
-        cli.app,
-        ["clean", "--limit", "10", "--offset", "10", "--sort", "newest"],
-    )
-
-    expected = MessageSelection(limit=10, offset=10, sort=MessageSort.NEWEST)
-    assert result.exit_code == 0
-    assert observed["selection"] == expected
-    assert observed["selection"] is mailbox.selection
-    assert "messages=4 selected=0 sort=newest offset=10 limit=10" in output.getvalue()
-
-
-def test_clean_reclassify_option_is_forwarded_without_enabling_apply(monkeypatch):
-    output = StringIO()
-    report = CleanReport(folder="Spam", apply=False, results=[])
-    mailbox, observed = _configure_clean(monkeypatch, report, output)
-
-    result = CliRunner().invoke(cli.app, ["clean", "--reclassify"])
-
-    assert result.exit_code == 0
-    assert observed["apply"] is False
-    assert observed["reclassify"] is True
-    assert observed["selection"] == MessageSelection()
-    assert mailbox.selection is observed["selection"]
-
-
 @pytest.mark.parametrize(
     "arguments",
     [["clean", "--limit", "0"], ["clean", "--offset", "-1"], ["clean", "--sort", "invalid"]],
@@ -333,62 +283,6 @@ def test_progress_reports_persisted_state(monkeypatch):
     cli._print_result(row, folder="INBOX.Junk", position=1, total=1, apply=True)
 
     assert "State=STORED" in output.getvalue()
-
-
-def test_clean_streams_decisions_once_with_summary(monkeypatch):
-    output = StringIO()
-    report = _stream_report()
-    _configure_clean(monkeypatch, report, output)
-
-    result = CliRunner().invoke(cli.app, ["clean"])
-
-    rendered = output.getvalue()
-    assert result.exit_code == 0
-    assert "clean` is deprecated" in rendered
-    assert "folder=Spam messages=4 selected=4 sort=newest offset=0 limit=all" in rendered
-    assert "[1/4] SPAM | WOULD DELETE |" in rendered
-    assert "Signals=" not in rendered
-    assert "Reasons=" not in rendered
-    assert "[2/4] NOT_SPAM | KEEP |" in rendered
-    assert "[3/4] SKIP | SKIP / KEEP |" in rendered
-    assert "[4/4] ERROR | ERROR / KEEP |" in rendered
-    assert rendered.count("spam-subject") == 1
-    assert "token=secret" not in rendered
-    assert "/path" not in rendered
-    assert "Scanned 4; rules 0; spam 1; not-spam 1; review 0; skipped 1; errors 1." in rendered
-    assert "Actions: would delete 1; kept 3." in rendered
-    assert "Dry-run only." in rendered
-
-
-def test_no_progress_suppresses_stream_and_renders_final_report(monkeypatch):
-    output = StringIO()
-    report = _stream_report()
-    _configure_clean(monkeypatch, report, output)
-
-    result = CliRunner().invoke(cli.app, ["clean", "--no-progress"])
-
-    rendered = output.getvalue()
-    assert result.exit_code == 0
-    assert "[1/4]" not in rendered
-    assert "spam-subject" in rendered
-    assert "WOULD DELETE" in rendered
-    assert rendered.count("spam-subject") == 1
-
-
-def test_apply_progress_reports_final_action_without_duplicate_listing(monkeypatch):
-    output = StringIO()
-    report = _stream_report(apply=True)
-    _configure_clean(monkeypatch, report, output)
-
-    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
-
-    rendered = output.getvalue()
-    assert result.exit_code == 0
-    assert "[1/4] SPAM | DELETED |" in rendered
-    assert "[1/4] SPAM | DELETE |" not in rendered
-    assert rendered.count("[1/4] SPAM |") == 1
-    assert "folder=Spam UID 40  DELETED" not in rendered
-    assert "Actions: deleted 1; kept 3." in rendered
 
 
 class DoctorFakeClient:
@@ -775,19 +669,6 @@ def test_doctor_reports_unknown_keyword_persistence_without_mutating(monkeypatch
     assert client.added == client.removed == []
 
 
-def test_clean_apply_aborts_before_classification_when_keywords_are_unsupported(monkeypatch):
-    client = DoctorFakeClient(permanent_flags=())
-    _configure_doctor(monkeypatch, client, settings=_keyword_state_settings())
-
-    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
-
-    assert result.exit_code == 1
-    assert "custom keyword persistence: UNSUPPORTED" in result.output
-    assert "apply aborted before classification/mutation" in result.output
-    assert client.fetches == [(("1:*",), ("UID",))]
-    assert client.added == client.removed == client.expunged == []
-
-
 def test_doctor_reports_missing_source_and_checks_later_sources(monkeypatch):
     settings = Settings(
         imap=ImapSettings(host="imap.example.org", username="user@example.org"),
@@ -996,104 +877,6 @@ def test_partial_delete_report_distinguishes_confirmed_and_pending_uids(monkeypa
     assert "Partial deletion: 1 confirmed; 1 pending." in rendered
 
 
-def test_clean_exits_nonzero_after_partial_delete(monkeypatch):
-    settings = Settings(
-        imap=ImapSettings(host="imap.example.org", username="user@example.org"),
-        spam=SpamSettings(folders=("Spam",)),
-    )
-    failure = ImapOperationError(
-        operation="imap_uid_expunge",
-        message="deletion stopped after a failed UID batch",
-        folder="Spam",
-        uids=(2,),
-        batch=2,
-        batch_count=2,
-        cause_type="RuntimeError",
-    )
-    partial = PartialDeleteError(deleted=(1,), pending=(2,), failure=failure)
-    signals = SemanticSpamSignals(0.1, 0.99, 0.1, 0.1, 0.9)
-    report = CleanReport(
-        folder="Spam",
-        apply=True,
-        partial_delete_error=partial,
-        results=[
-            MessageResult(
-                uid=1,
-                subject="confirmed",
-                sender="a@example.org",
-                verdict=SpamVerdict.DELETE,
-                signals=signals,
-                reasons=("phishing",),
-                status="delete",
-                inclination="DELETE-APPROVED",
-                action=MessageAction(ActionKind.DELETE),
-                outcome=SpamOutcome.SPAM,
-                action_applied=True,
-            ),
-            MessageResult(
-                uid=2,
-                subject="pending",
-                sender="b@example.org",
-                verdict=SpamVerdict.DELETE,
-                signals=signals,
-                reasons=("phishing",),
-                status="delete",
-                inclination="DELETE-APPROVED",
-                action=MessageAction(ActionKind.DELETE),
-                outcome=SpamOutcome.SPAM,
-            ),
-        ],
-    )
-
-    class Context:
-        folder = "Spam"
-        uids = frozenset({1, 2})
-        capabilities = frozenset({b"MOVE", b"UIDPLUS"})
-        permanent_flags = frozenset({b"\\*"})
-        permanent_flags_known = True
-
-        def destination_exists(self, destination):
-            return True
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-        def snapshot(self):
-            return self
-
-        def selected_count(self, selection):
-            return len(self.uids)
-
-    class FakeCleaner:
-        def __init__(self, mailbox, classifier, *, policy, actions=None, rules=None, state_backend=None):
-            pass
-
-        def run(self, *, apply, selection, on_result, reclassify=False):
-            if on_result is not None:
-                for position, row in enumerate(report.results, start=1):
-                    on_result(row, position, len(report.results))
-            return report
-
-    output = StringIO()
-    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
-    monkeypatch.setattr(cli, "load_settings", lambda path: settings)
-    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
-    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
-    monkeypatch.setattr(legacy_clean, "ScopedMailbox", lambda **kwargs: Context())
-    monkeypatch.setattr(legacy_clean, "PyJevSpamClassifier", CleanFakeClassifier)
-    monkeypatch.setattr(legacy_clean, "SpamCleaner", FakeCleaner)
-
-    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
-
-    assert result.exit_code == 1
-    assert "NOT CONFIRMED" in output.getvalue()
-    assert "confirmed_deleted_count=1 pending_count=1" in result.output
-    assert "hint: run imapledger doctor --verbose" in result.output
-
-
 def test_config_show_prints_effective_config_without_prompt_or_connection(monkeypatch, tmp_path):
     settings = Settings(
         imap=ImapSettings(host="imap.example.org", username="user@example.org"),
@@ -1291,263 +1074,6 @@ def _multi_folder_settings(folders=("INBOX.Junk", "INBOX.Spam")):
             ),
         ),
     )
-
-
-def test_clean_apply_keeps_real_folder_provenance_with_selection_drift(monkeypatch):
-    output = StringIO()
-    settings = _multi_folder_settings(("INBOX.Junk", "INBOX.spam"))
-    client = FolderAwareFakeClient(
-        {
-            "INBOX.Junk": {
-                1001: raw_message("JUNK-A", "junk-a@example.org"),
-                1000: raw_message("JUNK-B", "junk-b@example.org"),
-            },
-            "INBOX.spam": {
-                2001: raw_message("SPAM-A", "spam-a@example.org"),
-                2000: raw_message("SPAM-B", "spam-b@example.org"),
-            },
-            "INBOX.Trash": {},
-            "INBOX.NotSpam": {},
-        }
-    )
-    rules = RuleSet(
-        (
-            MailRule(
-                "junk-a",
-                True,
-                ("INBOX.Junk",),
-                MessageAction(ActionKind.MOVE, "INBOX.Trash"),
-                RuleMatch(from_address="junk-a@example.org"),
-            ),
-            MailRule(
-                "junk-b",
-                True,
-                ("INBOX.Junk",),
-                MessageAction(ActionKind.MOVE, "INBOX.Trash"),
-                RuleMatch(from_address="junk-b@example.org"),
-            ),
-            MailRule(
-                "spam-a",
-                True,
-                ("INBOX.spam",),
-                MessageAction(ActionKind.MOVE, "INBOX.Trash"),
-                RuleMatch(from_address="spam-a@example.org"),
-            ),
-            MailRule(
-                "spam-b",
-                True,
-                ("INBOX.spam",),
-                MessageAction(ActionKind.MOVE, "INBOX.Trash"),
-                RuleMatch(from_address="spam-b@example.org"),
-            ),
-        )
-    )
-    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
-    monkeypatch.setattr(cli, "load_settings", lambda path: settings)
-    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: rules)
-    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
-    monkeypatch.setattr(legacy_clean, "PyJevSpamClassifier", CleanFakeClassifier)
-
-    def mailbox_factory(**kwargs):
-        return ScopedMailbox(**kwargs, client_factory=lambda *args, **options: client)
-
-    monkeypatch.setattr(legacy_clean, "ScopedMailbox", mailbox_factory)
-    result = CliRunner().invoke(cli.app, ["clean", "--limit", "2", "--apply"])
-
-    rendered = output.getvalue()
-    assert result.exit_code == 0, result.output
-    assert "MOVED -> INBOX.Trash | junk-a@example.org | JUNK-A" in rendered
-    assert "junk-a@example.org" in rendered
-    assert "MOVED -> INBOX.Trash | junk-b@example.org | JUNK-B" in rendered
-    assert "junk-b@example.org" in rendered
-    assert "MOVED -> INBOX.Trash | spam-a@example.org | SPAM-A" in rendered
-    assert "spam-a@example.org" in rendered
-    assert "MOVED -> INBOX.Trash | spam-b@example.org | SPAM-B" in rendered
-    assert "spam-b@example.org" in rendered
-    assert "Folder=INBOX.Spam" not in rendered
-    assert "Rule=junk-a" not in rendered
-    assert rendered.count("JUNK-A") == 1
-    assert rendered.count("JUNK-B") == 1
-    assert client.moves == [
-        ((1001,), "INBOX.Trash"),
-        ((1000,), "INBOX.Trash"),
-        ((2001,), "INBOX.Trash"),
-        ((2000,), "INBOX.Trash"),
-    ]
-
-
-def test_clean_visits_multiple_folders_in_order_with_one_password_and_classifier(monkeypatch):
-    output = StringIO()
-    settings = _multi_folder_settings()
-    state = _install_multi_clean(monkeypatch, settings, output)
-
-    result = CliRunner().invoke(
-        cli.app,
-        ["clean", "--limit", "10", "--offset", "10", "--sort", "newest"],
-    )
-
-    selection = MessageSelection(limit=10, offset=10, sort=MessageSort.NEWEST)
-    rendered = output.getvalue()
-    assert result.exit_code == 0
-    assert len(state["prompts"]) == 1
-    assert len(state["classifier_instances"]) == len(state["classifier_contexts"]) == 1
-    assert [folder for folder, _, _ in state["clean_calls"]] == ["INBOX.Junk", "INBOX.Spam"]
-    assert {mailbox.folder for mailbox in state["mailboxes"]} == set(settings.spam.folders)
-    assert all(classifier is state["classifier_instances"][0] for _, classifier, _ in state["clean_calls"])
-    assert all(actual == selection for _, _, actual in state["clean_calls"])
-    assert state["clean_calls"][0][2] is state["clean_calls"][1][2]
-    assert all(mailbox.selections == [selection] for mailbox in state["mailboxes"])
-    assert "folder=INBOX.Junk messages=30 selected=10 sort=newest offset=10 limit=10" in rendered
-    assert "folder=INBOX.Spam messages=30 selected=10 sort=newest offset=10 limit=10" in rendered
-    assert rendered.count("WOULD MOVE -> INBOX.Trash") == 2
-    assert "Aggregate across 2 folders (UIDs remain folder-scoped): scanned 2; rules 0; spam 2;" in rendered
-
-
-def test_clean_apply_preflights_and_allows_rule_destinations(monkeypatch):
-    output = StringIO()
-    rules = RuleSet(
-        (
-            MailRule(
-                "learned-route",
-                True,
-                ("INBOX.Junk",),
-                MessageAction(ActionKind.MOVE, "INBOX.RuleTrash"),
-                RuleMatch(from_address="mailer@example.org"),
-            ),
-        )
-    )
-    state = _install_multi_clean(monkeypatch, _multi_folder_settings(), output, rules=rules)
-
-    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
-
-    assert result.exit_code == 0, result.output
-    assert all("INBOX.RuleTrash" in mailbox.kwargs["allowed_destinations"] for mailbox in state["mailboxes"])
-    for folder in ("INBOX.Junk", "INBOX.Spam"):
-        assert ("destination", folder, "INBOX.RuleTrash") in state["events"]
-
-
-def test_clean_apply_preflights_each_destination_before_classifying(monkeypatch):
-    output = StringIO()
-    state = _install_multi_clean(monkeypatch, _multi_folder_settings(), output)
-
-    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
-
-    rendered = output.getvalue()
-    assert result.exit_code == 0
-    assert len(state["prompts"]) == 1
-    assert len(state["classifier_instances"]) == 1
-    first_classify = next(index for index, event in enumerate(state["events"]) if event[0] == "classify")
-    assert state["events"].index(("close", "INBOX.Spam")) < first_classify
-    assert [mailbox.kwargs["writable"] for mailbox in state["mailboxes"]] == [False, False, True, True]
-    for folder in ("INBOX.Junk", "INBOX.Spam"):
-        folder_events = [event for event in state["events"] if event[1] == folder]
-        assert folder_events.index(("destination", folder, "INBOX.Trash")) < folder_events.index(("classify", folder))
-        assert folder_events.index(("destination", folder, "INBOX.NotSpam")) < folder_events.index(("classify", folder))
-    assert rendered.count("MOVED -> INBOX.Trash |") == 2
-    assert rendered.count("SPAM | MOVED -> INBOX.Trash |") == 2
-    assert "MOVED -> INBOX.Trash |" in rendered
-    assert "Aggregate across 2 folders" in rendered
-
-
-def test_clean_apply_aborts_all_sources_before_classifier_or_mutation(monkeypatch):
-    output = StringIO()
-    state = _install_multi_clean(
-        monkeypatch,
-        _multi_folder_settings(),
-        output,
-        preflight_failure_folder="INBOX.Spam",
-    )
-
-    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
-
-    rendered = output.getvalue()
-    assert result.exit_code == 1
-    assert len(state["prompts"]) == 1
-    assert [mailbox.folder for mailbox in state["mailboxes"]] == ["INBOX.Junk", "INBOX.Spam"]
-    assert all(mailbox.kwargs["writable"] is False for mailbox in state["mailboxes"])
-    assert state["classifier_instances"] == []
-    assert state["clean_calls"] == []
-    assert "preflight INBOX.Junk: OK" in rendered
-    assert "preflight INBOX.Spam: FAILED" in rendered
-    assert "error [imap_source_folder_missing]" in result.output
-    assert "apply aborted before classification/mutation" in rendered
-    assert "MOVED" not in rendered and "DELETED" not in rendered
-    assert "Traceback" not in result.output
-
-
-def test_clean_partial_move_exits_nonzero_and_keeps_confirmed_reporting(monkeypatch):
-    output = StringIO()
-    settings = _multi_folder_settings()
-    failure = ImapOperationError(
-        operation="imap_uid_move",
-        message="move stopped after a failed UID batch",
-        folder="INBOX.Junk",
-        uids=(20,),
-        batch=2,
-        batch_count=2,
-        cause_type="RuntimeError",
-        server_status="NO",
-    )
-    partial = PartialMoveError(
-        moved=(10,),
-        pending=(20,),
-        destination="INBOX.Trash",
-        failure=failure,
-    )
-
-    def report_factory(mailbox, apply):
-        return CleanReport(
-            folder=mailbox.folder,
-            apply=apply,
-            partial_move_error=partial,
-            results=[
-                MessageResult(
-                    uid=10,
-                    subject="confirmed",
-                    sender="a@example.org",
-                    verdict=SpamVerdict.DELETE,
-                    signals=SemanticSpamSignals(0.1, 0.99, 0.1, 0.1, 0.9),
-                    reasons=("phishing",),
-                    status="delete",
-                    inclination="DELETE-APPROVED",
-                    action=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
-                    outcome=SpamOutcome.SPAM,
-                    action_applied=True,
-                ),
-                MessageResult(
-                    uid=20,
-                    subject="pending",
-                    sender="b@example.org",
-                    verdict=SpamVerdict.DELETE,
-                    signals=SemanticSpamSignals(0.1, 0.99, 0.1, 0.1, 0.9),
-                    reasons=("phishing",),
-                    status="delete",
-                    inclination="DELETE-APPROVED",
-                    action=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
-                    outcome=SpamOutcome.SPAM,
-                    detail="Move was not confirmed; see the operation error.",
-                ),
-            ],
-        )
-
-    state = _install_multi_clean(monkeypatch, settings, output, report_factory=report_factory)
-    result = CliRunner().invoke(cli.app, ["clean", "--apply"])
-
-    rendered = output.getvalue()
-    assert result.exit_code == 1
-    assert [(mailbox.folder, mailbox.kwargs["writable"]) for mailbox in state["mailboxes"]] == [
-        ("INBOX.Junk", False),
-        ("INBOX.Spam", False),
-        ("INBOX.Junk", True),
-    ]
-    assert "[1/2] SPAM | MOVED -> INBOX.Trash |" in rendered
-
-    assert "[2/2] SPAM | MOVE NOT CONFIRMED -> INBOX.Trash |" in rendered
-    assert rendered.count("[1/2] SPAM | MOVED") == 1
-    assert "MOVED -> INBOX.Trash |" in rendered
-    assert "MOVE NOT CONFIRMED -> INBOX.Trash |" in rendered
-    assert "Aggregate across 1 folders" in rendered
-    assert "destination='INBOX.Trash'" in result.output
 
 
 def test_doctor_checks_all_source_folders_capabilities_and_destinations(monkeypatch):
@@ -1880,20 +1406,10 @@ def _routing_settings() -> Settings:
     )
 
 
-def _routing_rule() -> MailRule:
-    return MailRule(
-        id="mailer-daemon-gmx-net",
-        enabled=True,
-        source_folders=("INBOX.Junk",),
-        action=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
-        match=RuleMatch(from_address="mailer-daemon@gmx.net"),
-    )
-
-
 def _routing_message(uid: int = 43627, *, address: str = "mailer-daemon@gmx.net") -> MailMessage:
     return MailMessage(
         uid=uid,
-        subject="Ihre E-Mail konnte nicht zugestellt werden",
+        subject="Delivery failure notice",
         sender=f"Mailer Daemon <{address}>",
         recipients=(),
         date="",
@@ -1903,25 +1419,26 @@ def _routing_message(uid: int = 43627, *, address: str = "mailer-daemon@gmx.net"
     )
 
 
-def _install_rule_learn(monkeypatch, tmp_path, *, destination_exists=True):
-    state = {"prompts": [], "writes": [], "events": [], "fetches": [], "moves": []}
+def _install_rule_learn(monkeypatch, tmp_path, *, status="auto"):
+    state = {"fetches": [], "saved": [], "proposals": [], "events": []}
     settings = _routing_settings()
-    candidate = RuleCandidate(
-        "from_address_exact",
-        RuleMatch(from_address="mailer-daemon@gmx.net"),
-        "from=mailer-daemon@gmx.net",
-        True,
-        100,
+    rule = RoutingRule(
+        id="newsletter",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        destination="Archive",
+        description="Route newsletter messages",
     )
-    proposal = RuleProposal(candidate, "auto", 0.96, 0.98, "model-test", "request-test")
+    matcher = RuleMatch(from_address="mailer-daemon@gmx.net")
+    proposal = SimpleNamespace(
+        semantic_fit=0.96,
+        selected_candidate=SimpleNamespace(description="Exact sender address"),
+        candidate_confidence=0.96,
+        safe_probability=0.98,
+        proposed_matcher=matcher,
+        status=status,
+    )
     message = _routing_message()
-
-    class FakeJev:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
 
     class FakeMailbox:
         def __init__(self, **kwargs):
@@ -1933,42 +1450,29 @@ def _install_rule_learn(monkeypatch, tmp_path, *, destination_exists=True):
         def __exit__(self, *args):
             return None
 
-        def destination_exists(self, destination):
-            state["destination"] = destination
-            return destination_exists
-
         def fetch_uid(self, uid):
             state["fetches"].append(uid)
+            state["events"].append("fetch")
             return MailboxItem(uid, message)
 
-        def move_uid(self, uid, destination):
-            state["events"].append("move")
-            state["moves"].append((uid, destination))
-            return MoveResult((uid,), destination)
+    class FakeOperation:
+        def propose(self, current_message, *, folder, target_rule_id, existing_rules):
+            state["proposals"].append((current_message, folder, target_rule_id, existing_rules))
+            return proposal
 
-        def selected_count(self, selection):
-            return 2
-
-        def iter_messages(self, selection):
-            yield MailboxItem(43627, message)
-            yield MailboxItem(43628, _routing_message(43628, address="other@example.org"))
+        def save(self, current_proposal, service):
+            state["saved"].append((current_proposal, service))
+            state["events"].append("save")
+            return SimpleNamespace(changed_rule_id="newsletter")
 
     output = StringIO()
     state["output"] = output
     monkeypatch.setattr(cli, "console", Console(file=output, width=200))
-    monkeypatch.setattr(cli, "load_settings", lambda path: settings)
-    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
-    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: state["prompts"].append(prompt) or "secret")
+    monkeypatch.setattr(cli, "load_settings", lambda _path: settings)
+    monkeypatch.setattr(cli, "load_routing_rules", lambda _path: RoutingRuleSet((rule,)))
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: "secret")
     monkeypatch.setattr(cli, "ScopedMailbox", FakeMailbox)
-    monkeypatch.setattr(cli, "learn_rule_proposal", lambda jev, **kwargs: proposal)
-    monkeypatch.setattr(pyjev, "Jev", FakeJev)
-
-    def write(rules, path):
-        state["events"].append("save")
-        state["writes"].append((rules, path))
-        return path
-
-    monkeypatch.setattr(cli, "write_rules", write)
+    monkeypatch.setattr(cli, "RuleLearningOperation", FakeOperation)
     return state, proposal
 
 
@@ -1976,11 +1480,11 @@ def _learn_args(tmp_path, *extra):
     return [
         "rule",
         "learn",
-        "43627",
+        "newsletter",
         "--folder",
-        "INBOX.Junk",
-        "--move",
-        "INBOX.Trash",
+        "INBOX",
+        "--uid",
+        "43627",
         "--config",
         str(tmp_path / "config.toml"),
         *extra,
@@ -1990,201 +1494,143 @@ def _learn_args(tmp_path, *extra):
 def test_rule_help_and_learn_require_folder():
     runner = CliRunner()
     help_result = runner.invoke(cli.app, ["rule", "--help"])
-    missing_folder = runner.invoke(cli.app, ["rule", "learn", "43627", "--move", "INBOX.Trash"])
+    missing_folder = runner.invoke(cli.app, ["rule", "learn", "newsletter", "--uid", "43627"])
 
     assert help_result.exit_code == 0
-    assert all(name in help_result.output for name in ("learn", "list", "show", "remove", "test"))
+    assert all(
+        name in help_result.output
+        for name in ("add", "edit", "learn", "list", "show", "remove", "test", "preview", "apply")
+    )
     assert missing_folder.exit_code == 2
     assert "--folder" in missing_folder.output
 
 
-def test_rule_learn_validates_uid_and_configured_source_before_password(monkeypatch, tmp_path):
-    monkeypatch.setattr(cli, "load_settings", lambda path: _routing_settings())
-    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: pytest.fail("validation prompted for a password"))
-    runner = CliRunner()
-    invalid_uid = runner.invoke(
+def test_rule_learn_validates_uid_and_existing_target_before_password(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: pytest.fail("validation prompted for a password"))
+    invalid_uid = CliRunner().invoke(
         cli.app,
-        ["rule", "learn", "0", "--folder", "INBOX.Junk", "--move", "INBOX.Trash"],
+        ["rule", "learn", "newsletter", "--folder", "INBOX", "--uid", "0"],
     )
-    unconfigured_folder = runner.invoke(
-        cli.app,
-        ["rule", "learn", "43627", "--folder", "INBOX", "--move", "INBOX.Trash"],
-    )
+    monkeypatch.setattr(cli, "load_settings", lambda _path: _routing_settings())
+    monkeypatch.setattr(cli, "load_routing_rules", lambda _path: RoutingRuleSet())
+    missing_rule = CliRunner().invoke(cli.app, _learn_args(tmp_path))
 
     assert invalid_uid.exit_code == 2
-    assert "positive integer" in invalid_uid.output
-    assert unconfigured_folder.exit_code == 2
-    assert "not configured in spam.folders" in unconfigured_folder.output
+    assert "greater than or equal to 1" in invalid_uid.output
+    assert missing_rule.exit_code == 2
+    assert "Rule not found: newsletter" in missing_rule.output
 
 
-def test_rule_learn_destination_preflight_failure_does_not_fetch_or_save(monkeypatch, tmp_path):
-    state, _ = _install_rule_learn(monkeypatch, tmp_path, destination_exists=False)
-
-    result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--yes"))
-
-    assert result.exit_code == 1
-    assert state["destination"] == "INBOX.Trash"
-    assert state["fetches"] == []
-    assert state["writes"] == []
-
-
-def test_rule_learn_yes_saves_read_only_without_moving_current_uid(monkeypatch, tmp_path):
+def test_rule_learn_saves_only_matcher_and_never_moves_example(monkeypatch, tmp_path):
     state, _ = _install_rule_learn(monkeypatch, tmp_path)
 
     result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--yes"))
 
     assert result.exit_code == 0, result.output
     assert state["mailbox_kwargs"]["writable"] is False
+    assert "allowed_destinations" not in state["mailbox_kwargs"]
     assert state["fetches"] == [43627]
-    assert state["moves"] == []
-    assert len(state["writes"]) == 1
-    assert state["writes"][0][0].rules[0].id == "mailer-daemon-gmx-net"
-    assert "Jev confidence: 0.96" in state["output"].getvalue()
-    assert "Generalization safety: 0.98" in state["output"].getvalue()
-    assert "Saved rule mailer-daemon-gmx-net" in state["output"].getvalue()
+    assert state["events"] == ["fetch", "save"]
+    assert len(state["saved"]) == 1
+    assert state["proposals"][0][1:3] == ("INBOX", "newsletter")
+    assert "Saved matcher to rule newsletter" in state["output"].getvalue()
+    assert "INBOX is not configured" not in result.output
+    assert "MOVED" not in result.output
 
 
-def test_rule_learn_reads_source_message_after_destination_probe(monkeypatch, tmp_path):
-    output = StringIO()
-    source_raw = raw_message("Source example", "mailer-daemon@gmx.net")
-    destination_raw = raw_message("Wrong destination example", "trash@example.org")
-    client = FolderAwareFakeClient(
-        {
-            "INBOX.Junk": {43627: source_raw},
-            "INBOX.Trash": {43627: destination_raw},
-        }
-    )
-    candidate = RuleCandidate(
-        "from_address_exact",
-        RuleMatch(from_address="mailer-daemon@gmx.net"),
-        "from=mailer-daemon@gmx.net",
-        True,
-        100,
-    )
-    proposal = RuleProposal(candidate, "auto", 0.96, 0.98, "model-test", "request-test")
-    learned = {}
-
-    class FakeJev:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-    def mailbox_factory(**kwargs):
-        return ScopedMailbox(**kwargs, client_factory=lambda *args, **options: client)
-
-    def learn_rule(jev, **kwargs):
-        learned["message"] = kwargs["message"]
-        return proposal
-
-    monkeypatch.setattr(cli, "console", Console(file=output, width=200))
-    monkeypatch.setattr(cli, "load_settings", lambda path: _routing_settings())
-    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet())
-    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: "secret")
-    monkeypatch.setattr(cli, "ScopedMailbox", mailbox_factory)
-    monkeypatch.setattr(cli, "learn_rule_proposal", learn_rule)
-    monkeypatch.setattr(cli, "write_rules", lambda rules, path: path)
-    monkeypatch.setattr(pyjev, "Jev", FakeJev)
-
-    result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--yes"))
-
-    assert result.exit_code == 0, result.output
-    assert learned["message"].sender == "mailer-daemon@gmx.net"
-    assert learned["message"].subject == "Source example"
-    assert "From: mailer-daemon@gmx.net" in output.getvalue()
-    assert "Subject: Source example" in output.getvalue()
-    assert "Wrong destination example" not in output.getvalue()
-    assert client.selected[-1] == ("INBOX.Junk", True)
-
-
-def test_rule_learn_preview_does_not_save_even_with_yes(monkeypatch, tmp_path):
+def test_rule_learn_preview_never_saves_even_with_yes(monkeypatch, tmp_path):
     state, _ = _install_rule_learn(monkeypatch, tmp_path)
 
     result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--preview", "--yes"))
 
     assert result.exit_code == 0, result.output
-    assert state["writes"] == []
-    assert state["moves"] == []
-    assert "Preview only. No rule was saved." in state["output"].getvalue()
+    assert state["saved"] == []
+    assert state["events"] == ["fetch"]
+    assert "Preview only. No matcher was saved." in state["output"].getvalue()
 
 
-def test_rule_learn_preview_and_apply_current_are_rejected_before_password(monkeypatch, tmp_path):
-    monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: pytest.fail("contradictory options prompted"))
+def test_rule_learn_review_proposal_is_not_saved(monkeypatch, tmp_path):
+    state, _ = _install_rule_learn(monkeypatch, tmp_path, status="review")
 
-    result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--preview", "--apply-current"))
+    result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--yes"))
 
-    assert result.exit_code == 2
-    assert "cannot be combined" in result.output
+    assert result.exit_code == 0, result.output
+    assert state["saved"] == []
+    assert "No matcher was saved." in state["output"].getvalue()
 
 
 def test_rule_learn_confirmation_defaults_to_no(monkeypatch, tmp_path):
     state, _ = _install_rule_learn(monkeypatch, tmp_path)
     confirmations = []
-    monkeypatch.setattr(cli.typer, "confirm", lambda prompt, *, default: confirmations.append(default) or False)
+    monkeypatch.setattr(cli.typer, "confirm", lambda _prompt, *, default: confirmations.append(default) or False)
 
     result = CliRunner().invoke(cli.app, _learn_args(tmp_path))
 
     assert result.exit_code == 0
     assert confirmations == [False]
-    assert state["writes"] == []
-    assert state["moves"] == []
-    assert "No rule was saved." in state["output"].getvalue()
-
-
-def test_rule_learn_apply_current_saves_before_exact_uid_move(monkeypatch, tmp_path):
-    state, _ = _install_rule_learn(monkeypatch, tmp_path)
-
-    result = CliRunner().invoke(cli.app, _learn_args(tmp_path, "--yes", "--apply-current"))
-
-    assert result.exit_code == 0, result.output
-    assert state["mailbox_kwargs"]["writable"] is True
-    assert state["events"] == ["save", "move"]
-    assert state["moves"] == [(43627, "INBOX.Trash")]
-    assert "MOVED current UID 43627 -> INBOX.Trash" in state["output"].getvalue()
+    assert state["saved"] == []
+    assert "No matcher was saved." in state["output"].getvalue()
 
 
 def test_rule_list_show_remove_do_not_prompt_for_password(monkeypatch, tmp_path):
-    rule = _routing_rule()
-    monkeypatch.setattr(cli, "load_rules", lambda path: RuleSet((rule,)))
+    config = tmp_path / "config.toml"
+    path = config.with_name("rules.toml")
+    rule = RoutingRule(
+        id="mailer-daemon-gmx-net",
+        enabled=True,
+        type=RuleType.HEADER,
+        destination="INBOX.Trash",
+        match=RuleMatch(from_address="mailer-daemon@gmx.net"),
+        source_folders=("INBOX.Junk",),
+    )
+    write_routing_rules(RoutingRuleSet((rule,)), path)
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt: pytest.fail("management command prompted"))
-    removed = []
-    monkeypatch.setattr(cli, "write_rules", lambda rules, path: removed.append(rules))
     output = StringIO()
     monkeypatch.setattr(cli, "console", Console(file=output, width=200))
 
-    listed = CliRunner().invoke(cli.app, ["rule", "list", "--config", str(tmp_path / "config.toml")])
-    shown = CliRunner().invoke(
-        cli.app,
-        ["rule", "show", rule.id, "--config", str(tmp_path / "config.toml")],
-    )
-    deleted = CliRunner().invoke(
-        cli.app,
-        ["rule", "remove", rule.id, "--yes", "--config", str(tmp_path / "config.toml")],
-    )
+    listed = CliRunner().invoke(cli.app, ["rule", "list", "--config", str(config)])
+    shown = CliRunner().invoke(cli.app, ["rule", "show", rule.id, "--config", str(config)])
+    deleted = CliRunner().invoke(cli.app, ["rule", "remove", rule.id, "--yes", "--config", str(config)])
 
     assert listed.exit_code == 0 and rule.id in output.getvalue()
-    assert shown.exit_code == 0 and "from_address: mailer-daemon@gmx.net" in output.getvalue()
+    assert shown.exit_code == 0 and "from=mailer-daemon@gmx.net" in output.getvalue()
     assert deleted.exit_code == 0 and f"Removed rule {rule.id}" in output.getvalue()
-    assert len(removed) == 1 and removed[0].rules == ()
+    assert load_routing_rules(path).rules == ()
 
 
-def test_rule_test_is_bounded_read_only_and_never_constructs_classifier(monkeypatch, tmp_path):
-    rule = _routing_rule()
+def test_rule_test_evaluates_one_exact_message_read_only(monkeypatch, tmp_path):
+    settings = _routing_settings()
+    rule = RoutingRule(
+        id="mailer-daemon-gmx-net",
+        enabled=True,
+        type=RuleType.HEADER,
+        destination="INBOX.Trash",
+        match=RuleMatch(from_address="mailer-daemon@gmx.net"),
+    )
     state, _ = _install_rule_learn(monkeypatch, tmp_path)
-    monkeypatch.setattr(cli, "load_rules", lambda path, *, source_folders: RuleSet((rule,)))
+    monkeypatch.setattr(cli, "load_settings", lambda _path: settings)
+    monkeypatch.setattr(cli, "load_routing_rules", lambda _path: RoutingRuleSet((rule,)))
     monkeypatch.setattr(cli, "PyJevSpamClassifier", lambda **kwargs: pytest.fail("rule test ran spam classifier"))
 
     result = CliRunner().invoke(
         cli.app,
-        ["rule", "test", rule.id, "--limit", "2", "--config", str(tmp_path / "config.toml")],
+        [
+            "rule",
+            "test",
+            rule.id,
+            "--folder",
+            "INBOX.Junk",
+            "--uid",
+            "43627",
+            "--config",
+            str(tmp_path / "config.toml"),
+        ],
     )
 
     assert result.exit_code == 0, result.output
     assert state["mailbox_kwargs"]["writable"] is False
-    assert "allowed_destinations" not in state["mailbox_kwargs"]
+    assert state["fetches"] == [43627]
     assert "Folder=INBOX.Junk UID 43627 MATCH" in state["output"].getvalue()
-    assert "Folder=INBOX.Junk UID 43628 MATCH" not in state["output"].getvalue()
     assert "Read-only; no actions were executed." in state["output"].getvalue()
 
 

@@ -82,12 +82,8 @@ class CleanOperation:
             selected_rules = tuple(rule for rule in selected_rules if rule.id == request.rule_scope)
             if not selected_rules:
                 raise ValueError(f"enabled rule not found for source {request.folder}: {request.rule_scope}")
-        elif self._rules.fallback_destination is None:
-            raise ValueError("full routing requires rules.fallback_destination")
 
-        destinations = [rule.destination for rule in selected_rules]
-        if request.rule_scope is None and self._rules.fallback_destination is not None:
-            destinations.append(self._rules.fallback_destination)
+        destinations = [rule.destination for rule in selected_rules if rule.destination != request.folder]
         return CleanPreflight(
             folder=request.folder,
             mode="single-rule" if request.rule_scope is not None else "full",

@@ -8,22 +8,38 @@ from pyjev.results import BundleResult, ChoiceResult, NoulResult
 
 from imapledger.config import ActionKind, MessageAction
 from imapledger.message import MailMessage
+from imapledger.routing_models import RoutingRule, RuleType
 from imapledger.rule_candidates import RuleCandidate, build_rule_candidates
 from imapledger.rule_learning import (
     MIN_CANDIDATE_CONFIDENCE,
     MIN_GENERALIZATION_PROBABILITY,
     NONE_CANDIDATE_ID,
+    learn_existing_rule_proposal,
     learn_rule_proposal,
 )
 from imapledger.rules import RuleError, RuleMatch
 
 
 class FakeJev:
-    def __init__(self, selected: str, *, confidence: float = 0.96, safe: float = 0.98) -> None:
+    def __init__(
+        self,
+        selected: str,
+        *,
+        confidence: float = 0.96,
+        safe: float = 0.98,
+        semantic_fit: float = 0.96,
+    ) -> None:
         self.selected = selected
         self.confidence = confidence
         self.safe = safe
+        self.semantic_fit = semantic_fit
         self.calls: list[tuple[object, dict[str, object]]] = []
+
+    def __enter__(self) -> FakeJev:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
 
     def evaluate(self, decision: object, *, state: dict[str, object]) -> BundleResult:
         self.calls.append((decision, state))
@@ -34,6 +50,13 @@ class FakeJev:
         if self.selected in probabilities:
             probabilities[self.selected] = self.confidence
         answers = {
+            "semantic_fit": NoulResult(
+                value=self.semantic_fit,
+                model="fit-model",
+                usage={},
+                raw={},
+                request_id="fit-request",
+            ),
             "candidate": ChoiceResult(
                 value=self.selected,
                 confidence=self.confidence,
@@ -268,3 +291,57 @@ def test_malformed_probability_distribution_is_rejected() -> None:
             candidates=candidates,
             requested_action=MessageAction(ActionKind.MOVE, "INBOX.Trash"),
         )
+
+
+def test_existing_rule_learning_requires_semantic_fit_and_uses_only_supplied_matchers() -> None:
+    message = _message(body="BODY MUST NOT BE INCLUDED")
+    candidates = build_rule_candidates(message)
+    target = RoutingRule(
+        id="delivery-failure",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        destination="INBOX.Trash",
+        description="Delivery failure notices",
+    )
+    jev = FakeJev("from_address_exact")
+
+    proposal = learn_existing_rule_proposal(
+        message=message,
+        target_rule=target,
+        candidates=candidates,
+        match_threshold=0.90,
+        jev_factory=lambda: jev,
+    )
+
+    decision, state = jev.calls[0]
+    assert isinstance(decision, BundleDecision)
+    assert isinstance(decision.questions["semantic_fit"], NoulDecision)
+    assert proposal.status == "auto"
+    assert proposal.semantic_fit == 0.96
+    assert proposal.candidate == _candidate(candidates, "from_address_exact")
+    assert "BODY MUST NOT BE INCLUDED" not in str(state)
+    assert "requested_action" not in state
+    assert set(decision.questions["candidate"].options) == {candidate.id for candidate in candidates} | {
+        NONE_CANDIDATE_ID
+    }
+
+
+def test_existing_rule_learning_rejects_an_example_below_semantic_threshold() -> None:
+    candidates = build_rule_candidates(_message())
+    target = RoutingRule(
+        id="delivery-failure",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        destination="INBOX.Trash",
+        description="Delivery failure notices",
+    )
+    proposal = learn_existing_rule_proposal(
+        message=_message(),
+        target_rule=target,
+        candidates=candidates,
+        match_threshold=0.90,
+        jev_factory=lambda: FakeJev("from_address_exact", semantic_fit=0.89),
+    )
+
+    assert proposal.status == "message-does-not-fit-rule"
+    assert proposal.candidate is not None

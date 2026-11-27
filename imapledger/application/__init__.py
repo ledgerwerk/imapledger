@@ -12,6 +12,14 @@ from .operation_registry import (
     OperationSpec,
 )
 from .progress import ProgressOperation
+from .rule_run import (
+    RuleApplyMessageOperation,
+    RuleEvaluationOperation,
+    RuleRunOperation,
+    RuleRunPreflight,
+    RuleRunRequest,
+    RuleRunResult,
+)
 from .rules import RuleLearningOperation, RuleLearningPreview, RuleMigrationOperation, RuleMigrationPreview
 from .state import StateFolderStatus, StateOperation, StateResetRequest, StateResetResult
 
@@ -23,6 +31,12 @@ __all__ = [
     "CleanPreflight",
     "CleanRequest",
     "CleanResult",
+    "RuleRunOperation",
+    "RuleRunPreflight",
+    "RuleRunRequest",
+    "RuleRunResult",
+    "RuleEvaluationOperation",
+    "RuleApplyMessageOperation",
     "DoctorOperation",
     "DoctorRequest",
     "LegacyCleanOperation",

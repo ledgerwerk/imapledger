@@ -6,81 +6,58 @@ Launch the terminal interface with:
 imapledger ui
 ```
 
-The console is the interactive frontend for mailbox operations, review, classification state, progress, diagnostics, rules, credentials, configuration, and the Config Ledger. It shares application operations with the CLI and does not shell out to CLI subprocesses. Launch is disconnected and does not resolve credentials; connect only when a mailbox operation is needed. Reading a message uses the read-only `BODY.PEEK` path. HTML is not rendered and attachments are not opened.
+The TUI is the interactive frontend for mailbox browsing, unified rules, progress, diagnostics, credentials, configuration, and Config Ledger. It shares application operations with the CLI and does not shell out to CLI subprocesses. Startup is disconnected and does not resolve credentials. Opening a message uses read-only `BODY.PEEK`; it does not mark mail seen, fetch remote images, render HTML, or open attachments.
 
 ## Keyboard shortcuts
 
-| Key                    | Action                                                      |
-| ---------------------- | ----------------------------------------------------------- |
-| Left / `H`             | Focus the previous pane                                     |
-| Right / `L`            | Focus the next pane                                         |
-| Tab / Shift+Tab        | Cycle focus through panes                                   |
-| Up / Down or `k` / `j` | Move through folders or messages; scroll message detail     |
-| Home / End             | Move to the first or last item or top or bottom of detail   |
-| PageUp / PageDown      | Page through the focused pane                               |
-| Enter                  | Open the selected folder or message                         |
-| `x`                    | Preview Clean 10 in the selected folder                     |
-| `X`                    | Open the modern Clean dialog for the selected folder        |
-| `B`                    | Advanced / Legacy Clean over configured `spam.folders`      |
-| `p` / `d` / `S`        | Inspect progress, diagnostics, and classification state     |
-| `s`                    | Open System for setup, connection, credentials, and config  |
-| `:`                    | Open Command Center and search available operations         |
-| `G`                    | Open Config Ledger                                          |
-| `c` / `C`              | Analyze or reanalyze the selected message; no mail is moved |
-| `e`                    | Explain the selected message                                |
-| `R`                    | Open the unified Rules workbench                            |
-| `l`                    | Learn a rule from the selected message                      |
-| `a`                    | Apply the current routing plan after confirmation           |
-| `i`                    | Explicitly analyze eligible embedded images                 |
-| `I`                    | Review and optionally load remote images after confirmation |
-| `r`                    | Refresh                                                     |
-| `h` / `?`              | Open keyboard help                                          |
-| `q`                    | Quit                                                        |
+| Key                    | Action                                                            |
+| ---------------------- | ----------------------------------------------------------------- |
+| Left / `H`             | Focus the previous pane                                           |
+| Right / `L`            | Focus the next pane                                               |
+| Tab / Shift+Tab        | Cycle focus through panes                                         |
+| Up / Down or `k` / `j` | Move through folders or messages; scroll detail                   |
+| Home / End             | Move to the first or last item or top or bottom of detail         |
+| PageUp / PageDown      | Page through the focused pane                                     |
+| `x`                    | Preview rules on 10 messages in the selected folder               |
+| `X`                    | Open multi-folder rule preview/apply options                      |
+| `c`                    | Evaluate rules for the selected message                           |
+| `e`                    | Explain the current evaluation without rerunning it               |
+| `l`                    | Learn a matcher for an existing semantic rule                     |
+| `a`                    | Apply the current MOVE plan after confirmation                    |
+| `R`                    | Open the unified Rules workbench                                  |
+| `p` / `d` / `S`        | Inspect progress, diagnostics, and legacy classification state    |
+| `s`                    | Open System for setup, connection, credentials, and config        |
+| `:`                    | Open Command Center and search available operations               |
+| `G`                    | Open Config Ledger                                                |
+| `i` / `I`              | Analyze embedded images / review remote images after confirmation |
+| `r`                    | Refresh                                                           |
+| `h` / `?`              | Open keyboard help                                                |
+| `q`                    | Quit                                                              |
 
 The focused pane has a highlighted border. Pane navigation follows the widget currently holding focus, including focus reached with the mouse.
 
-## Folder operations and shared workflows
+## Rule preview and apply
 
-`x` previews the oldest 10 messages in the selected real folder. `X` opens the modern routing Clean dialog with limit, offset, order, rule scope, and preview or apply options. Apply runs read-only preflight first and then asks for explicit confirmation of the exact folder scope. The job screen streams safe per-message outcomes and supports cooperative cancellation. Applying rechecks progress identity, UIDVALIDITY, and message fingerprints through the shared clean operation.
+`x` previews the next 10 messages in the selected real folder. Preview is read-only. `X` opens rule-run options for selecting one or more folders or all selectable folders, setting a limit and ordering, and choosing preview or apply. Config Ledger and non-selectable folders are excluded. Apply performs read-only preflight before explicit confirmation. The job screen streams safe results and supports cooperative cancellation.
 
-`B` opens Advanced / Legacy Clean. This compatibility workflow operates on every configured `spam.folders` source and applies the configured SPAM, NOT_SPAM, and REVIEW actions. It is distinct from modern positional routing Clean. Preview is the default. Apply preflights every source and requires a second confirmation; destinations must already exist.
+Batch work uses the same rule-run operation as the CLI. Apply rechecks destinations, current rules, UIDVALIDITY, exact UIDs, and progress identity before moving. No-match leaves messages in place. A message already in its destination is reported as already there without MOVE.
 
-`p` opens progress and stored errors, including explicit retry and reset confirmations. `d` runs read-only diagnostics. `S` inspects classification state and offers preview-first, scoped state resets. Review browsing, state changes, rule learning and migration, and clean operations use the same application operations as their CLI counterparts.
+## Evaluate and explain one message
 
-`s` opens System. TUI startup remains disconnected. System supports local setup and effective-config inspection, explicit connect and disconnect, and credential set, delete, or vault-passphrase workflows. Secrets are not shown in forms or operation output.
+Press `c` with a message selected to evaluate the ordered rules. The analysis panel shows rule results, semantic confidence where available, the first matching rule, destination, and whether the result is MOVE, KEEP IN PLACE, or ALREADY THERE. Evaluation is read-only.
 
-`:` opens Command Center, which searches the operation inventory and explains unavailable requirements. `G` opens Config Ledger for snapshots, diffs, pulls, and pushes. Pull previews bind the target and snapshot content hashes; overwriting local configuration requires explicit confirmation and a fresh preview.
+Press `e` to explain the existing evaluation. It does not send a second model request or reevaluate. If no evaluation exists yet, the screen tells you to press `c`. Press `a` to open confirmation for the current MOVE plan. The confirmation names the source folder, exact UID, winning rule, and destination, and is bound to the plan shown when it opened. Stale rules, UIDVALIDITY, or message identity fail closed.
 
-## Analyze and apply the exact plan
+## Rules workbench and learning
 
-Press `c` with a message selected to evaluate the current full pipeline. The analysis panel shows each rule's state, semantic confidence where available, the first matching rule or fallback, destination, and rules fingerprint. This is read-only. Use `C` to reanalyze rather than relying on cached classification state in the legacy classification workflow.
+Press `R` to create and edit global-by-default schema-3 rules. Spam appears in the same workbench as semantic and header rules. The workbench supports presets, priority changes, enabling or disabling, editing, read-only tests, full-pipeline evaluation, and explicit migration of older rule files. No fallback destination is required. The first enabled match wins; otherwise mail stays in place.
 
-Press `a` to apply the current plan. The confirmation names the exact source folder, UID, winning rule or fallback, and destination. Confirmation is bound to the plan and message shown when the dialog opened. Before moving, the application revalidates current rules, UIDVALIDITY, the exact UID, and the configured destination. A stale or invalid plan fails closed. Applying uses configured MOVE destinations only; the TUI does not create folders or issue arbitrary actions.
+Press `l` with a message selected to choose an existing semantic rule and preview a deterministic matcher proposal. Saving changes only the rules file, after fit, safety, duplicate, conflict, and stale-fingerprint checks. The example message is not moved. Config Ledger cannot be a learning source.
 
-## Rules workbench
+`clean FOLDER` is a deprecated CLI adapter, not a separate TUI workflow. The TUI has no Legacy Clean screen or binding.
 
-Press `R` to create and edit unified schema-2 rules. Priority is top to bottom, and the first enabled match wins. The workbench can:
+## System, operations, and privacy
 
-- create and edit spam, semantic, or deterministic header rules;
-- enable or disable a rule and change its priority;
-- configure the full-pipeline fallback destination;
-- test the selected rule or evaluate all rules on the current message;
-- delete a rule after selection.
+`s` opens System for local setup, effective-config inspection, explicit connect/disconnect, and credential workflows. Secrets are not shown in forms or operation output. `:` opens Command Center, which searches the operation inventory and explains unavailable requirements. `G` opens Config Ledger for snapshots, diffs, pulls, and pushes. Pull previews bind the target and snapshot hashes; overwrites require explicit confirmation.
 
-Tests are read-only and show rule results, winner, and destination. Saving rule changes updates the local `rules.toml` and refreshes current-message analysis; it does not move existing messages. Rule destinations must be existing mailboxes and cannot be the current source or configuration-ledger folder. Schema-1 files must be explicitly migrated before using the schema-2 workbench. See [Unified routing rules](rules.md).
-
-## Legacy classification actions
-
-Configurations that still use the legacy classification workflow retain category actions for SPAM, NOT_SPAM, and REVIEW. `B` exposes the deprecated bare-`clean` compatibility workflow over `spam.folders`; applying is preflighted and confirmation-gated. The source-folder list does not limit modern explicit-folder routing Clean. See [Cleaning and diagnostics](cleaning.md) and [Persistent state](state.md).
-
-## Image inventory and visual analysis
-
-The visual-content section counts embedded images and remote HTML image references as soon as the message is opened. This inventory is local. Opening a message does not contact remote image hosts or send image bytes to `pyjev`.
-
-Press `i` to explicitly assess eligible embedded images. Preparation and model work run in the background. Results are reading aids only; they do not change routing rules, destination, persistent classification state, or mail actions. Analysis reports are cached only in memory for the current session.
-
-## Remote image privacy
-
-Remote image references are never fetched automatically. Pressing `I` opens a confirmation screen with Cancel focused by default. Loading an image contacts its external host and may reveal that the message was opened and the user's network address. Canceling makes no remote request.
-
-After confirmation, the loader accepts only credential-free HTTPS URLs on the standard HTTPS port. It resolves each hostname, rejects non-public addresses, pins the connection to a validated address, and revalidates every redirect target. Requests have bounded timeouts, redirect count, image count, and response size. Only PNG/JPEG responses are accepted. The loader sends no cookies, Authorization header, or Referer, does not use a proxy, execute, or render downloaded content. URLs and downloaded bytes are not persisted.
+The visual-content panel counts embedded images and remote HTML image references locally. `i` explicitly analyzes eligible embedded images; results are informational and do not affect routing. Remote images are never fetched automatically. `I` opens a cancel-default confirmation; loading can reveal the user's network address to external hosts. Requests use strict HTTPS, DNS/IP, redirect, timeout, and response-size checks. URLs and downloaded bytes are not persisted.

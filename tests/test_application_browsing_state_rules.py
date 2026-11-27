@@ -16,7 +16,7 @@ from imapledger.routing_models import RoutingRule, RuleType
 from imapledger.routing_models import RuleSet as RoutingRuleSet
 from imapledger.routing_rule_service import RoutingRuleService
 from imapledger.rule_candidates import build_rule_candidates
-from imapledger.rule_learning import RuleProposal
+from imapledger.rule_learning import ExistingRuleProposal
 from imapledger.rules import RuleMatch
 
 
@@ -130,7 +130,7 @@ def test_rule_migration_apply_uses_preview_and_rejects_stale_file(tmp_path: Path
     applied = operation.apply(fresh_preview)
     assert applied.applied is True
     assert applied.rules.rules[0].id == "github"
-    assert "schema = 2" in path.read_text(encoding="utf-8")
+    assert "schema = 3" in path.read_text(encoding="utf-8")
 
 
 def test_rule_learning_saves_only_against_unchanged_rules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -151,30 +151,28 @@ def test_rule_learning_saves_only_against_unchanged_rules(tmp_path: Path, monkey
         auto_submitted="",
     )
     candidate = next(item for item in build_rule_candidates(message) if item.id == "from_address_exact")
-    proposal = RuleProposal(candidate, "auto", 0.96, 0.98, "model", "request")
-    monkeypatch.setattr("imapledger.application.rules.learn_rule_proposal", lambda *args, **kwargs: proposal)
+    proposal = ExistingRuleProposal(candidate, 0.96, 0.96, 0.98, "auto", "model", "request")
+    monkeypatch.setattr("imapledger.application.rules.learn_existing_rule_proposal", lambda **kwargs: proposal)
 
-    class _Jev:
-        def __enter__(self) -> _Jev:
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            return None
-
+    target_rule = RoutingRule(
+        id="delivery-failure",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        destination="Archive",
+        description="Delivery failure notices",
+    )
     path = tmp_path / "rules.toml"
-    write_routing_rules(RoutingRuleSet(), path)
+    write_routing_rules(RoutingRuleSet((target_rule,)), path)
     service = RoutingRuleService(path)
     operation = RuleLearningOperation()
     preview = operation.propose(
         message,
         folder="Spam",
-        destination="Archive",
+        target_rule_id=target_rule.id,
         existing_rules=service.load(),
-        jev_factory=_Jev,
     )
-    assert preview.rule is not None
-    assert preview.rule.destination == "Archive"
-    assert preview.rule.source_folders == ("Spam",)
+    assert preview.proposed_matcher == candidate.match
+    assert preview.status == "auto"
 
     second_rule = RoutingRule(
         id="other",
@@ -187,4 +185,111 @@ def test_rule_learning_saves_only_against_unchanged_rules(tmp_path: Path, monkey
     service.add(second_rule)
     with pytest.raises(RoutingConfigError, match="rules changed after proposal"):
         operation.save(preview, service)
-    assert service.load().rules == (second_rule,)
+    assert service.load().rules == (target_rule, second_rule)
+
+
+def test_rule_learning_appends_matcher_to_existing_semantic_rule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = MailMessage(
+        uid=12,
+        subject="delivery failure",
+        sender="Mailer Daemon <mailer-daemon@example.net>",
+        recipients=(),
+        date="",
+        body="",
+        from_address="mailer-daemon@example.net",
+    )
+    candidate = next(item for item in build_rule_candidates(message) if item.id == "from_address_exact")
+    proposal = ExistingRuleProposal(candidate, 0.96, 0.96, 0.98, "auto")
+    monkeypatch.setattr("imapledger.application.rules.learn_existing_rule_proposal", lambda **kwargs: proposal)
+    target = RoutingRule(
+        id="delivery-failure",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        destination="Archive",
+        description="Delivery failure notices",
+        match_any=(RuleMatch(list_id="bounces.example.net"),),
+    )
+    path = tmp_path / "rules.toml"
+    write_routing_rules(RoutingRuleSet((target,)), path)
+    service = RoutingRuleService(path)
+    operation = RuleLearningOperation()
+    preview = operation.propose(
+        message,
+        folder="Spam",
+        target_rule_id=target.id,
+        existing_rules=service.load(),
+    )
+
+    result = operation.save(preview, service)
+
+    saved_rule = service.load().rules[0]
+    assert result.changed_rule_id == target.id
+    assert saved_rule.type is RuleType.SEMANTIC
+    assert saved_rule.description == target.description
+    assert saved_rule.match_any == (target.match_any[0], candidate.match)
+
+
+def test_rule_learning_preview_reports_higher_priority_matcher_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = MailMessage(
+        uid=12,
+        subject="delivery failure",
+        sender="Mailer Daemon <mailer-daemon@example.net>",
+        recipients=(),
+        date="",
+        body="",
+        from_address="mailer-daemon@example.net",
+    )
+    candidate = next(item for item in build_rule_candidates(message) if item.id == "from_address_exact")
+    proposal = ExistingRuleProposal(candidate, 0.96, 0.96, 0.98, "auto")
+    monkeypatch.setattr("imapledger.application.rules.learn_existing_rule_proposal", lambda **kwargs: proposal)
+    earlier = RoutingRule(
+        id="mailer-daemon",
+        enabled=True,
+        type=RuleType.HEADER,
+        destination="Archive",
+        match=candidate.match,
+        source_folders=("Spam",),
+    )
+    target = RoutingRule(
+        id="delivery-failure",
+        enabled=True,
+        type=RuleType.SEMANTIC,
+        destination="Archive",
+        description="Delivery failure notices",
+    )
+    rules = RoutingRuleSet((earlier, target))
+    path = tmp_path / "rules.toml"
+    write_routing_rules(rules, path)
+    service = RoutingRuleService(path)
+    operation = RuleLearningOperation()
+    preview = operation.propose(
+        message,
+        folder="Spam",
+        target_rule_id=target.id,
+        existing_rules=service.load(),
+    )
+
+    assert preview.status == "conflict"
+    assert preview.conflict_rule_id == earlier.id
+    with pytest.raises(RoutingConfigError, match="higher-priority rule mailer-daemon"):
+        operation.save(preview, service)
+    assert service.load() == rules
+
+
+def test_builtin_spam_rule_cannot_be_removed(tmp_path: Path) -> None:
+    spam = RoutingRule("spam", True, RuleType.SPAM, "INBOX.Trash", built_in=True)
+    rules = RoutingRuleSet((spam,))
+    path = tmp_path / "rules.toml"
+    write_routing_rules(rules, path)
+    service = RoutingRuleService(path)
+
+    with pytest.raises(RoutingConfigError, match="built-in Spam rule cannot be removed"):
+        service.remove("spam")
+
+    assert service.load() == rules

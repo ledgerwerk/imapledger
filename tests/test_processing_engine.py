@@ -26,8 +26,7 @@ class _FakeEvaluator:
         return None
 
     def fingerprint(self, rules: RuleSet) -> str:
-        fallback = rules.fallback_destination or "none"
-        return f"rules-{fallback}"
+        return f"rules-{rules.rules!r}"
 
     def plan(self, folder: str, message: MailMessage, rules: RuleSet, *, rule_scope: str | None = None) -> RoutingPlan:
         if message.uid in self.failing_uids:
@@ -47,8 +46,6 @@ class _FakeEvaluator:
         mode = "single-rule" if rule_scope is not None else "full"
         if winner is not None:
             destination = winner.destination
-        elif rule_scope is None:
-            destination = rules.fallback_destination
         else:
             destination = None
         if self.destination_override is not None:
@@ -120,18 +117,17 @@ def _settings() -> Settings:
     )
 
 
-def _rules(*, fallback: str = "Archive") -> RuleSet:
+def _rules(*, destination: str = "Invoices") -> RuleSet:
     return RuleSet(
         (
             RoutingRule(
                 id="invoice",
                 enabled=True,
                 type=RuleType.HEADER,
-                destination="Invoices",
+                destination=destination,
                 match=RuleMatch(subject="invoice"),
             ),
         ),
-        fallback_destination=fallback,
     )
 
 
@@ -153,17 +149,17 @@ def test_preview_repeats_same_uids_without_advancing_progress_then_apply_checkpo
     repeated_preview = engine.run(mailbox, apply=False, limit=2, sort_direction="oldest")
     assert tuple(result.uid for result in preview.messages) == (1, 2)
     assert tuple(result.uid for result in repeated_preview.messages) == (1, 2)
-    assert tuple(result.outcome for result in preview.messages) == ("match", "fallback")
+    assert tuple(result.outcome for result in preview.messages) == ("match", "no_match")
     assert preview.run.cursor_uid is None
     assert preview.run.scanned_count == 0
     assert store.results(preview.run.id) == ()
     assert mailbox.moved == []
 
     applied = engine.run(mailbox, apply=True, limit=2, sort_direction="oldest")
-    assert tuple(mailbox.moved) == ((1, "Invoices"), (2, "Archive"))
+    assert tuple(mailbox.moved) == ((1, "Invoices"),)
     assert applied.run.scanned_count == 2
     assert applied.run.match_count == 1
-    assert applied.run.moved_count == 2
+    assert applied.run.moved_count == 1
     assert applied.run.status == "active"
 
     completed = engine.run(mailbox, apply=True, sort_direction="oldest")
@@ -213,15 +209,15 @@ def test_retry_errors_reuses_run_and_replaces_error_with_confirmed_move(tmp_path
 
 def test_changed_fingerprint_supersedes_active_run(tmp_path, monkeypatch) -> None:
     _FakeEvaluator.failing_uids = set()
-    _FakeEvaluator.matching_uids = set()
-    engine, store = _engine(monkeypatch, tmp_path, _rules(fallback="Archive"))
-    mailbox = _FakeMailbox((1, 2), writable=True, destinations=("Invoices", "Archive", "Other"))
+    _FakeEvaluator.matching_uids = {1, 2}
+    engine, store = _engine(monkeypatch, tmp_path, _rules())
+    mailbox = _FakeMailbox((1, 2), writable=True, destinations=("Invoices", "Other"))
     first = engine.run(mailbox, apply=True, limit=1, sort_direction="oldest")
     assert first.run.status == "active"
 
     changed = ProcessingEngine(
         settings=_settings(),
-        rules=_rules(fallback="Other"),
+        rules=_rules(destination="Other"),
         progress_store=store,
     )
     second = changed.run(mailbox, apply=True, limit=1, sort_direction="oldest")
@@ -272,6 +268,21 @@ def test_engine_streams_each_result_with_latest_run_counters(tmp_path, monkeypat
     assert tuple(uid for uid, _ in seen) == (1, 2)
     assert tuple(count for _, count in seen) == (1, 2)
     assert tuple(message.uid for message in report.messages) == tuple(uid for uid, _ in seen)
+
+
+def test_apply_records_already_there_without_attempting_move(tmp_path, monkeypatch) -> None:
+    _FakeEvaluator.failing_uids = set()
+    _FakeEvaluator.matching_uids = {1}
+    engine, store = _engine(monkeypatch, tmp_path, _rules(destination="INBOX"))
+    mailbox = _FakeMailbox((1,), writable=True)
+
+    report = engine.run(mailbox, apply=True, sort_direction="oldest")
+
+    assert report.messages[0].outcome == "already_there"
+    assert report.messages[0].destination == "INBOX"
+    assert mailbox.moved == []
+    assert store.get_result(report.run.id, 1).outcome == "already_there"
+    assert report.run.moved_count == 0
 
 
 def test_retry_streams_results_and_stops_safely_between_uids(tmp_path, monkeypatch) -> None:

@@ -27,6 +27,13 @@ class EvaluationState(str, Enum):
     ERROR = "error"
 
 
+class RoutingAction(str, Enum):
+    MOVE = "move"
+    KEEP_IN_PLACE = "keep_in_place"
+    ALREADY_THERE = "already_there"
+    ERROR = "error"
+
+
 @dataclass(frozen=True, slots=True)
 class RoutingRule:
     id: str
@@ -37,6 +44,8 @@ class RoutingRule:
     match_at: float | None = None
     match: RuleMatch | None = None
     source_folders: tuple[str, ...] = ()
+    match_any: tuple[RuleMatch, ...] = ()
+    built_in: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or RULE_ID_PATTERN.fullmatch(self.id) is None:
@@ -64,11 +73,33 @@ class RoutingRule:
             object.__setattr__(self, "match_at", float(self.match_at))
         if rule_type is not RuleType.SEMANTIC and self.match_at is not None:
             raise RoutingModelError("match_at is only valid for semantic rules")
-        if rule_type is RuleType.HEADER:
-            if not isinstance(self.match, RuleMatch):
-                raise RoutingModelError("header rule requires a header match")
-        elif self.match is not None:
-            raise RoutingModelError("match is only valid for header rules")
+        if not isinstance(self.match_any, (tuple, list)):
+            raise RoutingModelError("match_any must be a sequence")
+        matchers = tuple(self.match_any)
+        if any(not isinstance(matcher, RuleMatch) for matcher in matchers):
+            raise RoutingModelError("match_any entries must be RuleMatch values")
+        if self.match is not None and not isinstance(self.match, RuleMatch):
+            raise RoutingModelError("match must be a RuleMatch")
+        if self.match is not None:
+            if matchers and self.match != matchers[0]:
+                raise RoutingModelError("match conflicts with the first match_any entry")
+            if not matchers:
+                matchers = (self.match,)
+        if rule_type is RuleType.HEADER and not matchers:
+            raise RoutingModelError("header rule requires at least one matcher")
+        if rule_type is RuleType.SPAM and matchers:
+            raise RoutingModelError("spam rules do not accept deterministic matchers")
+        if len(set(matchers)) != len(matchers):
+            raise RoutingModelError("match_any must not contain duplicates")
+        object.__setattr__(self, "match_any", matchers)
+        object.__setattr__(self, "match", matchers[0] if len(matchers) == 1 else None)
+        if not isinstance(self.built_in, bool):
+            raise RoutingModelError("rule built_in must be a boolean")
+        if self.built_in and rule_type is not RuleType.SPAM:
+            raise RoutingModelError("only spam rules can be built in")
+        if self.id == "spam" and rule_type is not RuleType.SPAM:
+            raise RoutingModelError("the spam rule ID is reserved for the built-in spam rule")
+        object.__setattr__(self, "built_in", self.built_in or self.id == "spam")
         if not isinstance(self.source_folders, (tuple, list)):
             raise RoutingModelError("source_folders must be a sequence")
         folders = tuple(self.source_folders)
@@ -116,22 +147,16 @@ class RuleSet:
 
     def move_destinations(self) -> tuple[str, ...]:
         destinations = [rule.destination for rule in self.enabled_rules()]
-        if self.fallback_destination is not None:
-            destinations.append(self.fallback_destination)
         return tuple(dict.fromkeys(destinations))
 
     def validate_destinations(self, source_folder: str, *, config_store_folder: str | None = None) -> None:
-        if config_store_folder is not None and source_folder == config_store_folder:
+        if config_store_folder is None:
+            return
+        if source_folder == config_store_folder:
             raise RoutingModelError("config-store folder cannot be used as a source")
         for rule in self.enabled_rules(source_folder):
-            if rule.destination == source_folder:
-                raise RoutingModelError(f"rule {rule.id} destination must not equal the source folder")
-            if config_store_folder is not None and rule.destination == config_store_folder:
+            if rule.destination == config_store_folder:
                 raise RoutingModelError("config-store folder cannot be a routing destination")
-        if self.fallback_destination == source_folder:
-            raise RoutingModelError("fallback destination must not equal the source folder")
-        if config_store_folder is not None and self.fallback_destination == config_store_folder:
-            raise RoutingModelError("config-store folder cannot be a routing destination")
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +195,16 @@ class RoutingPlan:
     rules_fingerprint: str
     model: str | None = None
     request_id: str | None = None
+
+    @property
+    def action(self) -> RoutingAction:
+        if any(result.state is EvaluationState.ERROR for result in self.rule_results):
+            return RoutingAction.ERROR
+        if self.destination is None:
+            return RoutingAction.KEEP_IN_PLACE
+        if self.destination == self.folder:
+            return RoutingAction.ALREADY_THERE
+        return RoutingAction.MOVE
 
 
 @dataclass(frozen=True, slots=True)

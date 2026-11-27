@@ -13,11 +13,10 @@ from rich.text import Text
 from .action_service import ActionService
 from .analysis_service import AnalysisService
 from .application.browsing import ReviewOperation, ReviewRequest
-from .application.clean import CleanOperation, CleanRequest
 from .application.doctor import DoctorOperation, DoctorRequest
-from .application.legacy_clean import LegacyCleanOperation, LegacyCleanRequest
 from .application.progress import ProgressOperation
-from .application.rules import RuleMigrationOperation
+from .application.rule_run import RuleEvaluationOperation, RuleRunOperation, RuleRunRequest
+from .application.rules import RuleLearningOperation, RuleMigrationOperation
 from .application.state import StateOperation, StateResetRequest
 from .classification_state import all_state_keywords
 from .classifier import PyJevSpamClassifier
@@ -73,17 +72,16 @@ from .routing_config import (
     load_routing_rules,
     routing_rules_path_for_config,
 )
-from .rule_candidates import build_rule_candidates
-from .rule_learning import RuleProposal, learn_rule_proposal
+from .routing_models import RoutingRule, RuleType
+from .routing_models import RuleSet as RoutingRuleSet
+from .routing_rule_service import RoutingRuleService
 from .rules import (
     RuleError,
+    RuleMatch,
     RuleSet,
     describe_match,
-    generate_rule_id,
     load_rules,
     rules_path_for_config,
-    validate_rule_id,
-    write_rules,
 )
 
 app = typer.Typer(no_args_is_help=True, help="Security-scoped IMAP mail classification and cleaning.")
@@ -91,7 +89,7 @@ config_app = typer.Typer(help="Inspect imapledger configuration.")
 app.add_typer(config_app, name="config")
 auth_app = typer.Typer(help="Store and inspect IMAP credentials.")
 app.add_typer(auth_app, name="auth")
-rule_app = typer.Typer(help="Manage optional advanced routing filters for batch clean.")
+rule_app = typer.Typer(help="Manage global routing rules, previews, apply, and learning.")
 app.add_typer(rule_app, name="rule")
 state_app = typer.Typer(help="Inspect and reset persisted classification state.")
 app.add_typer(state_app, name="state")
@@ -392,11 +390,11 @@ def auth_change_passphrase(
 
 @rule_app.command("migrate")
 def rule_migrate(
-    apply: bool = typer.Option(False, "--apply", help="Write the schema-2 conversion to rules.toml."),
+    apply: bool = typer.Option(False, "--apply", help="Write the schema-3 conversion to rules.toml."),
     preview: bool = typer.Option(False, "--preview", help="Preview the conversion without writing."),
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
 ) -> None:
-    """Explicitly migrate schema-1 header rules to schema 2."""
+    """Explicitly migrate legacy routing rules to schema 3."""
     if apply and preview:
         err_console.print("Usage error: --preview and --apply cannot be combined.")
         raise typer.Exit(2)
@@ -409,14 +407,36 @@ def rule_migrate(
         err_console.print(f"Rules error: {exc}", markup=False)
         raise typer.Exit(2) from exc
     console.print(f"rules: {path}", markup=False)
-    console.print(f"schema: {result.source_schema} -> 2", markup=False)
+    console.print(f"schema: {result.source_schema} -> 3", markup=False)
     console.print(f"converted rules: {len(result.rules.rules)}", markup=False)
-    if result.rules.fallback_destination is None:
-        console.print("No fallback was inferred. Configure rules.fallback_destination before full clean.", markup=False)
+    for warning in result.warnings:
+        console.print(f"warning: {warning}", markup=False)
     console.print(
-        "Migration applied." if apply else "Preview only. Re-run with --apply to write schema-2 rules.",
+        "Migration applied." if apply else "Preview only. Re-run with --apply to write schema-3 rules.",
         markup=False,
     )
+
+
+def _load_routing_rules_for_cli(config: Path) -> RoutingRuleSet:
+    try:
+        return load_routing_rules(routing_rules_path_for_config(config))
+    except RoutingConfigError as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+
+
+def _parse_rule_matchers(values: list[str]) -> tuple[RuleMatch, ...]:
+    matchers = []
+    fields = set(RuleMatch.__dataclass_fields__)
+    for value in values:
+        field, separator, expected = value.partition("=")
+        if not separator or field not in fields or not expected:
+            raise typer.BadParameter("matchers must use field=value with a supported matcher field")
+        try:
+            matchers.append(RuleMatch(**{field: expected}))
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    return tuple(matchers)
 
 
 @rule_app.command("list")
@@ -424,29 +444,23 @@ def rule_list(
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
 ) -> None:
     """List locally stored routing rules without connecting to IMAP."""
-    try:
-        rules = load_rules(rules_path_for_config(config))
-    except RuleError as exc:
-        err_console.print(f"Rules error: {exc}", markup=False)
-        raise typer.Exit(2) from exc
+    rules = _load_routing_rules_for_cli(config)
     if not rules.rules:
         console.print("No routing rules.", markup=False)
         return
-
     table = Table(title="Routing rules")
-    table.add_column("ID")
-    table.add_column("Enabled")
-    table.add_column("Sources")
-    table.add_column("Match")
-    table.add_column("Action")
+    for column in ("ID", "Enabled", "Type", "Scope", "Destination", "Match"):
+        table.add_column(column)
     for rule in rules.rules:
-        action = "keep" if rule.action.action is ActionKind.KEEP else f"move -> {rule.action.destination}"
+        scope = ", ".join(rule.source_folders) if rule.source_folders else "All folders"
+        match = " OR ".join(describe_match(item) for item in rule.match_any) or "semantic"
         table.add_row(
             rule.id,
             "yes" if rule.enabled else "no",
-            ", ".join(rule.source_folders),
-            describe_match(rule.match),
-            action,
+            rule.type.value,
+            scope,
+            rule.destination,
+            match,
         )
     console.print(table, markup=False)
 
@@ -457,27 +471,103 @@ def rule_show(
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
 ) -> None:
     """Show one locally stored routing rule without connecting to IMAP."""
-    try:
-        rules = load_rules(rules_path_for_config(config))
-    except RuleError as exc:
-        err_console.print(f"Rules error: {exc}", markup=False)
-        raise typer.Exit(2) from exc
+    rules = _load_routing_rules_for_cli(config)
     rule = next((item for item in rules.rules if item.id == rule_id), None)
     if rule is None:
         err_console.print(f"Rule not found: {rule_id}", markup=False)
         raise typer.Exit(2)
     console.print(f"id: {rule.id}", markup=False)
     console.print(f"enabled: {str(rule.enabled).lower()}", markup=False)
-    console.print("sources:", markup=False)
-    for folder in rule.source_folders:
-        console.print(f"  - {folder}", markup=False)
-    console.print("match:", markup=False)
-    for key, value in rule.match.as_dict().items():
-        console.print(f"  {key}: {_safe_text(value)}", markup=False)
-    if rule.action.action is ActionKind.KEEP:
-        console.print("action: keep", markup=False)
-    else:
-        console.print(f"action: move -> {rule.action.destination}", markup=False)
+    console.print(f"type: {rule.type.value}", markup=False)
+    console.print(f"scope: {', '.join(rule.source_folders) if rule.source_folders else 'all folders'}", markup=False)
+    console.print(f"destination: {rule.destination}", markup=False)
+    if rule.description is not None:
+        console.print(f"description: {_safe_text(rule.description)}", markup=False)
+    if rule.match_any:
+        console.print("match any:", markup=False)
+        for matcher in rule.match_any:
+            console.print(f"  - {describe_match(matcher)}", markup=False)
+
+
+@rule_app.command("add")
+def rule_add(
+    rule_id: str = typer.Argument(..., help="New rule ID"),
+    rule_type: RuleType = typer.Option(..., "--type", help="Rule type: semantic or header"),  # noqa: B008
+    destination: str = typer.Option(..., "--destination", help="Destination folder"),
+    description: str | None = typer.Option(None, "--description", help="Rule description"),
+    matcher_values: list[str] = typer.Option([], "--match", help="Matcher field=value; repeat for OR alternatives"),  # noqa: B008
+    source_folders: list[str] = typer.Option(  # noqa: B008
+        [], "--source-folder", help="Restrict rule to a source folder; repeatable"
+    ),  # noqa: B008
+    match_at: float | None = typer.Option(None, "--match-at", min=0, max=1, help="Semantic match threshold"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """Add a global-by-default semantic or header routing rule."""
+    if rule_type is RuleType.SPAM:
+        raise typer.BadParameter("the built-in Spam rule cannot be added manually")
+    matchers = _parse_rule_matchers(matcher_values)
+    try:
+        rule = RoutingRule(
+            id=rule_id,
+            enabled=True,
+            type=rule_type,
+            destination=destination,
+            description=description,
+            match_at=match_at,
+            source_folders=tuple(source_folders),
+            match_any=matchers,
+        )
+        result = RoutingRuleService(routing_rules_path_for_config(config)).add(rule)
+    except (RoutingConfigError, ValueError) as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    console.print(f"Added rule {result.changed_rule_id}", markup=False)
+
+
+@rule_app.command("edit")
+def rule_edit(
+    rule_id: str = typer.Argument(..., help="Rule ID"),
+    destination: str | None = typer.Option(None, "--destination", help="Destination folder"),
+    description: str | None = typer.Option(None, "--description", help="Rule description"),
+    matcher_values: list[str] = typer.Option([], "--match", help="Replace matchers; repeat for OR alternatives"),  # noqa: B008
+    source_folders: list[str] = typer.Option([], "--source-folder", help="Replace source scope; repeatable"),  # noqa: B008
+    global_scope: bool = typer.Option(False, "--global", help="Make the rule apply to all folders"),
+    match_at: float | None = typer.Option(None, "--match-at", min=0, max=1, help="Semantic match threshold"),
+    enable: bool = typer.Option(False, "--enable", help="Enable the rule"),
+    disable: bool = typer.Option(False, "--disable", help="Disable the rule"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+) -> None:
+    """Edit a local rule without connecting to IMAP."""
+    if enable and disable:
+        raise typer.BadParameter("--enable and --disable cannot be combined")
+    service = RoutingRuleService(routing_rules_path_for_config(config))
+    try:
+        rules = service.load()
+        current = next((item for item in rules.rules if item.id == rule_id), None)
+        if current is None:
+            raise RoutingConfigError(f"rule not found: {rule_id}")
+        if current.built_in and (
+            description is not None or matcher_values or source_folders or global_scope or match_at is not None
+        ):
+            raise RoutingConfigError("the built-in Spam rule only supports destination and enabled-state edits")
+        matchers = _parse_rule_matchers(matcher_values) if matcher_values else current.match_any
+        scope = () if global_scope else (tuple(source_folders) if source_folders else current.source_folders)
+        replacement = RoutingRule(
+            id=current.id,
+            enabled=False if disable else (True if enable else current.enabled),
+            type=current.type,
+            destination=destination or current.destination,
+            description=description or current.description,
+            match_at=match_at if match_at is not None else current.match_at,
+            match_any=matchers,
+            source_folders=scope,
+            built_in=current.built_in,
+        )
+        result = service.update(rule_id, replacement)
+    except (RoutingConfigError, ValueError) as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    console.print(f"Updated rule {result.changed_rule_id}", markup=False)
 
 
 @rule_app.command("remove")
@@ -487,69 +577,215 @@ def rule_remove(
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
 ) -> None:
     """Remove a locally stored routing rule without connecting to IMAP."""
-    path = rules_path_for_config(config)
+    service = RoutingRuleService(routing_rules_path_for_config(config))
     try:
-        rules = load_rules(path)
-    except RuleError as exc:
+        rules = service.load()
+        rule = next((item for item in rules.rules if item.id == rule_id), None)
+        if rule is None:
+            raise RoutingConfigError(f"rule not found: {rule_id}")
+        if rule.built_in:
+            raise RoutingConfigError("the built-in Spam rule cannot be removed")
+    except RoutingConfigError as exc:
         err_console.print(f"Rules error: {exc}", markup=False)
         raise typer.Exit(2) from exc
-    if not any(rule.id == rule_id for rule in rules.rules):
-        err_console.print(f"Rule not found: {rule_id}", markup=False)
-        raise typer.Exit(2)
     if not yes and not typer.confirm(f"Remove rule {rule_id}?", default=False):
         console.print("No rule was removed.", markup=False)
         return
     try:
-        write_rules(RuleSet(tuple(rule for rule in rules.rules if rule.id != rule_id)), path)
-    except RuleError as exc:
+        service.remove(rule_id)
+    except RoutingConfigError as exc:
         err_console.print(f"Rules error: {exc}", markup=False)
         raise typer.Exit(1) from exc
     console.print(f"Removed rule {rule_id}", markup=False)
 
 
-@rule_app.command("learn")
-def rule_learn(
-    uid: int = typer.Argument(..., help="Folder-scoped message UID to learn from"),
-    folder: str = typer.Option(..., "--folder", help="Configured source folder containing the UID"),
-    move: str = typer.Option(..., "--move", help="Explicit move destination for the learned rule"),
-    name: str | None = typer.Option(None, "--name", help="Optional safe rule ID"),
-    preview: bool = typer.Option(False, "--preview", help="Show a proposal without saving it"),
-    yes: bool = typer.Option(False, "--yes", help="Accept the proposed rule without prompting"),
-    apply_current: bool = typer.Option(
-        False,
-        "--apply-current",
-        help="Move the referenced UID after the rule is successfully saved",
-    ),
+def _execute_rule_run(
+    *,
+    folder: str | None,
+    all_folders: bool,
+    apply: bool,
+    limit: int,
+    rule_scope: str | None,
+    sort: MessageSort,
+    new_run: bool,
+    retry_errors: bool,
+    progress_db: Path,
+    config: Path,
+    verbose: bool,
+    yes: bool = False,
+) -> None:
+    if all_folders == (folder is not None):
+        raise typer.BadParameter("specify exactly one folder or --all-folders")
+    if new_run and retry_errors:
+        raise typer.BadParameter("--new-run cannot be combined with --retry-errors")
+    if retry_errors and not apply:
+        raise typer.BadParameter("--retry-errors requires --apply")
+    if apply and not yes and not typer.confirm("Apply routing rules to the selected folder scope?", default=False):
+        console.print("No mailbox changes made.", markup=False)
+        return
+    try:
+        settings = load_settings(config)
+        rules = load_routing_rules(routing_rules_path_for_config(config))
+        operation = RuleRunOperation(settings, rules)
+        if rule_scope is not None and not any(rule.id == rule_scope for rule in rules.rules):
+            raise RoutingConfigError(f"rule not found: {rule_scope}")
+        password = ""
+        if all_folders:
+            password = _resolve_password(settings.imap)
+            with FolderCatalog(
+                host=settings.imap.host,
+                port=settings.imap.port,
+                username=settings.imap.username,
+                password=password,
+                event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+            ) as catalog:
+                rows = catalog.list_folders(include_counts=False)
+            selected_folders = operation.selectable_folders(rows)
+            if not selected_folders:
+                raise MailboxError("no selectable mail folders were found")
+        else:
+            selected_folders = (folder,)
+        request = RuleRunRequest(
+            folders=selected_folders,
+            apply=apply,
+            limit=limit,
+            sort=sort.value,
+            rule_scope=rule_scope,
+            new_run=new_run,
+            retry_errors=retry_errors,
+            progress_db=progress_db,
+        )
+        operation.preflight(request)
+        if not all_folders:
+            password = _resolve_password(settings.imap)
+
+        def display_result(current_folder, message, _run):
+            console.print(f"folder={current_folder}", markup=False)
+            _print_processing_message(message, preview=not apply)
+
+        result = operation.run(
+            request,
+            password=password,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+            on_result=display_result,
+        )
+    except ConfigError as exc:
+        err_console.print(f"Configuration error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    except (RoutingConfigError, ValueError) as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    except (MailboxError, ProcessingError, ProgressStoreError) as exc:
+        _print_failure(exc, debug=False, command="rule apply" if apply else "rule preview")
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        _print_failure(exc, debug=False, command="rule apply" if apply else "rule preview")
+        raise typer.Exit(1) from exc
+    finally:
+        password = ""
+    for current_folder, run in result.progress:
+        console.print(
+            f"folder={current_folder} run={run.id} status={run.status} scanned={run.scanned_count} "
+            f"matched={run.match_count} moved={run.moved_count} no_match={run.no_match_count} errors={run.error_count}",
+            markup=False,
+        )
+    if not apply:
+        console.print("Preview only. No mailbox or per-message progress state was changed.", markup=False)
+    if any(message.outcome == "error" for _, message in result.messages):
+        raise typer.Exit(1)
+
+
+@rule_app.command("preview")
+def rule_preview(
+    folder: str | None = typer.Argument(None, help="Source folder; omit when using --all-folders"),  # noqa: B008
+    all_folders: bool = typer.Option(False, "--all-folders", help="Preview every selectable mail folder"),
+    limit: int = typer.Option(10, "--limit", min=1, help="Maximum messages per folder"),
+    rule_scope: str | None = typer.Option(None, "--rule", help="Evaluate only this rule"),
+    sort: MessageSort = typer.Option(MessageSort.OLDEST, "--sort", help="Mailbox-local UID ordering"),  # noqa: B008
+    new_run: bool = typer.Option(False, "--new-run", help="Start a fresh preview scan"),
+    progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database"),  # noqa: B008
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
 ) -> None:
-    """Learn a narrow routing rule from one explicitly scoped message UID."""
+    """Preview the ordered global routing rules without changing mail."""
+    _execute_rule_run(
+        folder=folder,
+        all_folders=all_folders,
+        apply=False,
+        limit=limit,
+        rule_scope=rule_scope,
+        sort=sort,
+        new_run=new_run,
+        retry_errors=False,
+        progress_db=progress_db,
+        config=config,
+        verbose=verbose,
+    )
+
+
+@rule_app.command("apply")
+def rule_apply(
+    folder: str | None = typer.Argument(None, help="Source folder; omit when using --all-folders"),  # noqa: B008
+    all_folders: bool = typer.Option(False, "--all-folders", help="Apply to every selectable mail folder"),
+    limit: int = typer.Option(10, "--limit", min=1, help="Maximum messages per folder"),
+    rule_scope: str | None = typer.Option(None, "--rule", help="Apply only this rule"),
+    sort: MessageSort = typer.Option(MessageSort.OLDEST, "--sort", help="Mailbox-local UID ordering"),  # noqa: B008
+    new_run: bool = typer.Option(False, "--new-run", help="Supersede active progress and start a fresh scan"),
+    retry_errors: bool = typer.Option(False, "--retry-errors", help="Retry stored errors from the matching run"),
+    yes: bool = typer.Option(False, "--yes", help="Apply without confirmation"),
+    progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database"),  # noqa: B008
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """Apply ordered routing rules after mailbox preflight and confirmation."""
+    _execute_rule_run(
+        folder=folder,
+        all_folders=all_folders,
+        apply=True,
+        limit=limit,
+        rule_scope=rule_scope,
+        sort=sort,
+        new_run=new_run,
+        retry_errors=retry_errors,
+        progress_db=progress_db,
+        config=config,
+        verbose=verbose,
+        yes=yes,
+    )
+
+
+@rule_app.command("learn")
+def rule_learn(
+    rule_id: str = typer.Argument(..., help="Existing semantic rule to strengthen"),
+    folder: str = typer.Option(..., "--folder", help="Folder containing the exact message UID"),
+    uid: int = typer.Option(..., "--uid", min=1, help="Exact message UID to learn from"),
+    preview_only: bool = typer.Option(False, "--preview", help="Show the proposal without saving"),
+    yes: bool = typer.Option(False, "--yes", help="Save without confirmation"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """Strengthen an existing semantic rule with one safe deterministic matcher."""
     if uid < 1:
         raise typer.BadParameter("UID must be a positive integer")
-    if preview and apply_current:
-        raise typer.BadParameter("--preview cannot be combined with --apply-current")
     try:
         settings = load_settings(config)
+        rules = load_routing_rules(routing_rules_path_for_config(config))
     except ConfigError as exc:
-        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        err_console.print(f"Configuration error: {exc}", markup=False)
         raise typer.Exit(2) from exc
-    if folder not in settings.spam.folders:
-        err_console.print(f"Source folder is not configured in spam.folders: {folder}", markup=False)
-        raise typer.Exit(2)
-    if move in settings.spam.folders:
-        err_console.print("Move destination must not be a configured spam source folder.", markup=False)
-        raise typer.Exit(2)
-    rules_path = rules_path_for_config(config)
-    try:
-        existing = load_rules(rules_path, source_folders=settings.spam.folders)
-        if name is not None:
-            validate_rule_id(name)
-    except RuleError as exc:
+    except RoutingConfigError as exc:
         err_console.print(f"Rules error: {exc}", markup=False)
         raise typer.Exit(2) from exc
+    if settings.config_store is not None and folder == settings.config_store.folder:
+        raise typer.BadParameter("Config Ledger cannot be used as a learning source")
+    target_rule = next((rule for rule in rules.rules if rule.id == rule_id), None)
+    if target_rule is None:
+        err_console.print(f"Rule not found: {rule_id}", markup=False)
+        raise typer.Exit(2)
+    if target_rule.type is not RuleType.SEMANTIC:
+        raise typer.BadParameter("learning can only strengthen an existing semantic rule")
 
     password = _resolve_password(settings.imap)
-    rule_saved = False
     try:
         with ScopedMailbox(
             host=settings.imap.host,
@@ -557,167 +793,177 @@ def rule_learn(
             username=settings.imap.username,
             password=password,
             folder=folder,
-            writable=apply_current,
+            writable=False,
             max_message_bytes=settings.spam.max_message_bytes,
             max_body_chars=settings.spam.max_body_chars,
-            allowed_destinations=(move,),
-            allow_delete=False,
             event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
         ) as mailbox:
-            if not mailbox.destination_exists(move):
-                err_console.print(f"Move destination does not exist: {move}", markup=False)
-                raise typer.Exit(1)
             item = mailbox.fetch_uid(uid)
             if item.message is None:
-                err_console.print(
-                    f"Could not read UID {uid}: {item.skip_reason or 'message unavailable'}",
-                    markup=False,
-                )
-                raise typer.Exit(1)
+                raise MailboxError(f"Could not read UID {uid}: {item.skip_reason or 'message unavailable'}")
             message = item.message
-            candidates = build_rule_candidates(message)
-            from pyjev import Jev
-
-            with Jev() as jev:
-                proposal = learn_rule_proposal(
-                    jev,
-                    message=message,
-                    candidates=candidates,
-                    requested_action=MessageAction(ActionKind.MOVE, move),
-                )
-
-            console.print(f"example {folder} UID {uid}", markup=False)
-            console.print(f"From: {_safe_text(message.sender)}", markup=False)
-            console.print(f"Subject: {_safe_text(message.subject)}", markup=False)
-            _print_rule_proposal(proposal)
-            if proposal.status != "auto" or proposal.candidate is None:
-                console.print("No rule was saved.", markup=False)
-                raise typer.Exit(2)
-
-            rule_id = name or generate_rule_id(proposal.candidate.match, [rule.id for rule in existing.rules])
-            proposed = proposal.to_rule(
-                id=rule_id,
-                source_folders=(folder,),
-                action=MessageAction(ActionKind.MOVE, move),
-            )
-            console.print(f"Proposed rule: {proposed.id}", markup=False)
-            console.print(f"  source: {folder}", markup=False)
-            console.print(f"  match: {describe_match(proposed.match)}", markup=False)
-            console.print(f"  action: move -> {move}", markup=False)
-            if preview:
-                console.print("Preview only. No rule was saved.", markup=False)
-                return
-
-            for current in existing.rules:
-                if current.source_folders != proposed.source_folders or current.match != proposed.match:
-                    continue
-                if current.action == proposed.action:
-                    console.print(f"Equivalent rule already exists: {current.id}", markup=False)
-                    console.print("No rule was added.", markup=False)
-                    return
-                err_console.print(
-                    "A rule with the same matcher and scope already exists with a different action:",
-                    markup=False,
-                )
-                existing_action = (
-                    "keep" if current.action.action is ActionKind.KEEP else f"move -> {current.action.destination}"
-                )
-                err_console.print(f"  existing: {existing_action}", markup=False)
-                err_console.print(f"  proposed: move -> {move}", markup=False)
-                err_console.print("No rule was changed.", markup=False)
-                raise typer.Exit(2)
-            if any(rule.id == proposed.id for rule in existing.rules):
-                err_console.print(f"Rule ID already exists: {proposed.id}", markup=False)
-                raise typer.Exit(2)
-            if not yes and not typer.confirm("Save rule?", default=False):
-                console.print("No rule was saved.", markup=False)
-                return
-            write_rules(RuleSet((*existing.rules, proposed)), rules_path)
-            rule_saved = True
-            console.print(f"Saved rule {proposed.id}", markup=False)
-            console.print(f"rules: {rules_path}", markup=False)
-            if apply_current:
-                result = mailbox.move_uid(uid, move)
-                if uid not in result.moved:
-                    raise MailboxError("current UID move was not confirmed")
-                console.print(f"MOVED current UID {uid} -> {move}", markup=False)
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        if apply_current and rule_saved:
-            err_console.print("The rule was saved, but applying it to the current UID failed.", markup=False)
+        operation = RuleLearningOperation()
+        proposal = operation.propose(
+            message,
+            folder=folder,
+            target_rule_id=rule_id,
+            existing_rules=rules,
+        )
+    except (MailboxError, RoutingConfigError, ValueError) as exc:
         _print_failure(exc, debug=False, command="rule learn")
         raise typer.Exit(1) from exc
+    except Exception as exc:
+        _print_failure(exc, debug=False, command="rule learn")
+        raise typer.Exit(1) from exc
+    finally:
+        password = ""
 
-
-def _print_rule_proposal(proposal: RuleProposal) -> None:
-    if proposal.candidate is not None:
-        console.print("Candidate selected:", markup=False)
-        console.print(f"  {proposal.candidate.description}", markup=False)
+    console.print(f"example {folder} UID {uid}", markup=False)
+    console.print(f"target rule: {rule_id}", markup=False)
+    console.print(f"From: {_safe_text(message.sender)}", markup=False)
+    console.print(f"Subject: {_safe_text(message.subject)}", markup=False)
+    if proposal.semantic_fit is not None:
+        console.print(f"semantic fit: {proposal.semantic_fit:.2f}", markup=False)
+    if proposal.selected_candidate is not None:
+        console.print(f"Candidate: {proposal.selected_candidate.description}", markup=False)
     if proposal.candidate_confidence is not None:
-        console.print(f"Jev confidence: {proposal.candidate_confidence:.2f}", markup=False)
+        console.print(f"Candidate confidence: {proposal.candidate_confidence:.2f}", markup=False)
     if proposal.safe_probability is not None:
         console.print(f"Generalization safety: {proposal.safe_probability:.2f}", markup=False)
-    if proposal.status == "none":
-        console.print("Could not derive a sufficiently safe rule.", markup=False)
-    elif proposal.status == "review":
-        console.print("The candidate did not meet the automatic acceptance thresholds.", markup=False)
+    if proposal.proposed_matcher is not None:
+        console.print(f"Proposed matcher: {describe_match(proposal.proposed_matcher)}", markup=False)
+    console.print(f"Proposal status: {proposal.status}", markup=False)
+    if proposal.status == "conflict" and proposal.conflict_rule_id is not None:
+        console.print(f"Matcher conflicts with higher-priority rule {proposal.conflict_rule_id}.", markup=False)
+    if proposal.status != "auto" or proposal.proposed_matcher is None:
+        console.print("No matcher was saved.", markup=False)
+        return
+    if preview_only:
+        console.print("Preview only. No matcher was saved.", markup=False)
+        return
+    if not yes and not typer.confirm("Save matcher to this rule?", default=False):
+        console.print("No matcher was saved.", markup=False)
+        return
+    try:
+        result = operation.save(proposal, RoutingRuleService(routing_rules_path_for_config(config)))
+    except (RoutingConfigError, ValueError) as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(1) from exc
+    console.print(f"Saved matcher to rule {result.changed_rule_id}", markup=False)
+
+
+@rule_app.command("evaluate")
+def rule_evaluate(
+    folder: str = typer.Option(..., "--folder", help="Folder containing the exact message UID"),
+    uid: int = typer.Option(..., "--uid", min=1, help="Exact message UID to evaluate"),
+    config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
+) -> None:
+    """Evaluate all enabled rules for one exact message without applying actions."""
+    try:
+        settings = load_settings(config)
+        rules = load_routing_rules(routing_rules_path_for_config(config))
+    except ConfigError as exc:
+        err_console.print(f"Configuration error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    except RoutingConfigError as exc:
+        err_console.print(f"Rules error: {exc}", markup=False)
+        raise typer.Exit(2) from exc
+    if settings.config_store is not None and folder == settings.config_store.folder:
+        raise typer.BadParameter("Config Ledger cannot be used as a rule source")
+    password = _resolve_password(settings.imap)
+    try:
+        with ScopedMailbox(
+            host=settings.imap.host,
+            port=settings.imap.port,
+            username=settings.imap.username,
+            password=password,
+            folder=folder,
+            writable=False,
+            max_message_bytes=settings.spam.max_message_bytes,
+            max_body_chars=settings.spam.max_body_chars,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+        ) as mailbox:
+            item = mailbox.fetch_uid(uid)
+            if item.message is None:
+                raise MailboxError(f"Could not read UID {uid}: {item.skip_reason or 'message unavailable'}")
+            plan = RuleEvaluationOperation(settings, rules).evaluate(folder, item.message)
+    except (MailboxError, ProcessingError, RoutingConfigError) as exc:
+        _print_failure(exc, debug=False, command="rule evaluate")
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        _print_failure(exc, debug=False, command="rule evaluate")
+        raise typer.Exit(1) from exc
+    finally:
+        password = ""
+    console.print(
+        f"Folder={folder} UID {uid} winner={plan.winner_rule_id or '-'} destination={plan.destination or '-'}",
+        markup=False,
+    )
+    for result in plan.rule_results:
+        confidence = f" confidence={result.confidence:.3f}" if result.confidence is not None else ""
+        console.print(f"  {result.rule_id}: {result.state.value}{confidence}", markup=False)
+    console.print("Read-only; no actions were executed.", markup=False)
 
 
 @rule_app.command("test")
 def rule_test(
     rule_id: str = typer.Argument(..., help="Rule ID to test"),
-    limit: int = typer.Option(20, min=1, help="Maximum messages inspected per source folder"),
-    offset: int = typer.Option(0, min=0, help="Skip this many messages in each source folder"),
-    sort: MessageSort = typer.Option(MessageSort.NEWEST, "--sort", help="Mailbox-local UID ordering"),  # noqa: B008
+    folder: str = typer.Option(..., "--folder", help="Folder containing the exact message UID"),
+    uid: int = typer.Option(..., "--uid", min=1, help="Exact message UID to evaluate"),
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
 ) -> None:
-    """Inspect a bounded read-only window for messages matching one routing rule."""
+    """Evaluate one exact message with the selected rule, without applying actions."""
     try:
         settings = load_settings(config)
-        rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
+        rules = load_routing_rules(routing_rules_path_for_config(config))
     except ConfigError as exc:
-        err_console.print(f"[red]Configuration error:[/red] {exc}")
+        err_console.print(f"Configuration error: {exc}", markup=False)
         raise typer.Exit(2) from exc
-    except RuleError as exc:
+    except RoutingConfigError as exc:
         err_console.print(f"Rules error: {exc}", markup=False)
         raise typer.Exit(2) from exc
     rule = next((item for item in rules.rules if item.id == rule_id), None)
     if rule is None:
         err_console.print(f"Rule not found: {rule_id}", markup=False)
         raise typer.Exit(2)
-    selection = MessageSelection(limit=limit, offset=offset, sort=sort)
+    if settings.config_store is not None and folder == settings.config_store.folder:
+        raise typer.BadParameter("Config Ledger cannot be used as a rule source")
     password = _resolve_password(settings.imap)
     try:
-        for folder in rule.source_folders:
-            with ScopedMailbox(
-                host=settings.imap.host,
-                port=settings.imap.port,
-                username=settings.imap.username,
-                password=password,
-                folder=folder,
-                writable=False,
-                max_message_bytes=settings.spam.max_message_bytes,
-                max_body_chars=settings.spam.max_body_chars,
-                event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
-            ) as mailbox:
-                inspected = mailbox.selected_count(selection)
-                console.print(f"rule={rule.id} source={folder} inspected={inspected}", markup=False)
-                matched = 0
-                for item in mailbox.iter_messages(selection):
-                    if item.message is None or not rule.match.matches(item.message):
-                        continue
-                    matched += 1
-                    console.print(
-                        f"[{matched}] Folder={folder} UID {item.uid} MATCH From={_safe_text(item.message.sender)} "
-                        f"Subject={_safe_text(item.message.subject)}",
-                        markup=False,
-                    )
-                console.print(f"Matched {matched} in inspected window.", markup=False)
+        with ScopedMailbox(
+            host=settings.imap.host,
+            port=settings.imap.port,
+            username=settings.imap.username,
+            password=password,
+            folder=folder,
+            writable=False,
+            max_message_bytes=settings.spam.max_message_bytes,
+            max_body_chars=settings.spam.max_body_chars,
+            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
+        ) as mailbox:
+            item = mailbox.fetch_uid(uid)
+            if item.message is None:
+                raise MailboxError(f"Could not read UID {uid}: {item.skip_reason or 'message unavailable'}")
+            plan = RuleEvaluationOperation(settings, rules).evaluate(folder, item.message, rule_scope=rule_id)
+    except (MailboxError, ProcessingError, RoutingConfigError) as exc:
+        _print_failure(exc, debug=False, command="rule test")
+        raise typer.Exit(1) from exc
     except Exception as exc:
         _print_failure(exc, debug=False, command="rule test")
         raise typer.Exit(1) from exc
+    finally:
+        password = ""
+    matched = plan.winner_rule_id == rule_id
+    console.print(
+        f"Folder={folder} UID {uid} {'MATCH' if matched else 'NO MATCH'} "
+        f"winner={plan.winner_rule_id or '-'} destination={plan.destination or '-'}",
+        markup=False,
+    )
+    for result in plan.rule_results:
+        confidence = f" confidence={result.confidence:.3f}" if result.confidence is not None else ""
+        console.print(f"  {result.rule_id}: {result.state.value}{confidence}", markup=False)
     console.print("Read-only; no actions were executed.", markup=False)
 
 
@@ -952,268 +1198,37 @@ def doctor(
 
 @app.command()
 def clean(
-    folder: str | None = typer.Argument(
-        None,
-        help="Source folder for resumable routing. Omit to use the compatibility workflow.",
-    ),  # noqa: B008
-    apply: bool = typer.Option(
-        False,
-        "--apply",
-        help="Apply routing actions. Preview is the default.",
-    ),
-    reclassify: bool = typer.Option(
-        False,
-        "--reclassify",
-        help="Ignore stored classification state in the compatibility workflow.",
-    ),
-    limit: int | None = typer.Option(
-        None,
-        "--limit",
-        min=1,
-        help="Process at most this many messages.",
-    ),
-    offset: int = typer.Option(
-        0,
-        "--offset",
-        min=0,
-        help="Compatibility workflow only: skip messages after sorting.",
-    ),
-    sort: MessageSort | None = typer.Option(  # noqa: B008
-        None,
-        "--sort",
-        help="UID order, default oldest for resumable routing and newest for compatibility mode.",
-    ),
-    rule: str | None = typer.Option(None, "--rule", help="Evaluate only this enabled routing rule."),
-    new_run: bool = typer.Option(False, "--new-run", help="Supersede active progress and start a fresh scan."),
-    retry_errors: bool = typer.Option(False, "--retry-errors", help="Retry stored errors from the matching run."),
-    progress: bool = typer.Option(  # noqa: B008
-        True,
-        "--progress/--no-progress",
-        help="Print each completed UID evaluation, final configured routing actions, and counters.",
-    ),
-    progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database."),  # noqa: B008
+    folder: str = typer.Argument(..., help="Source folder to process with the unified rules system"),
+    apply: bool = typer.Option(False, "--apply", help="Apply routing actions; preview is the default"),
+    limit: int = typer.Option(10, "--limit", min=1, help="Maximum messages to inspect"),
+    sort: MessageSort = typer.Option(MessageSort.OLDEST, "--sort", help="Mailbox-local UID ordering"),  # noqa: B008
+    rule: str | None = typer.Option(None, "--rule", help="Evaluate only this rule"),
+    new_run: bool = typer.Option(False, "--new-run", help="Supersede active progress and start a fresh scan"),
+    retry_errors: bool = typer.Option(False, "--retry-errors", help="Retry stored errors from the matching run"),
+    yes: bool = typer.Option(False, "--yes", help="Apply without confirmation"),
+    progress_db: Path = typer.Option(default_progress_path(), "--progress-db", help="Progress SQLite database"),  # noqa: B008
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
     verbose: bool = typer.Option(False, "-v", "--verbose", help="Print safe IMAP operation progress"),
-    debug: bool = typer.Option(False, "--debug", help="Print a traceback without exception payloads"),
 ) -> None:
-    """Process routing and display the final configured action as it completes.
-
-    Compatibility mode applies category actions to spam.folders.
-    """
-    if folder is not None:
-        if new_run and retry_errors:
-            err_console.print("Usage error: --new-run cannot be combined with --retry-errors.")
-            raise typer.Exit(2)
-        if retry_errors and not apply:
-            err_console.print("Usage error: --retry-errors requires --apply.")
-            raise typer.Exit(2)
-        if reclassify or offset:
-            err_console.print("Usage error: --reclassify and --offset are only available without a source folder.")
-            raise typer.Exit(2)
-        _routing_clean(
-            folder,
-            apply=apply,
-            limit=limit,
-            sort=sort or MessageSort.OLDEST,
-            rule=rule,
-            new_run=new_run,
-            retry_errors=retry_errors,
-            progress=progress,
-            progress_db=progress_db,
-            config=config,
-            verbose=verbose,
-            debug=debug,
-        )
-        return
-    if rule is not None or new_run or retry_errors:
-        err_console.print("Usage error: --rule, --new-run, and --retry-errors require a source folder argument.")
-        raise typer.Exit(2)
+    """Deprecated alias for rule preview/apply on one folder."""
     console.print(
-        "Deprecation warning: bare `clean` is deprecated. Use `imapledger clean FOLDER` for semantic routing.",
+        "Deprecation warning: `clean` is a compatibility alias. Use `rule preview` or `rule apply`.",
         markup=False,
     )
-    try:
-        settings = load_settings(config)
-    except ConfigError as exc:
-        err_console.print(f"[red]Configuration error:[/red] {exc}")
-        raise typer.Exit(2) from exc
-
-    if not settings.spam.folders:
-        err_console.print(
-            "Configuration error: bare `clean` requires spam.folders; "
-            "use `clean FOLDER` for an explicit routing source.",
-            markup=False,
-        )
-        raise typer.Exit(2)
-    try:
-        rules = load_rules(rules_path_for_config(config), source_folders=settings.spam.folders)
-    except RuleError as exc:
-        err_console.print(f"[red]Rules error:[/red] {exc}")
-        raise typer.Exit(2) from exc
-    operation = LegacyCleanOperation(settings, rules)
-    try:
-        operation.validate_config()
-    except ConfigError as exc:
-        err_console.print(f"[red]Configuration error:[/red] {exc}")
-        raise typer.Exit(2) from exc
-    request = LegacyCleanRequest(
-        apply=apply,
-        limit=limit,
-        offset=offset,
-        sort=sort or MessageSort.NEWEST,
-        reclassify=reclassify,
-    )
-
-    def on_folder_start(folder, total_messages, selected_count, unclassified_count, selection) -> None:
-        console.print(
-            _selection_summary(
-                folder=folder,
-                total_messages=total_messages,
-                selected_count=selected_count,
-                unclassified_count=unclassified_count,
-                selection=selection,
-            ),
-            markup=False,
-        )
-
-    def on_result(folder, row, position, total) -> None:
-        _print_result(row, folder=folder, position=position, total=total, apply=apply, verbose=verbose)
-
-    password = _resolve_password(settings.imap)
-    try:
-        legacy_result = operation.run(
-            request,
-            password=password,
-            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
-            on_folder_start=on_folder_start,
-            on_result=on_result if progress else None,
-        )
-    except Exception as exc:
-        _print_failure(exc, debug=debug, command="clean")
-        raise typer.Exit(1) from exc
-    finally:
-        password = ""
-
-    for result in legacy_result.preflight_results:
-        state = "OK" if result.ok else "FAILED"
-        _print_state_preflight(result, clean_apply=True)
-        console.print(f"preflight {result.folder}: {state}", markup=False)
-        for capability in (b"MOVE", b"UIDPLUS"):
-            if capability in result.missing_capabilities:
-                console.print(f"required capability {capability.decode()}: MISSING")
-        for destination, exists in result.destinations:
-            if exists is not None:
-                state = "OK" if exists else "MISSING"
-                console.print(f"destination {destination}: {state}", markup=False)
-        for error in result.errors:
-            _print_failure(error, debug=False, command="clean")
-
-    if legacy_result.preflight_failed:
-        console.print("apply aborted before classification/mutation")
-        raise typer.Exit(1)
-
-    reports = list(legacy_result.reports)
-    for report in reports:
-        if progress:
-            _print_summary(report)
-        else:
-            _print_report(report)
-    if reports:
-        _print_aggregate_summary(reports)
-    if legacy_result.failure is not None:
-        _print_failure(legacy_result.failure, debug=debug, command="clean")
-        raise typer.Exit(1) from legacy_result.failure
-
-
-def _routing_clean(
-    folder: str,
-    *,
-    apply: bool,
-    limit: int | None,
-    sort: MessageSort,
-    rule: str | None,
-    new_run: bool,
-    retry_errors: bool,
-    progress: bool,
-    progress_db: Path,
-    config: Path,
-    verbose: bool,
-    debug: bool,
-) -> None:
-    try:
-        settings = load_settings(config)
-    except ConfigError as exc:
-        err_console.print(f"[red]Configuration error:[/red] {exc}")
-        raise typer.Exit(2) from exc
-    try:
-        rules = load_routing_rules(routing_rules_path_for_config(config))
-    except RoutingConfigError as exc:
-        err_console.print(f"[red]Rules error:[/red] {exc}")
-        raise typer.Exit(2) from exc
-
-    request = CleanRequest(
+    _execute_rule_run(
         folder=folder,
+        all_folders=False,
         apply=apply,
         limit=limit,
-        sort=sort.value,
         rule_scope=rule,
+        sort=sort,
         new_run=new_run,
         retry_errors=retry_errors,
         progress_db=progress_db,
+        config=config,
+        verbose=verbose,
+        yes=yes,
     )
-    operation = CleanOperation(settings, rules)
-    try:
-        operation.preflight(request)
-    except ValueError as exc:
-        err_console.print(f"[red]Rules error:[/red] {exc}")
-        raise typer.Exit(2) from exc
-
-    password = ""
-    try:
-        password = _resolve_password(settings.imap)
-        result = operation.run(
-            request,
-            password=password,
-            event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
-        )
-        report = result.report
-    except (ProcessingError, ProgressStoreError, MailboxError) as exc:
-        _print_failure(exc, debug=debug, command="clean")
-        raise typer.Exit(1) from exc
-    except Exception as exc:
-        _print_failure(exc, debug=debug, command="clean")
-        raise typer.Exit(1) from exc
-    finally:
-        password = ""
-
-    if progress:
-        for message in report.messages:
-            _print_processing_message(message, preview=report.preview)
-    run = report.run
-    console.print(
-        f"run={run.id} folder={run.source_folder} mode={run.mode} "
-        f"scope={run.rule_scope or '-'} sort={run.sort_direction} status={run.status} "
-        f"uidvalidity={run.uidvalidity} range=({run.lower_bound_uid},{run.high_watermark_uid}] "
-        f"cursor={run.cursor_uid if run.cursor_uid is not None else '-'} "
-        f"scanned_total={run.scanned_count} matched={run.match_count} moved={run.moved_count} "
-        f"no_match={run.no_match_count} errors={run.error_count} "
-        f"this_command={len(report.messages)}",
-        markup=False,
-    )
-    if report.preview:
-        console.print("Preview only. No mailbox or per-message progress state was changed.", markup=False)
-    if report.stopped_on_ambiguous_move:
-        ambiguous = next(
-            (message for message in report.messages if message.error_code in {"PartialMoveError", "MoveUnconfirmed"}),
-            None,
-        )
-        uid_text = f" UID={ambiguous.uid}." if ambiguous is not None else ""
-        console.print(
-            f"Stopped after an ambiguous MOVE.{uid_text} Reconcile this UID before continuing.",
-            markup=False,
-        )
-    if any(message.outcome == "error" for message in report.messages):
-        raise typer.Exit(1)
 
 
 def _print_processing_message(message: ProcessedMessage, *, preview: bool) -> None:
@@ -1227,7 +1242,14 @@ def _print_processing_message(message: ProcessedMessage, *, preview: bool) -> No
         )
     destination = message.destination or "-"
     rule_id = plan.winner_rule_id if plan is not None and plan.winner_rule_id is not None else "-"
-    action = "preview" if preview else ("confirmed" if message.confirmed else "not-moved")
+    if message.outcome == "no_match":
+        action = "keep-in-place"
+    elif message.outcome == "already_there":
+        action = "already-there"
+    elif preview:
+        action = "would-move" if message.destination else "keep-in-place"
+    else:
+        action = "moved" if message.confirmed else "not-moved"
     error = f" error={message.error_code}" if message.error_code else ""
     console.print(
         f"uid={message.uid} outcome={message.outcome} rule={rule_id} destination={destination} "
