@@ -45,7 +45,6 @@ class MessageDetail:
     item: MailboxItem
 
 
-
 class MailService:
     """Read-only folder and message browsing without classifier dependencies."""
 
@@ -129,7 +128,6 @@ class MailService:
         detail = MessageDetail(folder=folder, uidvalidity=uidvalidity, item=item)
         _log_timing("ui.message_open", started, message_count=1)
         return detail
-
 
     def _open_browser(self, folder: str) -> BrowserMailbox:
         settings = self._settings

@@ -37,6 +37,7 @@ class RoutingAction(str, Enum):
     DELETED = "deleted"
     ERROR = "error"
 
+
 @dataclass(frozen=True, slots=True)
 class RoutingRule:
     id: str
@@ -246,6 +247,7 @@ class RoutingPlan:
         if self.destination == self.folder:
             return RoutingAction.ALREADY_THERE
         return RoutingAction.MOVE
+
 
 @dataclass(frozen=True, slots=True)
 class RoutingReceipt:

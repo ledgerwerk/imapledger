@@ -30,9 +30,12 @@ def test_retired_category_modules_have_no_runtime_exports() -> None:
 def test_operation_registry_has_no_category_classification_commands() -> None:
     paths = {spec.cli_path for spec in OPERATION_SPECS}
 
-    assert not {
-        ("state", "status"),
-        ("state", "reset"),
-        ("review", "list"),
-        ("mail", "classify"),
-    } & paths
+    assert (
+        not {
+            ("state", "status"),
+            ("state", "reset"),
+            ("review", "list"),
+            ("mail", "classify"),
+        }
+        & paths
+    )

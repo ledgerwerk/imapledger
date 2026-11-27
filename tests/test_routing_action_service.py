@@ -166,7 +166,6 @@ def test_delete_requires_explicit_authorization_before_mailbox_access() -> None:
     assert mailbox.deletes == []
 
 
-
 def test_action_service_rejects_non_boolean_delete_authorization() -> None:
     rules = _rules(RuleAction.DELETE)
     mailbox = FakeMailbox()

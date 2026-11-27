@@ -78,6 +78,7 @@ class _FakeMailbox:
         self.moved: list[tuple[int, str]] = []
 
         self.deleted: list[int] = []
+
     def metadata(self) -> MailboxRunMetadata:
         return MailboxRunMetadata(uidvalidity=7, uidnext=self.high_watermark_uid + 1)
 
@@ -115,11 +116,11 @@ class _FakeMailbox:
         self.moved.append((uid, destination))
         return SimpleNamespace(moved=(uid,))
 
-
     def delete_uid(self, uid: int) -> SimpleNamespace:
         self.uids.remove(uid)
         self.deleted.append(uid)
         return SimpleNamespace(deleted=(uid,))
+
 
 def _settings() -> Settings:
     return Settings(
@@ -327,7 +328,6 @@ def test_retry_streams_results_and_stops_safely_between_uids(tmp_path, monkeypat
     assert store.get_result(report.run.id, 2).error_code == "RuntimeError"
 
 
-
 def test_keep_action_is_counted_as_acted_without_mailbox_mutation(tmp_path, monkeypatch) -> None:
     _FakeEvaluator.failing_uids = set()
     _FakeEvaluator.matching_uids = {1}
@@ -392,7 +392,6 @@ def test_delete_preview_never_mutates_and_requires_no_authorization(tmp_path, mo
     assert mailbox.deleted == []
     assert report.run.scanned_count == 0
     assert store.results(report.run.id) == ()
-
 
 
 def test_processing_engine_rejects_non_boolean_delete_authorization(tmp_path, monkeypatch) -> None:

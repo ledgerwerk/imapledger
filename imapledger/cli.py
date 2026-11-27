@@ -133,9 +133,9 @@ def _resolve_password(imap: ImapSettings) -> str:
         raise typer.Exit(2) from exc
 
 
-
 def _safe_text(value: str) -> str:
     return redact_urls(value)[:200]
+
 
 register_config_store_commands(config_app, resolve_password=lambda imap: _resolve_password(imap))
 
@@ -425,9 +425,7 @@ def _legacy_config_migration(
         )
 
     evidence = RuleEvidenceSettings(
-        trusted_authserv_ids=tuple(
-            dict.fromkeys((*rules.evidence.trusted_authserv_ids, *legacy.trusted_authserv_ids))
-        ),
+        trusted_authserv_ids=tuple(dict.fromkeys((*rules.evidence.trusted_authserv_ids, *legacy.trusted_authserv_ids))),
         trusted_provider_headers=tuple(
             dict.fromkeys((*rules.evidence.trusted_provider_headers, *legacy.trusted_provider_headers))
         ),
@@ -438,9 +436,7 @@ def _legacy_config_migration(
         evidence=evidence,
     )
     if apply and spam_action is not None and spam_action.action is RuleAction.DELETE and not allow_delete:
-        raise RoutingConfigError(
-            "migration creates a destructive DELETE rule; re-run with --apply --allow-delete"
-        )
+        raise RoutingConfigError("migration creates a destructive DELETE rule; re-run with --apply --allow-delete")
 
     console.print(f"legacy config: {config}", markup=False)
     console.print(f"rules: {rules_path}", markup=False)
@@ -496,6 +492,7 @@ def rule_migrate(
         markup=False,
     )
 
+
 def _load_routing_rules_for_cli(config: Path) -> RoutingRuleSet:
     try:
         return load_routing_rules(routing_rules_path_for_config(config))
@@ -516,8 +513,6 @@ def _parse_rule_matchers(values: list[str]) -> tuple[RuleMatch, ...]:
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
     return tuple(matchers)
-
-
 
 
 def _parse_recipe_options(values: list[str]) -> dict[str, float]:
@@ -617,6 +612,7 @@ def recipe_add(
         raise typer.Exit(2) from exc
     console.print(f"Added rule {result.changed_rule_id} from recipe {recipe_id}", markup=False)
 
+
 @rule_app.command("list")
 def rule_list(
     config: Path = typer.Option(default_config_path(), "--config", help="Configuration file"),  # noqa: B008
@@ -641,6 +637,7 @@ def rule_list(
             ", ".join(rule.source_folders) if rule.source_folders else "All folders",
         )
     console.print(table, markup=False)
+
 
 @rule_app.command("show")
 def rule_show(
@@ -669,6 +666,7 @@ def rule_show(
         console.print("match any:", markup=False)
         for matcher in rule.match_any:
             console.print(f"  - {describe_match(matcher)}", markup=False)
+
 
 @rule_app.command("add")
 def rule_add(
@@ -725,6 +723,7 @@ def rule_move(
         raise typer.Exit(2) from exc
     console.print(result.detail, markup=False)
 
+
 @rule_app.command("edit")
 def rule_edit(
     rule_id: str = typer.Argument(..., help="Rule ID"),
@@ -778,6 +777,7 @@ def rule_edit(
         raise typer.Exit(2) from exc
     console.print(f"Updated rule {result.changed_rule_id}", markup=False)
 
+
 @rule_app.command("remove")
 def rule_remove(
     rule_id: str = typer.Argument(..., help="Rule ID"),
@@ -802,6 +802,7 @@ def rule_remove(
         err_console.print(f"Rules error: {exc}", markup=False)
         raise typer.Exit(1) from exc
     console.print(f"Removed rule {rule_id}", markup=False)
+
 
 def _execute_rule_run(
     *,
@@ -1311,15 +1312,10 @@ def doctor(
             event_callback=(lambda event: console.print(event, markup=False)) if verbose else None,
         ) as catalog:
             folders = catalog.list_folders(include_counts=False)
-        selectable = tuple(
-            row.name for row in folders if row.selectable and row.name != config_store_folder
-        )
+        selectable = tuple(row.name for row in folders if row.selectable and row.name != config_store_folder)
         selectable_set = set(selectable)
         missing_sources = {
-            source
-            for rule in rules.enabled_rules()
-            for source in rule.source_folders
-            if source not in selectable_set
+            source for rule in rules.enabled_rules() for source in rule.source_folders if source not in selectable_set
         }
         for source in sorted(missing_sources):
             console.print(f"rule source {source}: MISSING or not selectable", markup=False)
@@ -1332,9 +1328,7 @@ def doctor(
                 dict.fromkeys(
                     rule.destination
                     for rule in active_rules
-                    if rule.action is RuleAction.MOVE
-                    and rule.destination is not None
-                    and rule.destination != folder
+                    if rule.action is RuleAction.MOVE and rule.destination is not None and rule.destination != folder
                 )
             )
             requires_delete = any(rule.action is RuleAction.DELETE for rule in active_rules)
@@ -1400,6 +1394,7 @@ def doctor(
         raise typer.Exit(1)
     console.print("result: IMAP connection and rule preflight are healthy", markup=False)
 
+
 @app.command()
 def clean(
     folder: str = typer.Argument(..., help="Source folder to process with the unified rules system"),
@@ -1454,7 +1449,7 @@ def _print_processing_message(message: ProcessedMessage, *, preview: bool) -> No
         if plan.configured_action is RuleAction.KEEP:
             action = "KEEP"
         elif plan.configured_action is RuleAction.MOVE:
-            action = ("WOULD MOVE" if preview else "MOVED" if message.confirmed else "MOVE NOT CONFIRMED")
+            action = "WOULD MOVE" if preview else "MOVED" if message.confirmed else "MOVE NOT CONFIRMED"
         elif message.outcome == "blocked":
             action = "DELETE BLOCKED"
         else:
@@ -1491,8 +1486,19 @@ def progress_list(
     runs = progress.list_runs()
     table = Table(title="Routing progress")
     for column in (
-        "Folder", "Mode", "Scope", "Sort", "Status", "Cursor", "Scanned", "Acted", "Moved",
-        "Deleted", "Kept", "Errors", "Run",
+        "Folder",
+        "Mode",
+        "Scope",
+        "Sort",
+        "Status",
+        "Cursor",
+        "Scanned",
+        "Acted",
+        "Moved",
+        "Deleted",
+        "Kept",
+        "Errors",
+        "Run",
     ):
         table.add_column(column)
     for run in runs:
@@ -1575,8 +1581,6 @@ def progress_reset(
     console.print(f"Deleted {deleted} progress run(s) for {folder}.", markup=False)
 
 
-
-
 @app.command("explain")
 def explain(
     uid: int = typer.Argument(..., help="Folder-scoped message UID"),
@@ -1614,8 +1618,6 @@ def ui(
     from .tui.app import run
 
     run(config)
-
-
 
 
 def _print_failure(exc: Exception, *, debug: bool, command: str | None = None) -> None:

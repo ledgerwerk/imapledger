@@ -71,10 +71,15 @@ def test_begin_run_resumes_same_identity_and_preserves_stable_high_watermark(tmp
 def test_changed_fingerprint_supersedes_old_run_and_starts_new_identity(tmp_path) -> None:
     store = ProgressStore(tmp_path / "progress.sqlite3")
     old = _begin(store)
-    store.record_result(old.id, uid=9, outcome="moved",
+    store.record_result(
+        old.id,
+        uid=9,
+        outcome="moved",
         configured_action=RuleAction.MOVE,
         applied=True,
-        confirmed=True, winner_rule_id="invoice")
+        confirmed=True,
+        winner_rule_id="invoice",
+    )
 
     current = _begin(store, fingerprint="fingerprint-b", high_watermark_uid=120)
 
@@ -212,7 +217,6 @@ def test_progress_rejects_results_outside_high_watermark_and_unsafe_error_detail
         store.record_result(run.id, uid=11, outcome="no_match")
     with pytest.raises(ProgressStoreError, match="short identifier"):
         store.record_result(run.id, uid=9, outcome="error", error_code="MAIL BODY SECRET: content")
-
 
 
 def test_schema_two_progress_database_migrates_action_results_and_counters(tmp_path) -> None:

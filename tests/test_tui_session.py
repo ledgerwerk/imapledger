@@ -19,7 +19,12 @@ from imapledger.credentials import CredentialStatus, ResolvedCredential
 from imapledger.mailbox import FolderInfo
 from imapledger.tui.app import MailReviewApp
 from imapledger.tui.session import AppSession, SessionState
-from imapledger.tui.system_screens import ConnectDialog, CredentialSetDialog, SetupDialog, SystemScreen
+from imapledger.tui.system_screens import (
+    ConnectDialog,
+    CredentialSetDialog,
+    SetupDialog,
+    SystemScreen,
+)
 
 SETTINGS = Settings(imap=ImapSettings(host="imap.example.org", username="user@example.org"))
 
@@ -143,6 +148,58 @@ def test_disconnected_tui_bootstraps_config_and_connects_after_reload(tmp_path: 
             assert isinstance(app.screen, ConnectDialog)
             app.screen.query_one("#connect-secret", Input).value = "typed-password"
             await pilot.click("#connect-confirm")
+            await pilot.pause(0.3)
+            assert session.status is SessionState.CONNECTED
+            assert app.mail_service is mail
+
+    asyncio.run(scenario())
+
+
+def test_disconnected_tui_setup_and_connect_with_keyboard(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    session = AppSession(config_path)
+    app = MailReviewApp(config_path, session=session)
+
+    async def scenario() -> None:
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, SystemScreen)
+            assert app.focused is app.screen.query_one("#system-setup", Button)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, SetupDialog)
+            assert app.focused is app.screen.query_one("#setup-path", Input)
+
+            app.screen.query_one("#setup-host", Input).value = "imap.example.org"
+            app.screen.query_one("#setup-username", Input).value = "user@example.org"
+            await pilot.press("tab", "tab", "tab", "tab", "tab")
+            assert app.focused is app.screen.query_one("#setup-save", Button)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause(0.3)
+            assert config_path.exists()
+
+            mail = _MailService()
+            action = _Closable()
+            session._credential_resolver = lambda imap, **_kwargs: ResolvedCredential(
+                "not-a-ui-value", AuthSource.PROMPT, imap.username
+            )
+            session._mail_service_factory = lambda *_args: mail
+            session._analysis_service_factory = lambda *_args: object()
+            session._action_service_factory = lambda *_args, **_kwargs: action
+
+            if not isinstance(app.screen, SystemScreen):
+                app.action_system()
+                await pilot.pause()
+            system = app.screen
+            await pilot.press("tab", "tab", "tab")
+            assert app.focused is system.query_one("#system-connect", Button)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, ConnectDialog)
+            assert app.focused is app.screen.query_one("#connect-secret", Input)
+            app.screen.query_one("#connect-secret", Input).value = "typed-password"
+            await pilot.press("tab", "enter")
             await pilot.pause(0.3)
             assert session.status is SessionState.CONNECTED
             assert app.mail_service is mail

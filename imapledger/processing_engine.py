@@ -37,6 +37,7 @@ class ProcessedMessage:
 
     detail: str | None = None
 
+
 @dataclass(frozen=True, slots=True)
 class ProcessingReport:
     run: ProgressRun
@@ -644,11 +645,7 @@ def _plan_matches_run(
     if plan.winner_rule_id is None:
         return plan.configured_action is None and plan.destination is None
     winner = next((rule for rule in candidates if rule.id == plan.winner_rule_id), None)
-    return (
-        winner is not None
-        and winner.action is plan.configured_action
-        and winner.destination == plan.destination
-    )
+    return winner is not None and winner.action is plan.configured_action and winner.destination == plan.destination
 
 
 def _safe_error_code(exc: Exception) -> str:

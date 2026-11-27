@@ -6,11 +6,11 @@ Rules apply to all selectable source folders by default. Set `source_folders` to
 
 ## Rule types and actions
 
-| Type | Behavior |
-| --- | --- |
+| Type       | Behavior                                                                                                                              |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `semantic` | Match a description using the semantic evaluator and optional `match_at` threshold. Safe deterministic matchers can also be attached. |
-| `header` | Match deterministic message-header fields without a model call. At least one matcher is required. |
-| `recipe` | Use a named evaluator from the shared recipe catalog, optionally with recipe-specific options. |
+| `header`   | Match deterministic message-header fields without a model call. At least one matcher is required.                                     |
+| `recipe`   | Use a named evaluator from the shared recipe catalog, optionally with recipe-specific options.                                        |
 
 A rule action is one of:
 

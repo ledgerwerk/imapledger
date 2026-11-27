@@ -10,35 +10,41 @@ The TUI is the interactive frontend for mailbox browsing, unified rules, progres
 
 ## Keyboard shortcuts
 
-| Key                    | Action                                                            |
-| ---------------------- | ----------------------------------------------------------------- |
-| Left / `H`             | Focus the previous pane                                           |
-| Right / `L`            | Focus the next pane                                               |
-| Tab / Shift+Tab        | Cycle focus through panes                                         |
-| Up / Down or `k` / `j` | Move through folders or messages; scroll detail                   |
-| Home / End             | Move to the first or last item or top or bottom of detail         |
-| PageUp / PageDown      | Page through the focused pane                                     |
-| `x`                    | Preview rules on 10 messages in the selected folder               |
-| `X`                    | Open multi-folder rule preview/apply options                      |
-| `c`                    | Evaluate rules for the selected message                           |
-| `e`                    | Explain the current evaluation without rerunning it               |
-| `l`                    | Learn a matcher for an existing semantic rule                     |
+| Key                    | Action                                                                |
+| ---------------------- | --------------------------------------------------------------------- |
+| Left / `H`             | Focus the previous pane                                               |
+| Right / `L`            | Focus the next pane                                                   |
+| Tab / Shift+Tab        | Cycle focus through panes                                             |
+| Up / Down or `k` / `j` | Move through folders or messages; scroll detail                       |
+| Home / End             | Move to the first or last item or top or bottom of detail             |
+| PageUp / PageDown      | Page through the focused pane                                         |
+| `x`                    | Preview rules on 10 messages in the selected folder                   |
+| `X`                    | Open multi-folder rule preview/apply options                          |
+| `c`                    | Evaluate rules for the selected message                               |
+| `e`                    | Explain the current evaluation without rerunning it                   |
+| `l`                    | Learn a matcher for an existing semantic rule                         |
 | `a`                    | Apply the displayed MOVE or authorized DELETE plan after confirmation |
-| `R`                    | Open the unified Rules workbench                                  |
-| `p` / `d`              | Inspect routing progress / open system diagnostics             |
-| `s`                    | Open System for setup, connection, credentials, and config        |
-| `:`                    | Open Command Center and search available operations               |
-| `G`                    | Open Config Ledger                                                |
-| `i` / `I`              | Analyze embedded images / review remote images after confirmation |
-| `r`                    | Refresh                                                           |
-| `h` / `?`              | Open keyboard help                                                |
-| `q`                    | Quit                                                              |
+| `R`                    | Open the unified Rules workbench                                      |
+| `p` / `d`              | Inspect routing progress / open system diagnostics                    |
+| `s`                    | Open System for setup, connection, credentials, and config            |
+| `:`                    | Open Command Center and search available operations                   |
+| `G`                    | Open Config Ledger                                                    |
+| `i` / `I`              | Analyze embedded images / review remote images after confirmation     |
+| `r`                    | Refresh                                                               |
+| `h` / `?`              | Open keyboard help                                                    |
+| `q`                    | Quit                                                                  |
 
 The focused pane has a highlighted border. Pane navigation follows the widget currently holding focus, including focus reached with the mouse.
 
+## Popup keyboard navigation
+
+Popups show a keyboard hint. Use Tab and Shift+Tab to move through visible, enabled controls. Lists and tables support arrow-key selection, and Enter activates the focused control. Escape cancels or closes the popup when supported. Secret entry fields are cleared when their dialog is cancelled.
+
+Confirmation screens focus Cancel or Close first. Enter activates only the focused control, so it does not confirm a destructive or committing action by default. Move focus to the explicit action before confirming. While a popup is open, its keyboard navigation takes precedence over main-pane shortcuts; outside popups, `H` and `L` still move between panes.
+
 ## Rule preview and apply
 
-`x` previews the next 10 messages in the selected real folder. Preview is read-only. `X` opens rule-run options for selecting one or more folders or all selectable folders, setting a limit and ordering, and choosing preview or apply. Config Ledger and non-selectable folders are excluded. Apply performs read-only preflight before explicit confirmation and shows whether Delete actions are authorized. The job screen streams safe results and supports cooperative cancellation.
+`x` previews the next 10 messages in the selected real folder. Preview is read-only. `X` opens rule-run options for selecting one or more folders or all selectable folders, setting a limit and choosing oldest or newest order (oldest by default), and choosing preview or apply. Config Ledger and non-selectable folders are excluded. Apply performs read-only preflight before explicit confirmation and shows whether Delete actions are authorized. The job screen streams safe results and supports cooperative cancellation.
 
 Batch work uses the same rule-run operation as the CLI. Apply rechecks source and MOVE destinations, current rules, UIDVALIDITY, exact UIDs, and progress identity before executing actions. No-match and KEEP leave messages in place. A message already in its destination is reported as already there without MOVE.
 

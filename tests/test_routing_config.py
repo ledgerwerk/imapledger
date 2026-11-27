@@ -126,13 +126,11 @@ def test_move_destination_shorthand_is_inferred_and_rendered_explicitly() -> Non
         ('id = "x"\ntype = "recipe"\naction = "keep"', "requires a valid recipe ID"),
         ('id = "x"\ntype = "semantic"\ndescription = "x"', "requires an action or destination"),
         (
-            'id = "x"\ntype = "semantic"\naction = "keep"\n'
-            'description = "x"\ndestination = "X"',
+            'id = "x"\ntype = "semantic"\naction = "keep"\ndescription = "x"\ndestination = "X"',
             "must not have a destination",
         ),
         (
-            'id = "x"\ntype = "semantic"\naction = "delete"\n'
-            'destination = "X"\ndescription = "x"',
+            'id = "x"\ntype = "semantic"\naction = "delete"\ndestination = "X"\ndescription = "x"',
             "must not have a destination",
         ),
         ('id = "x"\ntype = "semantic"\naction = "move"\ndescription = "x"', "requires a non-empty destination"),
@@ -151,7 +149,7 @@ def test_recipe_config_rejects_unsupported_options(tmp_path: Path) -> None:
     path.write_text(
         '[rules]\nschema = 4\n\n[[rules.rule]]\nid = "spam"\ntype = "recipe"\n'
         'recipe = "spam"\naction = "keep"\n\n[rules.rule.options]\n'
-        'delete_safe_at = 0.88\n',
+        "delete_safe_at = 0.88\n",
         encoding="utf-8",
     )
 
@@ -213,7 +211,6 @@ def test_fingerprint_tracks_rule_behavior_and_shared_evidence() -> None:
     )
 
 
-
 def test_recipe_fingerprint_tracks_recipe_revision(monkeypatch: pytest.MonkeyPatch) -> None:
     from dataclasses import replace
 
@@ -232,10 +229,9 @@ def test_recipe_fingerprint_tracks_recipe_revision(monkeypatch: pytest.MonkeyPat
 
     assert rules_fingerprint(rules) != original
 
+
 def test_content_fingerprint_tracks_disabled_rules_and_reordering() -> None:
-    disabled = RoutingRule(
-        "later", False, RuleType.RECIPE, action=RuleAction.KEEP, recipe="spam"
-    )
+    disabled = RoutingRule("later", False, RuleType.RECIPE, action=RuleAction.KEEP, recipe="spam")
     first = RuleSet((_semantic("newsletter", "INBOX.Newsletter"), disabled))
     reordered = RuleSet((disabled, _semantic("newsletter", "INBOX.Newsletter")))
 
@@ -244,16 +240,26 @@ def test_content_fingerprint_tracks_disabled_rules_and_reordering() -> None:
 
 def test_move_destinations_and_config_store_protection_ignore_keep_delete() -> None:
     keep = RoutingRule(
-        "keep", True, RuleType.HEADER, action=RuleAction.KEEP,
+        "keep",
+        True,
+        RuleType.HEADER,
+        action=RuleAction.KEEP,
         match_any=(RuleMatch(from_domain="a.example"),),
     )
     delete = RoutingRule(
-        "delete", True, RuleType.HEADER, action=RuleAction.DELETE,
+        "delete",
+        True,
+        RuleType.HEADER,
+        action=RuleAction.DELETE,
         match_any=(RuleMatch(from_domain="b.example"),),
     )
     move = RoutingRule(
-        "move", True, RuleType.HEADER, action=RuleAction.MOVE,
-        destination="INBOX.News", match_any=(RuleMatch(from_domain="c.example"),),
+        "move",
+        True,
+        RuleType.HEADER,
+        action=RuleAction.MOVE,
+        destination="INBOX.News",
+        match_any=(RuleMatch(from_domain="c.example"),),
     )
     rules = RuleSet((keep, delete, move))
 
@@ -300,8 +306,6 @@ def test_schema_three_migration_converts_spam_to_an_ordinary_recipe(tmp_path: Pa
     assert applied.applied is True
     assert load_routing_rules(path) == applied.rules
     assert "schema = 4" in path.read_text(encoding="utf-8")
-
-
 
 
 def test_schema_one_migration_converts_rules_and_schema_two_match_to_match_any(tmp_path: Path) -> None:

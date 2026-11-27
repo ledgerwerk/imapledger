@@ -247,7 +247,6 @@ class MessageSelection:
     offset: int = 0
     sort: MessageSort = MessageSort.NEWEST
 
-
     def __post_init__(self) -> None:
         if self.limit is not None and self.limit < 1:
             raise ValueError("limit must be positive")
@@ -622,7 +621,6 @@ class ScopedMailbox:
             uidvalidity = _uidvalidity(selected)
             uidnext = _uidnext(selected) if self._cursor_oriented else None
 
-
             self._emit(f"uidvalidity={uidvalidity}")
 
             uids = self._initial_uid_snapshot(client, selected)
@@ -637,8 +635,6 @@ class ScopedMailbox:
         self._snapshot = MailboxSnapshot(
             uidvalidity=uidvalidity,
             uids=uids,
-
-
             uidnext=uidnext,
         )
         self._capabilities = normalized_capabilities
@@ -905,7 +901,6 @@ class ScopedMailbox:
                     )
         return tuple(items[uid] for uid in requested)
 
-
     def fetch_headers(self, uid: int) -> MailMessage | None:
         self._validate_snapshot_uid(uid)
         client = self._reselect_source(operation="imap_fetch_headers_select")
@@ -985,7 +980,6 @@ class ScopedMailbox:
                 summaries[uid] = parse_summary(uid, raw_headers, flags=flags, size_bytes=size)
         return tuple(summaries[uid] for uid in requested)
 
-
     def _validate_snapshot_uid(self, uid: int) -> None:
         if isinstance(uid, bool) or not isinstance(uid, int) or uid < 1:
             raise ValueError("uid must be a positive integer")
@@ -1005,8 +999,6 @@ class ScopedMailbox:
                 uids=(uid,),
             ) from exc
         return uid in {int(found_uid) for found_uid in found}
-
-
 
     def _reselect_source(self, *, readonly: bool | None = None, operation: str) -> _Client:
         client, _ = self._reselect_source_with_response(readonly=readonly, operation=operation)
@@ -1650,8 +1642,6 @@ def _operation_error(
     )
 
 
-
-
 def _uidvalidity(selected: dict[bytes, Any]) -> int:
     value = selected.get(b"UIDVALIDITY")
     if value is None:
@@ -1718,7 +1708,6 @@ def _skipped_summary(uid: int, reason: str) -> MailSummary:
         message_id="",
         size_bytes=None,
         flags=frozenset(),
-
         skip_reason=reason,
     )
 
@@ -1861,7 +1850,6 @@ class BrowserMailbox:
                 summaries.append(_skipped_summary(uid, "message summary unavailable"))
         return tuple(summaries)
 
-
     def fetch_summaries(self, uids: Sequence[int]) -> tuple[MailSummary, ...]:
         if not uids:
             return ()
@@ -1938,6 +1926,7 @@ class BrowserMailbox:
             return MailboxItem(uid, skip_reason="message body unavailable")
         message = parse_message(uid, raw, max_body_chars=self._max_body_chars, size_bytes=size)
         return MailboxItem(uid, message=message)
+
     def _require_client(self) -> _Client:
         if self._client is None:
             raise MailboxError("browser mailbox is not open")
@@ -1973,7 +1962,5 @@ class ReadOnlyMailbox:
     def fetch_summaries(self, uids: Sequence[int]) -> tuple[MailSummary, ...]:
         return self.__mailbox.fetch_summaries(uids)
 
-
     def fetch_uid(self, uid: int) -> MailboxItem:
         return self.__mailbox.fetch_uid(uid)
-

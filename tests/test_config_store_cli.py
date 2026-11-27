@@ -255,6 +255,7 @@ def test_doctor_checks_config_store_folder_read_only(monkeypatch, tmp_path, stor
             if store_exists:
                 names.append(store_folder)
             return tuple(SimpleNamespace(name=name, selectable=True) for name in names)
+
     monkeypatch.setattr(cli_module, "load_settings", lambda path: settings)
     monkeypatch.setattr(cli_module, "load_routing_rules", lambda path: RoutingRuleSet())
     monkeypatch.setattr(cli_module, "FolderCatalog", lambda **kwargs: FakeFolderCatalog())

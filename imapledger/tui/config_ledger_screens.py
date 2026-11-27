@@ -5,10 +5,10 @@ from pathlib import Path
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, DataTable, Input, Label, Select, Static
 
 from ..config_ledger import ConfigPullPreview, ConfigToolSummary, ConfigVersionRecord
+from .modal import KeyboardModalScreen
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +26,7 @@ class ConfigPullRequest:
     target: str | None
 
 
-class ConfigLedgerScreen(ModalScreen[tuple[str, str] | None]):
+class ConfigLedgerScreen(KeyboardModalScreen[tuple[str, str] | None]):
     BINDINGS = [("escape", "close", "Close")]
     CSS = """
     ConfigLedgerScreen { align: center middle; }
@@ -65,6 +65,7 @@ class ConfigLedgerScreen(ModalScreen[tuple[str, str] | None]):
                 yield Button("Close", id="ledger-close")
 
     def on_mount(self) -> None:
+        super().on_mount()
         table = self.query_one("#config-ledger-table", DataTable)
         table.add_columns("Tool", "Versions", "Status", "Current", "Default path")
         for summary in self.summaries:
@@ -78,6 +79,7 @@ class ConfigLedgerScreen(ModalScreen[tuple[str, str] | None]):
             )
         if self.summaries:
             table.move_cursor(row=0)
+        table.focus()
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         tool = event.row_key.value if event.row_key is not None else None
@@ -128,7 +130,7 @@ class ConfigLedgerScreen(ModalScreen[tuple[str, str] | None]):
         self.dismiss(None)
 
 
-class ConfigVersionsScreen(ModalScreen[tuple[str, str, str] | None]):
+class ConfigVersionsScreen(KeyboardModalScreen[tuple[str, str, str] | None]):
     BINDINGS = [("escape", "close", "Close")]
     CSS = """
     ConfigVersionsScreen { align: center middle; }
@@ -156,6 +158,7 @@ class ConfigVersionsScreen(ModalScreen[tuple[str, str, str] | None]):
                 yield Button("Close", id="version-close")
 
     def on_mount(self) -> None:
+        super().on_mount()
         table = self.query_one("#config-versions-table", DataTable)
         table.add_columns("Current", "Version", "Created", "SHA256", "Size", "Default path", "Parents")
         for record in self.versions:
@@ -173,6 +176,7 @@ class ConfigVersionsScreen(ModalScreen[tuple[str, str, str] | None]):
             )
         if self.versions:
             table.move_cursor(row=0)
+        table.focus()
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         version_id = event.row_key.value if event.row_key is not None else None
@@ -214,7 +218,7 @@ class ConfigVersionsScreen(ModalScreen[tuple[str, str, str] | None]):
         self.dismiss(None)
 
 
-class ConfigPushDialog(ModalScreen[ConfigPushRequest | None]):
+class ConfigPushDialog(KeyboardModalScreen[ConfigPushRequest | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     ConfigPushDialog { align: center middle; }
@@ -245,6 +249,11 @@ class ConfigPushDialog(ModalScreen[ConfigPushRequest | None]):
                 yield Button("Review push…", id="config-push-review", variant="primary")
                 yield Button("Cancel", id="config-push-cancel")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        field_id = "#config-push-path" if self.tool.strip() else "#config-push-tool"
+        self.query_one(field_id, Input).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "config-push-cancel":
             self.dismiss(None)
@@ -266,7 +275,7 @@ class ConfigPushDialog(ModalScreen[ConfigPushRequest | None]):
         self.dismiss(None)
 
 
-class ConfigPushConfirmation(ModalScreen[bool]):
+class ConfigPushConfirmation(KeyboardModalScreen[bool]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     ConfigPushConfirmation { align: center middle; }
@@ -297,6 +306,10 @@ class ConfigPushConfirmation(ModalScreen[bool]):
                 yield Button("Push snapshot", id="config-push-confirm", variant="warning")
                 yield Button("Cancel", id="config-push-confirm-cancel")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#config-push-confirm-cancel", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "config-push-confirm")
 
@@ -304,7 +317,7 @@ class ConfigPushConfirmation(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class ConfigPullDialog(ModalScreen[ConfigPullRequest | None]):
+class ConfigPullDialog(KeyboardModalScreen[ConfigPullRequest | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     ConfigPullDialog { align: center middle; }
@@ -350,6 +363,10 @@ class ConfigPullDialog(ModalScreen[ConfigPullRequest | None]):
                 yield Button("Preview pull…", id="config-pull-preview", variant="primary", disabled=not bool(options))
                 yield Button("Cancel", id="config-pull-cancel")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#config-pull-version", Select).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "config-pull-cancel":
             self.dismiss(None)
@@ -365,7 +382,7 @@ class ConfigPullDialog(ModalScreen[ConfigPullRequest | None]):
         self.dismiss(None)
 
 
-class ConfigPullPreviewScreen(ModalScreen[bool]):
+class ConfigPullPreviewScreen(KeyboardModalScreen[bool]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     ConfigPullPreviewScreen { align: center middle; }
@@ -410,6 +427,10 @@ class ConfigPullPreviewScreen(ModalScreen[bool]):
                 )
                 yield Button("Cancel", id="config-pull-cancel")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#config-pull-cancel", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "config-pull-apply")
 
@@ -417,7 +438,7 @@ class ConfigPullPreviewScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class ConfigTextScreen(ModalScreen[None]):
+class ConfigTextScreen(KeyboardModalScreen[None]):
     BINDINGS = [("escape", "close", "Close")]
     CSS = """
     ConfigTextScreen { align: center middle; }
@@ -439,6 +460,10 @@ class ConfigTextScreen(ModalScreen[None]):
             with VerticalScroll():
                 yield Static(self.body or "No differences.", id="config-text-body", markup=False)
             yield Button("Close", id="config-text-close")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#config-text-close", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(None)

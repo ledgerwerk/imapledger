@@ -84,6 +84,7 @@ class MessageResult:
     configured_action: RuleAction | None = None
     detail: str | None = None
 
+
 def default_progress_path() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME")
     base = Path(state_home) if state_home else Path.home() / ".local" / "state"
@@ -389,8 +390,7 @@ class ProgressStore:
         run = self.get_run(run_id)
         order = "ASC" if run.sort_direction == "oldest" else "DESC"
         query = (
-            "SELECT * FROM message_results WHERE run_id = ? "
-            f"AND outcome IN ('error', 'blocked') ORDER BY uid {order}"
+            f"SELECT * FROM message_results WHERE run_id = ? AND outcome IN ('error', 'blocked') ORDER BY uid {order}"
         )
         values: tuple[object, ...] = (run_id,)
         if limit is not None:
@@ -573,6 +573,7 @@ class ProgressStore:
             connection.commit()
         finally:
             connection.close()
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
@@ -681,6 +682,7 @@ def _result_counts(result: sqlite3.Row | MessageResult) -> tuple[int, int, int, 
         int(outcome == "no_match"),
         int(is_error),
     )
+
 
 def _advance_cursor(current: int | None, uid: int, direction: SortDirection) -> int:
     if current is None:

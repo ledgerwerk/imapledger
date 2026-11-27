@@ -9,13 +9,24 @@ import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, ListItem, ListView, Static
+from textual.widgets import (
+    Button,
+    Checkbox,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    Select,
+    Static,
+)
 
 from ..application import (
     OPERATION_BY_ID,
@@ -48,7 +59,7 @@ from ..mailbox import FolderInfo, MessageSort, ProcessingMailbox
 from ..message import MailSummary
 from ..preflight import SourcePreflightResult, preflight_source
 from ..processing_engine import ProcessedMessage, ProcessingReport
-from ..progress_store import MessageResult, ProgressRun
+from ..progress_store import MessageResult, ProgressRun, SortDirection
 from ..remote_images import RemoteImageLoader
 from ..routing_action_service import RoutingActionReceipt
 from ..routing_actions import RuleAction
@@ -69,6 +80,7 @@ from .config_ledger_screens import (
     ConfigTextScreen,
     ConfigVersionsScreen,
 )
+from .modal import KeyboardModalScreen
 from .rule_screens import (
     RoutingRuleCenterScreen,
     RoutingRuleEditorScreen,
@@ -128,8 +140,7 @@ class FolderListItem(ListItem):
         self.folder_name = folder_name
 
 
-
-class ApplyConfirmation(ModalScreen[tuple[bool, bool]]):
+class ApplyConfirmation(KeyboardModalScreen[tuple[bool, bool]]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
     CSS = """
     ApplyConfirmation { align: center middle; }
@@ -168,6 +179,10 @@ class ApplyConfirmation(ModalScreen[tuple[bool, bool]]):
                 )
                 yield Button("Cancel", id="cancel")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#cancel", Button).focus()
+
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         if event.checkbox.id == "apply-delete-authorized":
             self.query_one("#apply", Button).disabled = not event.checkbox.value
@@ -176,17 +191,18 @@ class ApplyConfirmation(ModalScreen[tuple[bool, bool]]):
         if event.button.id == "cancel":
             self.dismiss((False, False))
             return
-        allow_delete = self.plan.configured_action is RuleAction.DELETE and self.query_one(
-            "#apply-delete-authorized", Checkbox
-        ).value
+        allow_delete = (
+            self.plan.configured_action is RuleAction.DELETE
+            and self.query_one("#apply-delete-authorized", Checkbox).value
+        )
         self.dismiss((True, allow_delete))
 
     def action_cancel(self) -> None:
         self.dismiss((False, False))
 
 
-
-class ProgressScreen(ModalScreen[tuple[str, ProgressRun] | None]):
+class ProgressScreen(KeyboardModalScreen[tuple[str, ProgressRun] | None]):
+    BINDINGS = [Binding("escape", "close", "Close")]
     CSS = """
     ProgressScreen { align: center middle; }
     #progress-box { width: 94%; height: 88%; border: round $accent; padding: 1 2; background: $surface; }
@@ -221,6 +237,7 @@ class ProgressScreen(ModalScreen[tuple[str, ProgressRun] | None]):
                 yield Button("Close", id="progress-close")
 
     def on_mount(self) -> None:
+        super().on_mount()
         table = self.query_one("#progress-runs", DataTable)
         table.add_columns("Folder", "Mode", "Rule", "Sort", "Status", "Cursor", "Scanned", "Errors", "Run")
         for index, run in enumerate(self.runs):
@@ -241,6 +258,8 @@ class ProgressScreen(ModalScreen[tuple[str, ProgressRun] | None]):
             table.move_cursor(row=0)
         else:
             self.query_one("#progress-detail", Static).update("No progress runs are recorded for this account.")
+
+        table.focus()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "progress-runs":
@@ -266,6 +285,9 @@ class ProgressScreen(ModalScreen[tuple[str, ProgressRun] | None]):
         self.query_one("#progress-retry", Button).disabled = not has_errors
         self.query_one("#progress-reset", Button).disabled = False
 
+    def action_close(self) -> None:
+        self.dismiss(None)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "progress-view-errors" and self.selected is not None:
             errors = self.errors.get(self.selected.id, ())
@@ -282,7 +304,8 @@ class ProgressScreen(ModalScreen[tuple[str, ProgressRun] | None]):
             self.dismiss(("retry", self.selected))
 
 
-class ProgressErrorsScreen(ModalScreen[bool | None]):
+class ProgressErrorsScreen(KeyboardModalScreen[bool | None]):
+    BINDINGS = [Binding("escape", "close", "Close")]
     CSS = """
     ProgressErrorsScreen { align: center middle; }
     #progress-errors-box { width: 80%; height: 82%; border: round $accent; padding: 1 2; background: $surface; }
@@ -305,10 +328,16 @@ class ProgressErrorsScreen(ModalScreen[bool | None]):
                 yield Button("Close", id="progress-errors-close")
 
     def on_mount(self) -> None:
+        super().on_mount()
         table = self.query_one("#progress-error-table", DataTable)
         table.add_columns("UID", "Error code")
         for error in self.errors:
             table.add_row(str(error.uid), error.error_code or "unknown")
+
+        table.focus()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "progress-errors-retry":
@@ -317,7 +346,8 @@ class ProgressErrorsScreen(ModalScreen[bool | None]):
             self.dismiss(None)
 
 
-class ProgressResetConfirmation(ModalScreen[bool]):
+class ProgressResetConfirmation(KeyboardModalScreen[bool]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
     CSS = """
     ProgressResetConfirmation { align: center middle; }
     #progress-reset-box { width: 70; height: auto; border: round $warning; padding: 1 2; background: $surface; }
@@ -341,11 +371,19 @@ class ProgressResetConfirmation(ModalScreen[bool]):
                 yield Button("Cancel", id="progress-reset-cancel")
                 yield Button("Delete progress", id="progress-reset-confirm", variant="error")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#progress-reset-cancel", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "progress-reset-confirm")
 
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
-class DoctorScreen(ModalScreen[None]):
+
+class DoctorScreen(KeyboardModalScreen[None]):
+    BINDINGS = [Binding("escape", "close", "Close")]
     CSS = """
     DoctorScreen { align: center middle; }
     #doctor-box { width: 94%; height: 88%; border: round $accent; padding: 1 2; background: $surface; }
@@ -367,6 +405,7 @@ class DoctorScreen(ModalScreen[None]):
                 yield Button("Close", id="doctor-close")
 
     def on_mount(self) -> None:
+        super().on_mount()
         table = self.query_one("#doctor-table", DataTable)
         table.add_columns("Folder", "Source", "Capabilities", "Destinations", "Probe", "Errors", "Result")
         for result in self.results:
@@ -397,12 +436,18 @@ class DoctorScreen(ModalScreen[None]):
         if not self.results:
             self.query_one("#doctor-summary", Static).update("No configured source folders to diagnose.")
 
+        self.query_one("#doctor-close", Button).focus()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "doctor-close":
             self.dismiss()
 
 
-class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
+class RuleRunDialog(KeyboardModalScreen[RuleRunRequest | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
     CSS = """
     RuleRunDialog { align: center middle; }
     #rule-run-box { width: 76; height: auto; border: round $accent; padding: 1 2; background: $surface; }
@@ -428,7 +473,15 @@ class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
             yield Label("Message limit")
             yield Input(value="10", placeholder="Unlimited", id="rule-run-limit")
             yield Label("Sort order")
-            yield Input(value="oldest", id="rule-run-sort")
+            yield Select(
+                [
+                    ("Oldest first", "oldest"),
+                    ("Newest first", "newest"),
+                ],
+                value="oldest",
+                allow_blank=False,
+                id="rule-run-sort",
+            )
             yield Checkbox("Apply rules", value=self.default_apply, id="rule-run-apply")
             yield Checkbox("Explicitly authorize configured DELETE actions", id="rule-run-allow-delete")
             yield Checkbox("Start a new run", id="rule-run-new-run")
@@ -442,10 +495,22 @@ class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
                 yield Button("Cancel", id="rule-run-cancel")
 
     def on_mount(self) -> None:
+        super().on_mount()
         self._update_command()
+        self.query_one("#rule-run-rule", Input).focus()
 
     def on_input_changed(self, _event: Input.Changed) -> None:
         self._update_command()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "rule-run-sort":
+            self._update_command()
+
+    def _selected_sort(self) -> SortDirection:
+        value = self.query_one("#rule-run-sort", Select).value
+        if value not in {"oldest", "newest"}:
+            raise ValueError("Choose a sort order.")
+        return cast(SortDirection, value)
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         if event.checkbox.id == "rule-run-apply" and not event.checkbox.value:
@@ -458,7 +523,7 @@ class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
             limit = int(limit_text) if limit_text else None
         except ValueError as exc:
             raise ValueError("Limit must be a positive integer or blank for unlimited.") from exc
-        sort = self.query_one("#rule-run-sort", Input).value.strip().lower() or "oldest"
+        sort = self._selected_sort()
         apply = self.query_one("#rule-run-apply", Checkbox).value
         allow_delete = apply and self.query_one("#rule-run-allow-delete", Checkbox).value
         return RuleRunRequest(
@@ -486,7 +551,7 @@ class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
         rule = self.query_one("#rule-run-rule", Input).value.strip()
         if rule:
             parts.extend(("--rule", shlex.quote(rule)))
-        sort = self.query_one("#rule-run-sort", Input).value.strip().lower() or "oldest"
+        sort = self._selected_sort()
         parts.extend(("--sort", shlex.quote(sort)))
         if self.query_one("#rule-run-new-run", Checkbox).value:
             parts.append("--new-run")
@@ -507,6 +572,9 @@ class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
         else:
             self.query_one("#rule-run-error", Static).update("")
 
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "rule-run-cancel":
             self.dismiss(None)
@@ -519,7 +587,8 @@ class RuleRunDialog(ModalScreen[RuleRunRequest | None]):
         self.dismiss(request)
 
 
-class RuleRunPreflightScreen(ModalScreen[str | None]):
+class RuleRunPreflightScreen(KeyboardModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "close", "Close")]
     CSS = """
     RuleRunPreflightScreen { align: center middle; }
     #rule-run-preflight-box { width: 76; height: auto; border: round $warning; padding: 1 2; background: $surface; }
@@ -539,11 +608,19 @@ class RuleRunPreflightScreen(ModalScreen[str | None]):
             with Horizontal(id="rule-run-preflight-buttons"):
                 yield Button("Close", id="rule-run-preflight-cancel")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#rule-run-preflight-cancel", Button).focus()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss()
 
 
-class RuleRunApplyConfirmation(ModalScreen[bool]):
+class RuleRunApplyConfirmation(KeyboardModalScreen[bool]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
     CSS = """
     RuleRunApplyConfirmation { align: center middle; }
     #rule-run-confirm-box { width: 78; height: auto; border: round $warning; padding: 1 2; background: $surface; }
@@ -578,11 +655,19 @@ class RuleRunApplyConfirmation(ModalScreen[bool]):
                     variant="error",
                 )
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#rule-run-confirm-cancel", Button).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "rule-run-confirm-apply")
 
 
-class RuleRunJobScreen(ModalScreen[None]):
+class RuleRunJobScreen(KeyboardModalScreen[None]):
+    BINDINGS = [Binding("escape", "close", "Close")]
     CSS = """
     RuleRunJobScreen { align: center middle; }
     #rule-run-job-box { width: 94%; height: 88%; border: round $accent; padding: 1 2; background: $surface; }
@@ -623,9 +708,11 @@ class RuleRunJobScreen(ModalScreen[None]):
                 yield Button("Close", id="rule-run-job-close", disabled=True)
 
     def on_mount(self) -> None:
+        super().on_mount()
         self.query_one("#rule-run-job-table", DataTable).add_columns(
             "UID", "Result", "Rule", "Destination", "Action", "Error"
         )
+        self.query_one("#rule-run-job-table", DataTable).focus()
         self._table_ready = True
         self._update_summary()
         pending_results = self._pending_results
@@ -679,6 +766,15 @@ class RuleRunJobScreen(ModalScreen[None]):
         )
         self._update_summary()
 
+    def _enable_close_button(self) -> None:
+        cancel = self.query_one("#rule-run-job-cancel", Button)
+        close = self.query_one("#rule-run-job-close", Button)
+        move_focus = cancel.has_focus
+        close.disabled = False
+        cancel.disabled = True
+        if move_focus:
+            close.focus()
+
     def finish(self, result: RuleRunFolderResult) -> None:
         if not self._table_ready:
             self._pending_finish = result
@@ -704,8 +800,7 @@ class RuleRunJobScreen(ModalScreen[None]):
         else:
             self._status = "completed"
         self._update_summary()
-        self.query_one("#rule-run-job-close", Button).disabled = False
-        self.query_one("#rule-run-job-cancel", Button).disabled = True
+        self._enable_close_button()
         run = report.run
         self.query_one("#rule-run-job-summary", Static).update(
             self._summary() + f"\nRun total scanned: {run.scanned_count}    Cursor: {run.cursor_uid or '-'}    "
@@ -722,8 +817,7 @@ class RuleRunJobScreen(ModalScreen[None]):
             return
         self._status = "cancelled/stopped by user"
         self._update_summary()
-        self.query_one("#rule-run-job-close", Button).disabled = False
-        self.query_one("#rule-run-job-cancel", Button).disabled = True
+        self._enable_close_button()
 
     def fail(self, error: ErrorPresentation) -> None:
         if not self._table_ready:
@@ -734,20 +828,24 @@ class RuleRunJobScreen(ModalScreen[None]):
         self.query_one("#rule-run-job-error", Static).update(
             f"{error.title}\n{error.detail}" + (f"\nNext: {error.hint}" if error.hint else "")
         )
-        self.query_one("#rule-run-job-close", Button).disabled = False
-        self.query_one("#rule-run-job-cancel", Button).disabled = True
+        self._enable_close_button()
+
+    def action_close(self) -> None:
+        if self._status != "running":
+            self.dismiss()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "rule-run-job-cancel":
             self.cancel_event.set()
             event.button.disabled = True
             event.button.label = "Cancellation requested"
+            self.query_one("#rule-run-job-table", DataTable).focus()
             return
         if event.button.id == "rule-run-job-close":
             self.dismiss()
 
 
-class RemoteImageConfirmation(ModalScreen[bool]):
+class RemoteImageConfirmation(KeyboardModalScreen[bool]):
     BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("q", "cancel", "Cancel")]
     CSS = """
     RemoteImageConfirmation { align: center middle; }
@@ -769,6 +867,7 @@ class RemoteImageConfirmation(ModalScreen[bool]):
                 yield Button("Load and analyze", variant="warning", id="load")
 
     def on_mount(self) -> None:
+        super().on_mount()
         self.query_one("#cancel", Button).focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -857,7 +956,7 @@ class MessageDetailView(VerticalScroll):
         self.scroll_page_down()
 
 
-class HelpScreen(ModalScreen[None]):
+class HelpScreen(KeyboardModalScreen[None]):
     BINDINGS = [
         Binding("h", "close_help", "Close help"),
         Binding("escape", "close_help", "Close help"),
@@ -918,6 +1017,15 @@ class HelpScreen(ModalScreen[None]):
                     "require a and explicit confirmation.",
                     markup=False,
                 )
+            yield Button("Close", id="help-close")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#help-close", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "help-close":
+            self.dismiss()
 
     def action_close_help(self) -> None:
         self.dismiss()
@@ -947,9 +1055,9 @@ class MailReviewApp(App[None]):
         Binding("shift+tab", "previous_pane", "Previous pane", priority=True),
         Binding("left", "pane_left", "Previous pane", priority=True),
         Binding("right", "pane_right", "Next pane", priority=True),
-        Binding("H", "pane_left", "Previous pane", priority=True),
-        Binding("L", "pane_right", "Next pane", priority=True),
-        Binding("h", "help", "Help", priority=True),
+        Binding("H", "pane_left", "Previous pane"),
+        Binding("L", "pane_right", "Next pane"),
+        Binding("h", "help", "Help"),
         Binding("?", "help", "Help"),
     ]
     CSS = """
@@ -1146,6 +1254,7 @@ class MailReviewApp(App[None]):
             f"{len(active_rules)} active rule(s).\n\n"
             "Nothing is moved during Preview. Press h for all shortcuts."
         )
+
     def _folder_label(self, folder: FolderInfo) -> str:
         counts = f"  {folder.total}" if folder.total is not None else ""
         unread = f" ({folder.unread} unread)" if folder.unread else ""
@@ -1167,6 +1276,7 @@ class MailReviewApp(App[None]):
 
         for folder in folders:
             self._folder_item_by_name[folder.name].query_one(Label).update(self._folder_label(folder))
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id != "folders" or not isinstance(event.item, FolderListItem):
             return
@@ -1179,6 +1289,7 @@ class MailReviewApp(App[None]):
             exclusive=True,
             exit_on_error=False,
         )
+
     def _begin_folder_load(self, folder: str) -> int:
         self._folder_generation += 1
         self._message_generation += 1
@@ -1239,6 +1350,7 @@ class MailReviewApp(App[None]):
                 )
                 self._render_mail_controls(total=0)
                 self._set_status(f"Could not load {folder}: {type(exc).__name__}")
+
     def _populate_rows(self, rows: tuple[tuple[str, MailSummary], ...]) -> None:
         self._rows = list(rows)
         table = self.query_one("#messages", DataTable)
@@ -1258,6 +1370,7 @@ class MailReviewApp(App[None]):
                 str(summary.size_bytes or "-"),
                 key=str(index),
             )
+
     def _render_mail_controls(self, *, total: int) -> None:
         self.query_one("#mail-previous", Button).disabled = not self._page_has_previous
         self.query_one("#mail-next", Button).disabled = not self._page_has_next
@@ -1271,6 +1384,7 @@ class MailReviewApp(App[None]):
         self.query_one("#mail-apply-rules", Button).disabled = not has_folder
         self.query_one("#mail-open-rules", Button).disabled = self.routing_rule_service is None
         self.query_one("#mail-learn-rule", Button).disabled = self._detail is None or self._detail.item.message is None
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "mail-previous":
             self._change_page(-1)
@@ -1300,7 +1414,6 @@ class MailReviewApp(App[None]):
             return
         self._page_offset = max(0, self._page_offset + direction * self._page_limit)
         self._reload_current_page()
-
 
     def _reload_current_page(self) -> None:
         if self._list_folder is None:
@@ -1659,7 +1772,6 @@ class MailReviewApp(App[None]):
         lines.extend(("", "Next", next_step))
         self.query_one("#analysis", Static).update("\n".join(lines))
 
-
     def action_progress(self) -> None:
         if self.settings is None:
             self._set_status("Progress is unavailable until configuration is loaded.")
@@ -1751,9 +1863,7 @@ class MailReviewApp(App[None]):
             folder = folder_info.name
             rules = self.routing_rules.enabled_rules(folder)
             destinations = tuple(
-                rule.destination
-                for rule in rules
-                if rule.action.value == "move" and rule.destination is not None
+                rule.destination for rule in rules if rule.action.value == "move" and rule.destination is not None
             )
             request = DoctorRequest(
                 folder=folder,
@@ -2524,21 +2634,31 @@ class MailReviewApp(App[None]):
         self.query_one(f"#{self._PANE_IDS[index]}").focus()
 
     def action_next_pane(self) -> None:
+        if isinstance(self.screen, KeyboardModalScreen):
+            self.screen.action_focus_next_control()
+            return
         self._focus_pane((self._focused_pane_index() + 1) % len(self._PANE_IDS))
 
     def action_previous_pane(self) -> None:
+        if isinstance(self.screen, KeyboardModalScreen):
+            self.screen.action_focus_previous_control()
+            return
         self._focus_pane((self._focused_pane_index() - 1) % len(self._PANE_IDS))
 
     def action_pane_left(self) -> None:
+        if isinstance(self.screen, KeyboardModalScreen):
+            return
         self._focus_pane(max(0, self._focused_pane_index() - 1))
 
     def action_pane_right(self) -> None:
+        if isinstance(self.screen, KeyboardModalScreen):
+            return
         self._focus_pane(min(len(self._PANE_IDS) - 1, self._focused_pane_index() + 1))
 
     def action_help(self) -> None:
         if isinstance(self.screen, HelpScreen):
             self.screen.action_close_help()
-        else:
+        elif not isinstance(self.screen, KeyboardModalScreen):
             self.push_screen(HelpScreen())
 
     def _operation_context(self) -> OperationContext:
@@ -2888,7 +3008,6 @@ class MailReviewApp(App[None]):
         body = f"Target: {result.target}\nVersion: {result.version_id}\nWritten: {result.written}"
         self.push_screen(ConfigTextScreen("Config Ledger pull result", body))
         self._config_ledger_mutation_running = False
-
 
     def _ensure_session(self) -> AppSession:
         if self.session is None:

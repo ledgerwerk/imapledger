@@ -155,11 +155,7 @@ class SpamRecipe:
                 ("unsolicited-bulk", "action-safe-corroboration"),
             )
 
-        if (
-            evidence.provider.trusted_spam
-            and action_safe >= options["provider_junk_support_at"]
-            and legitimate < 0.50
-        ):
+        if evidence.provider.trusted_spam and action_safe >= options["provider_junk_support_at"] and legitimate < 0.50:
             return RecipeEvaluation(
                 EvaluationState.MATCH,
                 action_safe,

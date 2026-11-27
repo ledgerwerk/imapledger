@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Static
 
 from ..application.operation_registry import OperationContext, OperationSpec
+from .modal import KeyboardModalScreen
 
 
-class CommandCenterScreen(ModalScreen[str | None]):
+class CommandCenterScreen(KeyboardModalScreen[str | None]):
     BINDINGS = [("escape", "cancel", "Close"), ("enter", "open_selected", "Open")]
     CSS = """
     CommandCenterScreen { align: center middle; }
@@ -42,9 +42,11 @@ class CommandCenterScreen(ModalScreen[str | None]):
                 yield Button("Close", id="command-center-close")
 
     def on_mount(self) -> None:
+        super().on_mount()
         table = self.query_one("#command-center-table", DataTable)
         table.add_columns("Operation", "Availability", "CLI", "TUI partner")
         self._refresh_rows("")
+        self.query_one("#command-center-search", Input).focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "command-center-search":

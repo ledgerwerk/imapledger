@@ -4,7 +4,6 @@ from pathlib import Path
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, ListItem, ListView, Select, Static
 
 from ..application.rules import RuleLearningPreview, RuleMigrationPreview
@@ -14,9 +13,10 @@ from ..routing_models import RoutingRule, RuleType
 from ..routing_models import RuleSet as RoutingRuleSet
 from ..rule_recipes import get_runtime_recipe, list_recipes
 from ..rules import MATCH_FIELDS, RuleMatch, describe_match, validate_rule_id
+from .modal import KeyboardModalScreen
 
 
-class RuleTestResultScreen(ModalScreen[None]):
+class RuleTestResultScreen(KeyboardModalScreen[None]):
     BINDINGS = [("escape", "close", "Close"), ("q", "close", "Close")]
 
     def __init__(self, text: str) -> None:
@@ -27,6 +27,10 @@ class RuleTestResultScreen(ModalScreen[None]):
         yield Static(self.text, markup=False)
         yield Button("Close", id="close")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#close", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss()
 
@@ -34,7 +38,7 @@ class RuleTestResultScreen(ModalScreen[None]):
         self.dismiss()
 
 
-class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
+class RoutingRuleCenterScreen(KeyboardModalScreen[tuple[str, str | None]]):
     BINDINGS = [
         ("escape", "close", "Close"),
         ("n", "new_rule", "New"),
@@ -97,6 +101,7 @@ class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
                 yield Button("Close", id="close")
 
     def on_mount(self) -> None:
+        super().on_mount()
         if self.rules.rules:
             self.query_one("#routing-rule-list", ListView).index = 0
         self.query_one("#routing-rule-list", ListView).focus()
@@ -164,7 +169,8 @@ class RoutingRuleCenterScreen(ModalScreen[tuple[str, str | None]]):
         scope = ", ".join(rule.source_folders) if rule.source_folders else "all folders"
         return f"{index:>2} {status:<8} {rule.id:<20} {rule.type.value:<9} {action:<24} [{scope}] {detail}"
 
-class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
+
+class RoutingRuleEditorScreen(KeyboardModalScreen[RoutingRule | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     RoutingRuleEditorScreen { align: center middle; }
@@ -193,8 +199,10 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
 
     def compose(self) -> ComposeResult:
         rule = self.rule
-        recipe_id = rule.recipe if rule is not None and rule.recipe is not None else (
-            self.runtime_recipes[0].runtime_recipe if self.runtime_recipes else None
+        recipe_id = (
+            rule.recipe
+            if rule is not None and rule.recipe is not None
+            else (self.runtime_recipes[0].runtime_recipe if self.runtime_recipes else None)
         )
         recipe_specs = tuple(spec for spec in self.runtime_recipes if spec.runtime_recipe is not None)
         with Vertical(id="routing-rule-editor-box"):
@@ -230,10 +238,7 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
                 with Vertical(id="recipe-fields"):
                     yield Label("Recipe")
                     yield Select(
-                        [
-                            (f"{spec.title} · {spec.category}", spec.runtime_recipe)
-                            for spec in recipe_specs
-                        ],
+                        [(f"{spec.title} · {spec.category}", spec.runtime_recipe) for spec in recipe_specs],
                         value=recipe_id or Select.NULL,
                         allow_blank=False,
                         id="routing-rule-recipe",
@@ -264,9 +269,9 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
                     yield Label("Move destination")
                     yield Select(
                         [(folder, folder) for folder in self.folders],
-                        value=rule.destination if rule and rule.destination else (
-                            self.folders[0] if self.folders else Select.NULL
-                        ),
+                        value=rule.destination
+                        if rule and rule.destination
+                        else (self.folders[0] if self.folders else Select.NULL),
                         prompt="Choose an existing folder",
                         allow_blank=True,
                         id="routing-rule-destination",
@@ -283,7 +288,10 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
+        super().on_mount()
         self._update_type_fields()
+
+        self.query_one("#routing-rule-id", Input).focus()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id in {"routing-rule-type", "routing-rule-action", "routing-rule-recipe"}:
@@ -421,7 +429,8 @@ class RoutingRuleEditorScreen(ModalScreen[RoutingRule | None]):
             evidence=self.rules.evidence,
         )
 
-class RuleLearnTargetScreen(ModalScreen[str | None]):
+
+class RuleLearnTargetScreen(KeyboardModalScreen[str | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     RuleLearnTargetScreen { align: center middle; }
@@ -452,6 +461,10 @@ class RuleLearnTargetScreen(ModalScreen[str | None]):
                 yield Button("Preview matcher", id="learn-preview", disabled=not bool(self.rules), variant="primary")
                 yield Button("Cancel", id="learn-cancel")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#learn-target-rule", Select).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "learn-cancel":
             self.dismiss(None)
@@ -463,7 +476,8 @@ class RuleLearnTargetScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class RuleLearnPreviewScreen(ModalScreen[bool]):
+class RuleLearnPreviewScreen(KeyboardModalScreen[bool]):
+    BINDINGS = [("escape", "close", "Close")]
     CSS = """
     RuleLearnPreviewScreen { align: center middle; }
     #learn-preview-box { width: 82; height: auto; border: round $accent; padding: 1 2; background: $surface; }
@@ -508,11 +522,18 @@ class RuleLearnPreviewScreen(ModalScreen[bool]):
                 yield Button("Save matcher", id="learn-save", disabled=not saveable, variant="primary")
                 yield Button("Close", id="learn-close")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#learn-close", Button).focus()
+
+    def action_close(self) -> None:
+        self.dismiss(False)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "learn-save")
 
 
-class RuleRecipeCatalogScreen(ModalScreen[str | None]):
+class RuleRecipeCatalogScreen(KeyboardModalScreen[str | None]):
     BINDINGS = [("escape", "cancel", "Close")]
     CSS = """
     RuleRecipeCatalogScreen { align: center middle; }
@@ -540,6 +561,7 @@ class RuleRecipeCatalogScreen(ModalScreen[str | None]):
                 yield Button("Cancel", id="rule-recipe-cancel")
 
     def on_mount(self) -> None:
+        super().on_mount()
         self._refresh()
         self.query_one("#rule-recipe-search", Input).focus()
 
@@ -592,14 +614,12 @@ class RuleRecipeCatalogScreen(ModalScreen[str | None]):
         recipe_id = self._selected_recipe_id()
         recipe = next((item for item in self.recipes if item.id == recipe_id), None)
         text = (
-            f"{recipe.description}\n\nDefault rule ID: {recipe.default_rule_id}"
-            if recipe
-            else "No matching recipes."
+            f"{recipe.description}\n\nDefault rule ID: {recipe.default_rule_id}" if recipe else "No matching recipes."
         )
         self.query_one("#rule-recipe-description", Static).update(text)
 
 
-class RuleTomlPreviewScreen(ModalScreen[None]):
+class RuleTomlPreviewScreen(KeyboardModalScreen[None]):
     BINDINGS = [("escape", "close", "Close")]
     CSS = """
     RuleTomlPreviewScreen { align: center middle; }
@@ -619,6 +639,10 @@ class RuleTomlPreviewScreen(ModalScreen[None]):
                 yield Static(self.text, id="rule-toml-preview-text", markup=False)
             yield Button("Close", id="rule-toml-preview-close")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#rule-toml-preview-close", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(None)
 
@@ -626,7 +650,7 @@ class RuleTomlPreviewScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
-class RuleRemovalConfirmation(ModalScreen[bool]):
+class RuleRemovalConfirmation(KeyboardModalScreen[bool]):
     BINDINGS = [("escape", "cancel", "Cancel")]
 
     def __init__(self, rule: RoutingRule) -> None:
@@ -643,13 +667,18 @@ class RuleRemovalConfirmation(ModalScreen[bool]):
                 yield Button("Cancel", id="rule-removal-cancel")
                 yield Button("Remove rule", id="rule-removal-confirm", variant="error")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#rule-removal-cancel", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "rule-removal-confirm")
 
     def action_cancel(self) -> None:
         self.dismiss(False)
 
-class RuleMigrationPreviewScreen(ModalScreen[tuple[bool, bool]]):
+
+class RuleMigrationPreviewScreen(KeyboardModalScreen[tuple[bool, bool]]):
     BINDINGS = [("escape", "cancel", "Close")]
     CSS = """
     RuleMigrationPreviewScreen { align: center middle; }
@@ -695,6 +724,10 @@ class RuleMigrationPreviewScreen(ModalScreen[tuple[bool, bool]]):
                 )
                 yield Button("Close", id="rule-migration-close")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#rule-migration-close", Button).focus()
+
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         if event.checkbox.id == "rule-migration-allow-delete":
             self.query_one("#rule-migration-apply", Button).disabled = not event.checkbox.value
@@ -703,9 +736,9 @@ class RuleMigrationPreviewScreen(ModalScreen[tuple[bool, bool]]):
         if event.button.id != "rule-migration-apply":
             self.dismiss((False, False))
             return
-        allow_delete = self.requires_delete_authorization and self.query_one(
-            "#rule-migration-allow-delete", Checkbox
-        ).value
+        allow_delete = (
+            self.requires_delete_authorization and self.query_one("#rule-migration-allow-delete", Checkbox).value
+        )
         self.dismiss((True, allow_delete))
 
     def action_cancel(self) -> None:

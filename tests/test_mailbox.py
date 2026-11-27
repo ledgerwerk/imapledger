@@ -1634,8 +1634,6 @@ def test_header_fetch_does_not_mutate_seen_and_uses_peek_subset() -> None:
     assert client.fetches[-1] == ((10,), ("BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID)]",))
 
 
-
-
 class SummaryFakeClient(FakeClient):
     def fetch(self, messages, data, modifiers=None):
         data = tuple(data)
@@ -1660,8 +1658,6 @@ class SummaryFakeClient(FakeClient):
             for uid in messages
             if uid in self.uids and uid not in getattr(self, "missing_summary_uids", set())
         }
-
-
 
 
 def test_fetch_summaries_marks_vanished_uid_and_rejects_uid_outside_snapshot() -> None:

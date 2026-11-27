@@ -105,8 +105,17 @@ def _parse_routing_rule(value: object, index: int) -> RoutingRule:
     if not isinstance(value, dict):
         raise RoutingConfigError(f"{label} must be a table")
     allowed = {
-        "id", "enabled", "type", "action", "destination", "description", "match_at",
-        "match_any", "source_folders", "recipe", "options",
+        "id",
+        "enabled",
+        "type",
+        "action",
+        "destination",
+        "description",
+        "match_at",
+        "match_any",
+        "source_folders",
+        "recipe",
+        "options",
     }
     unknown = set(value) - allowed
     if unknown:
@@ -146,8 +155,7 @@ def _parse_routing_rule(value: object, index: int) -> RoutingRule:
     if not isinstance(raw_matchers, list):
         raise RoutingConfigError(f"{label}.match_any must be an array of tables")
     matchers = tuple(
-        _parse_matcher(raw, f"{label}.match_any[{matcher_index}]")
-        for matcher_index, raw in enumerate(raw_matchers, 1)
+        _parse_matcher(raw, f"{label}.match_any[{matcher_index}]") for matcher_index, raw in enumerate(raw_matchers, 1)
     )
     source_folders = value.get("source_folders", [])
     if not isinstance(source_folders, list) or any(not isinstance(folder, str) for folder in source_folders):
@@ -364,8 +372,7 @@ def migrate_legacy_rules(
         if not isinstance(raw_rules, list):
             raise RoutingConfigError("rules.rule must be an array of tables")
         converted = [
-            _parse_legacy_routing_rule(value, index, schema=schema)
-            for index, value in enumerate(raw_rules, start=1)
+            _parse_legacy_routing_rule(value, index, schema=schema) for index, value in enumerate(raw_rules, start=1)
         ]
         default_match_at = _probability(table.get("default_match_at", 0.90), "rules.default_match_at")
         evidence = RuleEvidenceSettings()
@@ -415,8 +422,15 @@ def _parse_legacy_routing_rule(value: object, index: int, *, schema: int) -> Rou
     if not isinstance(value, dict):
         raise RoutingConfigError(f"{label} must be a table")
     allowed = {
-        "id", "enabled", "type", "destination", "description", "match_at", "match",
-        "match_any", "source_folders",
+        "id",
+        "enabled",
+        "type",
+        "destination",
+        "description",
+        "match_at",
+        "match",
+        "match_any",
+        "source_folders",
     }
     unknown = set(value) - allowed
     if unknown:

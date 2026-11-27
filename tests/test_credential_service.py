@@ -48,6 +48,7 @@ def _settings(source: AuthSource) -> Settings:
         ),
     )
 
+
 def _record_config_writes(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> None:
     def write_auth_config(path: Path, *, source: AuthSource, vault_path: Path | None = None) -> None:
         events.append(f"config:{source.value}")

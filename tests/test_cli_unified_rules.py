@@ -43,8 +43,17 @@ def test_rule_commands_work_without_spam_configuration_and_allow_spam_ids(tmp_pa
     added = runner.invoke(
         cli.app,
         [
-            "rule", "add", "spam", "--type", "semantic", "--action", "keep",
-            "--description", "Mail matching an ordinary semantic rule", "--config", str(config),
+            "rule",
+            "add",
+            "spam",
+            "--type",
+            "semantic",
+            "--action",
+            "keep",
+            "--description",
+            "Mail matching an ordinary semantic rule",
+            "--config",
+            str(config),
         ],
     )
     assert added.exit_code == 0, added.output
@@ -54,7 +63,6 @@ def test_rule_commands_work_without_spam_configuration_and_allow_spam_ids(tmp_pa
     assert shown.exit_code == 0, shown.output
     assert "id: spam" in shown.output
     assert "action: keep" in shown.output
-
 
     edited = runner.invoke(
         cli.app,
@@ -87,8 +95,18 @@ def test_recipe_catalog_show_and_add_materialize_ordinary_rule(tmp_path: Path) -
     added = runner.invoke(
         cli.app,
         [
-            "rule", "recipe", "add", "spam", "--id", "junk-filter", "--action", "keep",
-            "--option", "phishing_match_at=0.93", "--config", str(config),
+            "rule",
+            "recipe",
+            "add",
+            "spam",
+            "--id",
+            "junk-filter",
+            "--action",
+            "keep",
+            "--option",
+            "phishing_match_at=0.93",
+            "--config",
+            str(config),
         ],
     )
     assert added.exit_code == 0, added.output
@@ -142,8 +160,14 @@ def test_rule_apply_passes_explicit_delete_authorization(tmp_path: Path, monkeyp
     monkeypatch.setattr(cli, "RuleRunOperation", FakeRuleRunOperation)
     runner = CliRunner()
     common = [
-        "rule", "apply", "INBOX", "--yes", "--config", str(config),
-        "--progress-db", str(tmp_path / "progress.db"),
+        "rule",
+        "apply",
+        "INBOX",
+        "--yes",
+        "--config",
+        str(config),
+        "--progress-db",
+        str(tmp_path / "progress.db"),
     ]
 
     without_authorization = runner.invoke(cli.app, common)
@@ -154,7 +178,6 @@ def test_rule_apply_passes_explicit_delete_authorization(tmp_path: Path, monkeyp
     assert authorizations == [False, True]
 
 
-
 def test_rule_move_reorders_ordinary_rules(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     _write_config(config)
@@ -163,8 +186,17 @@ def test_rule_move_reorders_ordinary_rules(tmp_path: Path) -> None:
         added = runner.invoke(
             cli.app,
             [
-                "rule", "add", rule_id, "--type", "semantic", "--action", "keep",
-                "--description", f"Semantic rule {rule_id}", "--config", str(config),
+                "rule",
+                "add",
+                rule_id,
+                "--type",
+                "semantic",
+                "--action",
+                "keep",
+                "--description",
+                f"Semantic rule {rule_id}",
+                "--config",
+                str(config),
             ],
         )
         assert added.exit_code == 0, added.output

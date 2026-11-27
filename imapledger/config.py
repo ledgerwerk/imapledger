@@ -28,12 +28,11 @@ class ConfigError(ValueError):
 
 ActionKind = RuleAction
 
+
 class AuthSource(str, Enum):
     PROMPT = "prompt"
     KEYRING = "keyring"
     VAULT = "vault"
-
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,8 +76,6 @@ class MessageAction:
             raise ConfigError(f"{self.action.value} action must not have a destination")
 
 
-
-
 @dataclass(frozen=True, slots=True)
 class ImapSettings:
     host: str
@@ -109,12 +106,9 @@ class MailSettings:
             or self.max_message_bytes < 1
         ):
             raise ConfigError("mail.max_message_bytes must be a positive integer")
-        if (
-            isinstance(self.max_body_chars, bool)
-            or not isinstance(self.max_body_chars, int)
-            or self.max_body_chars < 1
-        ):
+        if isinstance(self.max_body_chars, bool) or not isinstance(self.max_body_chars, int) or self.max_body_chars < 1:
             raise ConfigError("mail.max_body_chars must be a positive integer")
+
 
 @dataclass(frozen=True, slots=True)
 class ConfigStoreSettings:
@@ -151,6 +145,7 @@ class Settings:
             raise ConfigError("mail must be generic mail settings")
         if self.config_store is not None and not isinstance(self.config_store, ConfigStoreSettings):
             raise ConfigError("config_store must be config store settings")
+
 
 def default_config_path() -> Path:
     base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
@@ -219,9 +214,7 @@ def load_legacy_spam_configuration(path: Path | None = None) -> LegacySpamConfig
         if set(action_table) - {"action", "destination"} or "action" not in action_table:
             raise ConfigError(f"invalid legacy spam.actions.{outcome} table")
         try:
-            actions[outcome] = MessageAction(
-                ActionKind(action_table["action"]), action_table.get("destination")
-            )
+            actions[outcome] = MessageAction(ActionKind(action_table["action"]), action_table.get("destination"))
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"invalid legacy spam.actions.{outcome}: {exc}") from exc
 
@@ -230,8 +223,12 @@ def load_legacy_spam_configuration(path: Path | None = None) -> LegacySpamConfig
         raise ConfigError("legacy spam.policy must be a table")
     policy: dict[str, float] = {}
     policy_keys = {
-        "legitimate_veto_at", "phishing_delete_at", "identity_deception_at",
-        "unsolicited_bulk_at", "delete_safe_at", "provider_junk_support_at",
+        "legitimate_veto_at",
+        "phishing_delete_at",
+        "identity_deception_at",
+        "unsolicited_bulk_at",
+        "delete_safe_at",
+        "provider_junk_support_at",
     }
     if set(raw_policy) - policy_keys:
         raise ConfigError(f"unknown key in legacy spam.policy: {sorted(set(raw_policy) - policy_keys)[0]}")
@@ -261,6 +258,7 @@ def load_legacy_spam_configuration(path: Path | None = None) -> LegacySpamConfig
             provider.get("trusted_spam_headers", []), "spam.provider.trusted_spam_headers"
         ),
     )
+
 
 def _parse_imap_auth_settings(value: object) -> ImapAuthSettings:
     if not isinstance(value, dict):
@@ -298,7 +296,6 @@ def _parse_mail_settings(value: object) -> MailSettings:
         if isinstance(exc, ConfigError):
             raise
         raise ConfigError(f"invalid [mail] value: {exc}") from exc
-
 
 
 def _parse_imap_settings(payload: dict[str, object]) -> ImapSettings:

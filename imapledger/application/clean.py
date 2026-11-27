@@ -58,6 +58,7 @@ class CleanPreflight:
 
     requires_delete: bool = False
 
+
 @dataclass(frozen=True, slots=True)
 class CleanResult:
     report: ProcessingReport

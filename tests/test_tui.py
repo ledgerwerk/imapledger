@@ -5,7 +5,7 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Input, Select, Static
+from textual.widgets import Button, Input, Select, Static
 
 from imapledger.config import ImapSettings, Settings
 from imapledger.routing_actions import RuleAction
@@ -49,9 +49,7 @@ def test_setup_dialog_only_edits_connection_configuration(tmp_path: Path) -> Non
         assert len(results) == 1
         assert results[0] is not None
         assert results[0].config_path == path
-        assert results[0].settings == Settings(
-            imap=ImapSettings(host="imap.example.org", username="user@example.org")
-        )
+        assert results[0].settings == Settings(imap=ImapSettings(host="imap.example.org", username="user@example.org"))
 
     asyncio.run(scenario())
 
@@ -193,5 +191,62 @@ def test_rules_toml_preview_shows_an_ordinary_spam_recipe() -> None:
             assert 'id = "spam"' in text
             assert 'recipe = "spam"' in text
             assert 'action = "keep"' in text
+
+    asyncio.run(scenario())
+
+
+def test_rules_workbench_and_removal_are_keyboard_operable() -> None:
+    async def scenario() -> None:
+        app = _ScreenHost()
+        rules = RuleSet(
+            (
+                RoutingRule(
+                    id="first",
+                    enabled=True,
+                    type=RuleType.SEMANTIC,
+                    action=RuleAction.KEEP,
+                    match_at=0.9,
+                    description="First rule",
+                ),
+                RoutingRule(
+                    id="second",
+                    enabled=True,
+                    type=RuleType.SEMANTIC,
+                    action=RuleAction.KEEP,
+                    match_at=0.9,
+                    description="Second rule",
+                ),
+            )
+        )
+        center = RoutingRuleCenterScreen(rules, ())
+        center_result: list[object] = []
+
+        async with app.run_test(size=(110, 36)) as pilot:
+            app.push_screen(center, center_result.append)
+            await pilot.pause()
+            assert app.focused is center.query_one("#routing-rule-list")
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            assert center_result == [("edit", "second")]
+
+            confirmation = RuleRemovalConfirmation(rules.rules[1])
+            cancelled: list[object] = []
+            app.push_screen(confirmation, cancelled.append)
+            await pilot.pause()
+            cancel = confirmation.query_one("#rule-removal-cancel", Button)
+            assert app.focused is cancel
+            await pilot.press("enter")
+            await pilot.pause()
+            assert cancelled == [False]
+
+            confirmation = RuleRemovalConfirmation(rules.rules[1])
+            removed: list[object] = []
+            app.push_screen(confirmation, removed.append)
+            await pilot.pause()
+            await pilot.press("tab")
+            assert app.focused is confirmation.query_one("#rule-removal-confirm", Button)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert removed == [True]
 
     asyncio.run(scenario())

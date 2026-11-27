@@ -55,9 +55,8 @@ def list_recipes(*, category: str | None = None, search: str | None = None) -> t
         recipes = tuple(
             recipe
             for recipe in recipes
-            if term in " ".join(
-                (recipe.id, recipe.title, recipe.category, recipe.summary, recipe.description)
-            ).casefold()
+            if term
+            in " ".join((recipe.id, recipe.title, recipe.category, recipe.summary, recipe.description)).casefold()
         )
     return recipes
 

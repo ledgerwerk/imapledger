@@ -159,8 +159,6 @@ def parse_summary(
         message_id=_decode_header_value(msg.get("Message-ID", "")),
         size_bytes=size_bytes,
         flags=flags,
-
-
     )
 
 

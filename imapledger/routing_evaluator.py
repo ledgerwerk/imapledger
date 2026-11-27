@@ -98,10 +98,7 @@ class SemanticRoutingEvaluator:
                 else:
                     recipe = self._recipe_for_rule(rule)
                     local_questions = recipe.questions(rule=rule)
-                    keys = {
-                        local_name: _recipe_question_key(rule.id, local_name)
-                        for local_name in local_questions
-                    }
+                    keys = {local_name: _recipe_question_key(rule.id, local_name) for local_name in local_questions}
                     for local_name, question in local_questions.items():
                         if not isinstance(question, NoulDecision):
                             raise RoutingEvaluationError(

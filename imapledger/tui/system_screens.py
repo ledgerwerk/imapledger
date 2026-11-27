@@ -5,7 +5,6 @@ from pathlib import Path
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select, Static
 
 from ..config import (
@@ -15,6 +14,7 @@ from ..config import (
     Settings,
     render_settings,
 )
+from .modal import KeyboardModalScreen
 from .session import SessionState
 
 
@@ -39,7 +39,7 @@ class VaultPassphraseChange:
     new_passphrase: str = field(repr=False)
 
 
-class SystemScreen(ModalScreen[str | None]):
+class SystemScreen(KeyboardModalScreen[str | None]):
     BINDINGS = [("escape", "close", "Close")]
     CSS = """
     SystemScreen { align: center middle; }
@@ -116,6 +116,10 @@ class SystemScreen(ModalScreen[str | None]):
                     )
                     yield Button("Close", id="system-close")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#system-setup", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(None if event.button.id == "system-close" else event.button.id.removeprefix("system-"))
 
@@ -123,7 +127,7 @@ class SystemScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class ReloadConfirmation(ModalScreen[bool]):
+class ReloadConfirmation(KeyboardModalScreen[bool]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     ReloadConfirmation { align: center middle; }
@@ -143,6 +147,10 @@ class ReloadConfirmation(ModalScreen[bool]):
                 yield Button("Continue and reload", id="reload-confirm", variant="warning")
                 yield Button("Cancel", id="reload-cancel")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#reload-cancel", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "reload-confirm")
 
@@ -150,7 +158,14 @@ class ReloadConfirmation(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class ConnectDialog(ModalScreen[str | None]):
+class ConnectDialog(KeyboardModalScreen[str | None]):
+    def on_mount(self) -> None:
+        super().on_mount()
+        if self.source is not AuthSource.KEYRING:
+            self.query_one("#connect-secret", Input).focus()
+        else:
+            self.query_one("#connect-confirm", Button).focus()
+
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     ConnectDialog { align: center middle; }
@@ -191,7 +206,7 @@ class ConnectDialog(ModalScreen[str | None]):
         self.dismiss(None)
 
 
-class SetupDialog(ModalScreen[SetupRequest | None]):
+class SetupDialog(KeyboardModalScreen[SetupRequest | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     SetupDialog { align: center middle; }
@@ -227,6 +242,10 @@ class SetupDialog(ModalScreen[SetupRequest | None]):
                 yield Button("Save config", id="setup-save")
                 yield Button("Cancel", id="setup-cancel")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#setup-path", Input).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "setup-cancel":
             self.dismiss(None)
@@ -248,11 +267,13 @@ class SetupDialog(ModalScreen[SetupRequest | None]):
             self.query_one("#setup-error", Static).update(str(exc))
             return
         self.dismiss(request)
+
     def action_cancel(self) -> None:
         self.dismiss(None)
 
 
-class EffectiveConfigScreen(ModalScreen[None]):
+class EffectiveConfigScreen(KeyboardModalScreen[None]):
+    BINDINGS = [("escape", "close", "Close")]
     CSS = """
     EffectiveConfigScreen { align: center middle; }
     #effective-config-box { width: 88; height: 88%; border: round $accent; padding: 1 2; background: $surface; }
@@ -274,11 +295,18 @@ class EffectiveConfigScreen(ModalScreen[None]):
                 yield Static(render_settings(self.settings), id="effective-config-text", markup=False)
             yield Button("Close", id="effective-config-close")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#effective-config-close", Button).focus()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(None)
 
 
-class CredentialSetDialog(ModalScreen[CredentialSetRequest | None]):
+class CredentialSetDialog(KeyboardModalScreen[CredentialSetRequest | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     CredentialSetDialog { align: center middle; }
@@ -313,6 +341,26 @@ class CredentialSetDialog(ModalScreen[CredentialSetRequest | None]):
             with Horizontal(id="credential-set-buttons"):
                 yield Button("Store credential", id="credential-set-save")
                 yield Button("Cancel", id="credential-set-cancel")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self._update_storage_fields()
+        self.query_one("#credential-storage", Select).focus()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "credential-storage":
+            self._update_storage_fields()
+
+    def _update_storage_fields(self) -> None:
+        vault_enabled = self.query_one("#credential-storage", Select).value == "vault"
+        passphrase_fields = (
+            self.query_one("#credential-passphrase", Input),
+            self.query_one("#credential-passphrase-confirm", Input),
+        )
+        if not vault_enabled and any(passphrase_field.has_focus for passphrase_field in passphrase_fields):
+            self.query_one("#credential-storage", Select).focus()
+        for passphrase_field in passphrase_fields:
+            passphrase_field.disabled = not vault_enabled
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "credential-set-cancel":
@@ -351,7 +399,7 @@ class CredentialSetDialog(ModalScreen[CredentialSetRequest | None]):
         self.dismiss(None)
 
 
-class CredentialDeleteDialog(ModalScreen[str | None]):
+class CredentialDeleteDialog(KeyboardModalScreen[str | None]):
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     CredentialDeleteDialog { align: center middle; }
@@ -374,9 +422,20 @@ class CredentialDeleteDialog(ModalScreen[str | None]):
                 yield Button("Delete credential", id="credential-delete-confirm", variant="error")
                 yield Button("Cancel", id="credential-delete-cancel")
 
+    def on_mount(self) -> None:
+        super().on_mount()
+        if self.source is AuthSource.VAULT:
+            self.query_one("#credential-delete-passphrase", Input).focus()
+        else:
+            self.query_one("#credential-delete-cancel", Button).focus()
+
+    def _clear_secret(self) -> None:
+        if self.source is AuthSource.VAULT:
+            self.query_one("#credential-delete-passphrase", Input).value = ""
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "credential-delete-cancel":
-            self.dismiss(None)
+            self.action_cancel()
             return
         secret = ""
         if self.source is AuthSource.VAULT:
@@ -386,10 +445,15 @@ class CredentialDeleteDialog(ModalScreen[str | None]):
         self.dismiss(secret)
 
     def action_cancel(self) -> None:
+        self._clear_secret()
         self.dismiss(None)
 
 
-class VaultPassphraseDialog(ModalScreen[VaultPassphraseChange | None]):
+class VaultPassphraseDialog(KeyboardModalScreen[VaultPassphraseChange | None]):
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#vault-old-passphrase", Input).focus()
+
     BINDINGS = [("escape", "cancel", "Cancel")]
     CSS = """
     VaultPassphraseDialog { align: center middle; }

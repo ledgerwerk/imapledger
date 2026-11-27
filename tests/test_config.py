@@ -85,9 +85,9 @@ def test_optional_mail_settings_round_trip(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("body", "message"),
     [
-        ('[mail]\nmax_message_bytes = 0\n', "mail.max_message_bytes must be a positive integer"),
-        ('[mail]\nmax_body_chars = true\n', "mail.max_body_chars must be a positive integer"),
-        ('[mail]\nunknown = 1\n', r"unknown key in \[mail\]"),
+        ("[mail]\nmax_message_bytes = 0\n", "mail.max_message_bytes must be a positive integer"),
+        ("[mail]\nmax_body_chars = true\n", "mail.max_body_chars must be a positive integer"),
+        ("[mail]\nunknown = 1\n", r"unknown key in \[mail\]"),
     ],
 )
 def test_mail_settings_validation(tmp_path: Path, body: str, message: str) -> None:
@@ -202,8 +202,7 @@ def test_config_mode_is_0600_on_posix(tmp_path: Path) -> None:
 def test_imap_auth_source_round_trips_without_credentials(tmp_path: Path, source: AuthSource) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
-        f'[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n'
-        f'[imap.auth]\nsource = "{source.value}"\n',
+        f'[imap]\nhost = "imap.example.org"\nusername = "me@example.org"\n\n[imap.auth]\nsource = "{source.value}"\n',
         encoding="utf-8",
     )
     imap = load_imap_settings(path)
@@ -278,7 +277,7 @@ def test_config_store_context_and_full_settings_round_trip(tmp_path: Path) -> No
         imap=settings.imap,
         store=settings.config_store,
     )
-    assert "[config_store]\nfolder = \"INBOX.imapledger.Config\"\nmax_file_bytes = 2000000" in rendered
+    assert '[config_store]\nfolder = "INBOX.imapledger.Config"\nmax_file_bytes = 2000000' in rendered
 
 
 def test_config_store_settings_validate_folder_and_size() -> None:
