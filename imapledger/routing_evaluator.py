@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 from pyjev import Jev
@@ -107,7 +108,7 @@ class SemanticRoutingEvaluator:
                                 f"recipe {rule.recipe} question {local_name} is not a Noul decision"
                             )
                         key = keys[local_name]
-                        questions[key] = question
+                        questions[key] = replace(question, name=key)
                     question_keys[rule.id] = keys
             except Exception as exc:
                 recipe_errors[rule.id] = str(exc) or exc.__class__.__name__

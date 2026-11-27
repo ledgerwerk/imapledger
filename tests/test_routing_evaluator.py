@@ -114,6 +114,7 @@ def test_recipe_and_semantic_questions_share_one_bundle_and_keep_order(monkeypat
         plan = evaluator.plan("INBOX.Archive", _message(), rules)
 
     assert plan.winner_rule_id == "spam"
+    assert plan.rule_results[0].state is EvaluationState.MATCH
     assert plan.destination == "INBOX.Trash"
     assert plan.model == "bundle-model"
     assert plan.request_id == "request-test"
@@ -123,8 +124,29 @@ def test_recipe_and_semantic_questions_share_one_bundle_and_keep_order(monkeypat
         *(_recipe_key("spam", name) for name in SIGNAL_NAMES),
         _semantic_key("advertising"),
     }
+    assert all(question.name == key for key, question in decision.questions.items())
     assert "source_folder" in state["mailbox_context"]
     assert plan.rule_results[1].confidence == 0.99
+
+
+def test_recipe_question_namespace_uses_rule_id_not_recipe_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rule_id = "junk-detector"
+    phishing_key = _recipe_key(rule_id, "phishing_or_scam")
+    fake = FakeJev({phishing_key: 0.95})
+    _install_jev(monkeypatch, fake)
+
+    with SemanticRoutingEvaluator() as evaluator:
+        plan = evaluator.plan("INBOX.Junk", _message(), RuleSet((_spam_rule(rule_id=rule_id),)))
+
+    decision, _state = fake.calls[0]
+    for signal_name in SIGNAL_NAMES:
+        key = _recipe_key(rule_id, signal_name)
+        assert key in decision.questions
+        assert decision.questions[key].name == key
+    assert plan.winner_rule_id == rule_id
+    assert plan.rule_results[0].state is EvaluationState.MATCH
 
 
 def test_first_semantic_match_wins_even_when_later_rule_also_matches(monkeypatch: pytest.MonkeyPatch) -> None:
